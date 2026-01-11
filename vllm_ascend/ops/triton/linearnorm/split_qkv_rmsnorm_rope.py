@@ -46,6 +46,7 @@ def split_qkv_rmsnorm_rope_kernel(
     BIAS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HALF_HEAD_DIM: tl.constexpr,
+    ROPE_HALF_ONLY: tl.constexpr,
 ):
     row_pid = tl.program_id(0)
     col_pid = tl.program_id(1)
@@ -109,7 +110,29 @@ def split_qkv_rmsnorm_rope_kernel(
             sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
             strides=(1, 1),
         )
-        roped_q = cat_x * sin + normalized_values * cos
+        if ROPE_HALF_ONLY:
+            # 计算完整的RoPE结果
+            full_roped = cat_x * sin + normalized_values * cos
+            # 只取前半部分应用RoPE，后半部分保持原始值
+            roped_q = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+            # 前半部分：应用RoPE
+            roped_q = tl.insert_slice(
+                roped_q,
+                tl.extract_slice(full_roped, offsets=(0, 0), sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+            # 后半部分：保持原始值
+            roped_q = tl.insert_slice(
+                roped_q,
+                tl.extract_slice(normalized_values, offsets=(0, HALF_HEAD_DIM), sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+                offsets=(0, HALF_HEAD_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+        else:
+            roped_q = cat_x * sin + normalized_values * cos
         tl.store(
             q_ptr + output_offset + col_indices,
             roped_q.reshape(Q_BLOCK_SIZE).to(q_ptr.dtype.element_ty),
@@ -174,7 +197,29 @@ def split_qkv_rmsnorm_rope_kernel(
             sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
             strides=(1, 1),
         )
-        roped_k = cat_x * sin + normalized_values * cos
+        if ROPE_HALF_ONLY:
+            # 计算完整的RoPE结果
+            full_roped = cat_x * sin + normalized_values * cos
+            # 只取前半部分应用RoPE，后半部分保持原始值
+            roped_k = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+            # 前半部分：应用RoPE
+            roped_k = tl.insert_slice(
+                roped_k,
+                tl.extract_slice(full_roped, offsets=(0, 0), sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+            # 后半部分：保持原始值
+            roped_k = tl.insert_slice(
+                roped_k,
+                tl.extract_slice(normalized_values, offsets=(0, HALF_HEAD_DIM), sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+                offsets=(0, HALF_HEAD_DIM),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+        else:
+            roped_k = cat_x * sin + normalized_values * cos
 
         tl.store(
             k_ptr + output_offset + col_indices,
@@ -211,6 +256,7 @@ def split_qkv_rmsnorm_rope_impl(
     eps: float,
     q_bias: Optional[torch.Tensor] = None,
     k_bias: Optional[torch.Tensor] = None,
+    rope_half_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     KV_BLOCK_SIZE = triton.next_power_of_2(head_dim)
     assert KV_BLOCK_SIZE == head_dim
@@ -257,6 +303,7 @@ def split_qkv_rmsnorm_rope_impl(
         BIAS,
         head_dim,
         head_dim // 2,
+        rope_half_only,
     )
     return q_output, k_output, v_output
 
@@ -273,6 +320,7 @@ def split_qkv_rmsnorm_rope_impl_fake(
     eps: float,
     q_bias: Optional[torch.Tensor] = None,
     k_bias: Optional[torch.Tensor] = None,
+    rope_half_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Fake implementation for shape inference during Dynamo/AOT tracing.
     # Note: sin and cos are not used in shape computation, but must be present in signature.
