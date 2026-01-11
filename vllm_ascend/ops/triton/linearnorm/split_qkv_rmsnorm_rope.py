@@ -46,8 +46,39 @@ def split_qkv_rmsnorm_rope_kernel(
     BIAS: tl.constexpr,
     HEAD_DIM: tl.constexpr,
     HALF_HEAD_DIM: tl.constexpr,
-    ROPE_HALF_ONLY: tl.constexpr,
+    COS_SIZE: tl.constexpr,
 ):
+    def apply_rope(x, sin, cos):
+        x1 = tl.extract_slice(
+            x, 
+            offsets=(0, 0),
+            sizes=(Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+            strides=(1, 1),
+        )
+        x2 = tl.extract_slice(
+            x, 
+            offsets=(0, COS_SIZE),
+            sizes=(Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+            strides=(1, 1),
+        )
+        cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+                         dtype=tl.bfloat16)
+        cat_x = tl.insert_slice(
+            cat_x,
+            -x2,
+            offsets=(0, 0),
+            sizes=(Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+            strides=(1, 1),
+        )
+        cat_x = tl.insert_slice(
+            cat_x,
+            x1,
+            offsets=(0, COS_SIZE),
+            sizes=(Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+            strides=(1, 1),
+        )
+        return cat_x * sin + x * cos
+        
     row_pid = tl.program_id(0)
     col_pid = tl.program_id(1)
     row_step = tl.num_programs(0)
@@ -79,60 +110,150 @@ def split_qkv_rmsnorm_rope_kernel(
             normalized_values = (normalized_values * weight_values).to(
                 tl.bfloat16)
 
-        sc_offsets = row_idx * HEAD_DIM + tl.arange(0, HEAD_DIM)
-        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        x1 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, 0),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        x2 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM),
-                         dtype=tl.bfloat16)
-        cat_x = tl.insert_slice(
-            cat_x,
-            -x2,
-            offsets=(0, 0),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.insert_slice(
-            cat_x,
-            x1,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        if ROPE_HALF_ONLY:
-            # 计算完整的RoPE结果
-            full_roped = cat_x * sin + normalized_values * cos
-            # 只取前半部分应用RoPE，后半部分保持原始值
-            roped_q = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
-            # 前半部分：应用RoPE
-            roped_q = tl.insert_slice(
-                roped_q,
-                tl.extract_slice(full_roped, offsets=(0, 0), sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+        sc_offsets = row_idx * COS_SIZE + tl.arange(0, COS_SIZE)
+        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, COS_SIZE)
+        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, COS_SIZE)
+
+        
+        if COS_SIZE == HEAD_DIM:
+            roped_q = apply_rope(normalized_values, sin, cos)
+        else:
+            # 提取前半部分x1
+            x1 = tl.extract_slice(
+                normalized_values,
                 offsets=(0, 0),
-                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
                 strides=(1, 1),
             )
-            # 后半部分：保持原始值
-            roped_q = tl.insert_slice(
-                roped_q,
-                tl.extract_slice(normalized_values, offsets=(0, HALF_HEAD_DIM), sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
+            roped_half = apply_rope(x1, sin, cos)
+            # 提取后半部分x2
+            x2 = tl.extract_slice(
+                normalized_values,
                 offsets=(0, HALF_HEAD_DIM),
                 sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
                 strides=(1, 1),
             )
-        else:
-            roped_q = cat_x * sin + normalized_values * cos
+            # 构建最终结果：前半部分是roped_half，后半部分是原始x2
+            roped_q = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+            roped_q = tl.insert_slice(
+                roped_q,
+                roped_half,
+                offsets=(0, 0),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+            roped_q = tl.insert_slice(
+                roped_q,
+                x2,
+                offsets=(0, HALF_HEAD_DIM),
+                sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+                strides=(1, 1),
+            )
+
+        # x1 = tl.extract_slice(
+        #     normalized_values,
+        #     offsets=(0, 0),
+        #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # x2 = tl.extract_slice(
+        #     normalized_values,
+        #     offsets=(0, HALF_HEAD_DIM),
+        #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # cat_x = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM),
+        #                  dtype=tl.bfloat16)
+        # cat_x = tl.insert_slice(
+        #     cat_x,
+        #     -x2,
+        #     offsets=(0, 0),
+        #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # cat_x = tl.insert_slice(
+        #     cat_x,
+        #     x1,
+        #     offsets=(0, HALF_HEAD_DIM),
+        #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # # )
+        # if ROPE_HALF_ONLY:
+        #     # 只对前半部分进行独立的RoPE计算
+        #     # 加载前HALF_HEAD_DIM个sin/cos值
+        #     sc_offsets_half = row_idx * HEAD_DIM + tl.arange(0, HALF_HEAD_DIM)
+        #     sin_half = (tl.load(sin_ptr + sc_offsets_half)).reshape(1, HALF_HEAD_DIM)
+        #     cos_half = (tl.load(cos_ptr + sc_offsets_half)).reshape(1, HALF_HEAD_DIM)
+
+        #     # 提取前半部分x1
+            # x1 = tl.extract_slice(
+            #     normalized_values,
+            #     offsets=(0, 0),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+
+            # # 将x1分成两半：x1_a和x1_b
+            # QUARTER_HEAD_DIM = HALF_HEAD_DIM // 2
+            # x1_a = tl.extract_slice(
+            #     x1,
+            #     offsets=(0, 0),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+            # x1_b = tl.extract_slice(
+            #     x1,
+            #     offsets=(0, QUARTER_HEAD_DIM),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+
+            # # 构建cat_x1: [-x1_b, x1_a]
+            # cat_x1 = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), dtype=tl.bfloat16)
+            # cat_x1 = tl.insert_slice(
+            #     cat_x1,
+            #     -x1_b,
+            #     offsets=(0, 0),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+            # cat_x1 = tl.insert_slice(
+            #     cat_x1,
+            #     x1_a,
+            #     offsets=(0, QUARTER_HEAD_DIM),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+
+            # # 计算roped_half
+            # roped_half = cat_x1 * sin_half + x1 * cos_half
+
+            # # 提取后半部分x2
+            # x2 = tl.extract_slice(
+            #     normalized_values,
+            #     offsets=(0, HALF_HEAD_DIM),
+            #     sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+            #     strides=(1, 1),
+            # )
+
+        #     # 构建最终结果：前半部分是roped_half，后半部分是原始x2
+        #     roped_q = tl.zeros((Q_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+        #     roped_q = tl.insert_slice(
+        #         roped_q,
+        #         roped_half,
+        #         offsets=(0, 0),
+        #         sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        #     roped_q = tl.insert_slice(
+        #         roped_q,
+        #         x2,
+        #         offsets=(0, HALF_HEAD_DIM),
+        #         sizes=(Q_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        # else:
+        #     roped_q = cat_x * sin + normalized_values * cos
         tl.store(
             q_ptr + output_offset + col_indices,
             roped_q.reshape(Q_BLOCK_SIZE).to(q_ptr.dtype.element_ty),
@@ -166,60 +287,133 @@ def split_qkv_rmsnorm_rope_kernel(
         else:
             normalized_values = (normalized_values * weight_values).to(
                 tl.bfloat16)
-        sc_offsets = row_idx * HEAD_DIM + tl.arange(0, HEAD_DIM)
-        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, HEAD_DIM)
-        x1 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, 0),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        x2 = tl.extract_slice(
-            normalized_values,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM),
-                         dtype=tl.bfloat16)
-        cat_x = tl.insert_slice(
-            cat_x,
-            -x2,
-            offsets=(0, 0),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        cat_x = tl.insert_slice(
-            cat_x,
-            x1,
-            offsets=(0, HALF_HEAD_DIM),
-            sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-            strides=(1, 1),
-        )
-        if ROPE_HALF_ONLY:
-            # 计算完整的RoPE结果
-            full_roped = cat_x * sin + normalized_values * cos
-            # 只取前半部分应用RoPE，后半部分保持原始值
-            roped_k = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
-            # 前半部分：应用RoPE
-            roped_k = tl.insert_slice(
-                roped_k,
-                tl.extract_slice(full_roped, offsets=(0, 0), sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
-                offsets=(0, 0),
-                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-                strides=(1, 1),
-            )
-            # 后半部分：保持原始值
-            roped_k = tl.insert_slice(
-                roped_k,
-                tl.extract_slice(normalized_values, offsets=(0, HALF_HEAD_DIM), sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), strides=(1, 1)),
-                offsets=(0, HALF_HEAD_DIM),
-                sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
-                strides=(1, 1),
-            )
+        sc_offsets = row_idx * COS_SIZE + tl.arange(0, COS_SIZE)
+        sin = (tl.load(sin_ptr + sc_offsets)).reshape(1, COS_SIZE)
+        cos = (tl.load(cos_ptr + sc_offsets)).reshape(1, COS_SIZE)
+
+
+        if COS_SIZE == HEAD_DIM:
+            roped_k = apply_rope(normalized_values, sin, cos)
         else:
-            roped_k = cat_x * sin + normalized_values * cos
+            # 提取前半部分x1
+            x1 = tl.extract_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+                strides=(1, 1),
+            )
+            roped_half = apply_rope(x1, sin, cos)
+            roped_k = tl.insert_slice(
+                normalized_values,
+                offsets=(0, 0),
+                sizes=(KV_BLOCK_SIZE // HEAD_DIM, COS_SIZE),
+                strides=(1, 1),
+            )
+
+        # x1 = tl.extract_slice(
+        #     normalized_values,
+        #     offsets=(0, 0),
+        #     sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # x2 = tl.extract_slice(
+        #     normalized_values,
+        #     offsets=(0, HALF_HEAD_DIM),
+        #     sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # cat_x = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM),
+        #                  dtype=tl.bfloat16)
+        # cat_x = tl.insert_slice(
+        #     cat_x,
+        #     -x2,
+        #     offsets=(0, 0),
+        #     sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # cat_x = tl.insert_slice(
+        #     cat_x,
+        #     x1,
+        #     offsets=(0, HALF_HEAD_DIM),
+        #     sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #     strides=(1, 1),
+        # )
+        # if ROPE_HALF_ONLY:
+        #     # 只对前半部分进行独立的RoPE计算
+        #     # 加载前HALF_HEAD_DIM个sin/cos值
+        #     sc_offsets_half = row_idx * HEAD_DIM + tl.arange(0, HALF_HEAD_DIM)
+        #     sin_half = (tl.load(sin_ptr + sc_offsets_half)).reshape(1, HALF_HEAD_DIM)
+        #     cos_half = (tl.load(cos_ptr + sc_offsets_half)).reshape(1, HALF_HEAD_DIM)
+
+        #     # 提取前半部分x1
+        #     x1 = tl.extract_slice(
+        #         normalized_values,
+        #         offsets=(0, 0),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+
+        #     # 将x1分成两半：x1_a和x1_b
+        #     QUARTER_HEAD_DIM = HALF_HEAD_DIM // 2
+        #     x1_a = tl.extract_slice(
+        #         x1,
+        #         offsets=(0, 0),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        #     x1_b = tl.extract_slice(
+        #         x1,
+        #         offsets=(0, QUARTER_HEAD_DIM),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+
+        #     # 构建cat_x1: [-x1_b, x1_a]
+        #     cat_x1 = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM), dtype=tl.bfloat16)
+        #     cat_x1 = tl.insert_slice(
+        #         cat_x1,
+        #         -x1_b,
+        #         offsets=(0, 0),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        #     cat_x1 = tl.insert_slice(
+        #         cat_x1,
+        #         x1_a,
+        #         offsets=(0, QUARTER_HEAD_DIM),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, QUARTER_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+
+        #     # 计算roped_half
+        #     roped_half = cat_x1 * sin_half + x1 * cos_half
+
+        #     # 提取后半部分x2
+        #     x2 = tl.extract_slice(
+        #         normalized_values,
+        #         offsets=(0, HALF_HEAD_DIM),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+
+        #     # 构建最终结果：前半部分是roped_half，后半部分是原始x2
+        #     roped_k = tl.zeros((KV_BLOCK_SIZE // HEAD_DIM, HEAD_DIM), dtype=tl.bfloat16)
+        #     roped_k = tl.insert_slice(
+        #         roped_k,
+        #         roped_half,
+        #         offsets=(0, 0),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        #     roped_k = tl.insert_slice(
+        #         roped_k,
+        #         x2,
+        #         offsets=(0, HALF_HEAD_DIM),
+        #         sizes=(KV_BLOCK_SIZE // HEAD_DIM, HALF_HEAD_DIM),
+        #         strides=(1, 1),
+        #     )
+        # else:
+        #     roped_k = cat_x * sin + normalized_values * cos
 
         tl.store(
             k_ptr + output_offset + col_indices,
@@ -256,8 +450,8 @@ def split_qkv_rmsnorm_rope_impl(
     eps: float,
     q_bias: Optional[torch.Tensor] = None,
     k_bias: Optional[torch.Tensor] = None,
-    rope_half_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    COS_SIZE = cos.shape[-1]
     KV_BLOCK_SIZE = triton.next_power_of_2(head_dim)
     assert KV_BLOCK_SIZE == head_dim
     assert q_hidden_size % kv_hidden_size == 0
@@ -303,7 +497,7 @@ def split_qkv_rmsnorm_rope_impl(
         BIAS,
         head_dim,
         head_dim // 2,
-        rope_half_only,
+        COS_SIZE,
     )
     return q_output, k_output, v_output
 
@@ -320,7 +514,6 @@ def split_qkv_rmsnorm_rope_impl_fake(
     eps: float,
     q_bias: Optional[torch.Tensor] = None,
     k_bias: Optional[torch.Tensor] = None,
-    rope_half_only: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     # Fake implementation for shape inference during Dynamo/AOT tracing.
     # Note: sin and cos are not used in shape computation, but must be present in signature.
