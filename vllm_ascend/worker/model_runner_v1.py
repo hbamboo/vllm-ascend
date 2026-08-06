@@ -2213,7 +2213,7 @@ class NPUModelRunner(GPUModelRunner):
                         cudagraph_mode,
                         batch_desc.num_reqs,
                     )
-
+                self.num_accepted_tokens_event.synchronize()
                 (attn_metadata, spec_decode_common_attn_metadata) = self._build_attention_metadata(
                     num_tokens=num_tokens_unpadded
                     if not (self.use_cp and self.pcp_manager.pcp_use_hybrid_attn)
