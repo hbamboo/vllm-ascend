@@ -87,6 +87,11 @@ LAYER_DONE_SENDING_MSG = b"layer_done_sending_msg"
 # 逐层 LAYER_DONE 握手使用独立连接, 需覆盖 D 侧 H2D 时间.
 LAYER_DONE_TIMEOUT_S = 30.0
 
+# 攒批层数: 模型完成 N 层任务后才统一做 D2H flush + 一次传输 + 一次
+# LAYER_DONE, 摊薄逐层传输的固定开销(批量 DMA / write 调用 / 控制消息).
+# 1 = 逐层传输(旧行为); 层序号断裂(跨步/换批)或到达最后层时立即冲刷.
+_LAYER_BATCH = int(os.getenv("MC_TCP_LAYER_BATCH", "8"))
+
 
 @dataclass
 class LayerMetadata:
@@ -154,9 +159,12 @@ class TransferMeta:
     dst: list[int]
     length: list[int]
     req_ids: list[str]
-    # req_id -> (start, count) 在 src/dst/length 中的区间, 用于按请求拆分
-    # LAYER_DONE 通知(不同请求可能对应不同 D 侧信道).
-    req_slices: dict[str, tuple[int, int]] = field(default_factory=dict)
+    # req_id -> [(start, count), ...] 在 src/dst/length 中的区间列表(跨层攒批时
+    # 同一请求在合并列表中有多个不连续段), 用于按请求拆分 LAYER_DONE 通知.
+    req_slices: dict[str, list[tuple[int, int]]] = field(default_factory=dict)
+    # req_id -> (remote_host, remote_port): LAYER_DONE 的控制面目的地(侧信道),
+    # 攒批合并后不再能从单一任务取到, 在聚合阶段记录.
+    req_peer: dict[str, tuple[str, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -275,17 +283,26 @@ class KVCacheSendingLayerThread(threading.Thread):
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
         self.ready_event.set()
+        # 攒批: 攒满 _LAYER_BATCH 层或遇到最后层/层序号断裂(跨步)才整批处理.
+        # 发送线程始终及时取走队列任务, 模型 forward 不被逐层传输钳制.
+        pending: list[SendTask] = []
         while True:
             send_task = self.send_queue.get()
-            self._handle_request(send_task)
+            if pending and send_task.layer_idx != pending[-1].layer_idx + 1:
+                self._handle_batch(pending)
+                pending = []
+            pending.append(send_task)
+            if len(pending) >= _LAYER_BATCH or send_task.layer_idx == (self.total_layers - 1):
+                self._handle_batch(pending)
+                pending = []
 
-    def _handle_request(self, send_task: SendTask):
+    def _handle_batch(self, tasks: list[SendTask]):
         try:
-            self._transfer_kv_cache(send_task)
+            self._transfer_kv_cache_batch(tasks)
         except Exception as e:
             logger.error(
-                "Failed to transfer KV cache. layer_idx=%s, error=%s. Check transfer engine and memory state.",
-                send_task.layer_idx,
+                "Failed to transfer KV cache batch. layer_idx=%s, error=%s. Check transfer engine and memory state.",
+                [t.layer_idx for t in tasks],
                 e,
             )
 
@@ -451,45 +468,36 @@ class KVCacheSendingLayerThread(threading.Thread):
                         length_list.append(block_len)
         return (src_list, dst_list, length_list)
 
-    def _transfer_kv_cache(self, send_task: SendTask):
-        layer_name = send_task.layer_name
-        layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
-        key = send_task.k_cache
-        value = send_task.v_cache
-        if self.pd_head_ratio > 1 and key is not None and value is not None:
-            with npu_stream_switch(self.resharding_stream):
-                key = key.view(-1, key.shape[-1])  # type:ignore
-                value = value.view(-1, key.shape[-1])  # type:ignore
-                self.k_buffer[: key.shape[0]].copy_(key)  # [:4, 128] ->
-                self.v_buffer[: value.shape[0]].copy_(value)
-        if send_task.k_quant_cache is not None:
-            with npu_stream_switch(self.resharding_stream):
-                key_quant = send_task.k_quant_cache
-                key_quant = key_quant.view(-1, key_quant.shape[-1])  # type:ignore
-                self.k_buffer[: key_quant.shape[0]].copy_(key_quant)
-                value_quant = send_task.v_quant_cache
-                value_quant = value_quant.view(-1, value_quant.shape[-1])  # type:ignore
-                self.v_buffer[: value_quant.shape[0]].copy_(value_quant)
+    def _transfer_kv_cache_batch(self, tasks: list[SendTask]):
+        """批量传输攒齐的多个层任务: 跨任务合并 ranges 后, 每 session 一次
+        D2H flush + 一次 sync_write + 每 peer 一次 LAYER_DONE(携带批内全部层
+        范围), 摊薄逐层传输的固定开销. tasks 为空时直接返回."""
+        if not tasks:
+            return
 
-        # Merge transmission tasks of the same session
-        session_meta: dict[str, TransferMeta] = {}
-        for req_id, req_meta in send_task.send_request.items():
-            session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
-            if session_id not in session_meta:
-                session_meta[session_id] = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+        # 1) reshard/quant buffer 拷贝(逐任务; v1 TCP 守卫下不会触发, 保留兼容)
+        for send_task in tasks:
+            key = send_task.k_cache
+            value = send_task.v_cache
+            if self.pd_head_ratio > 1 and key is not None and value is not None:
+                with npu_stream_switch(self.resharding_stream):
+                    key = key.view(-1, key.shape[-1])  # type:ignore
+                    value = value.view(-1, key.shape[-1])  # type:ignore
+                    self.k_buffer[: key.shape[0]].copy_(key)  # [:4, 128] ->
+                    self.v_buffer[: value.shape[0]].copy_(value)
+            if send_task.k_quant_cache is not None:
+                with npu_stream_switch(self.resharding_stream):
+                    key_quant = send_task.k_quant_cache
+                    key_quant = key_quant.view(-1, key_quant.shape[-1])  # type:ignore
+                    self.k_buffer[: key_quant.shape[0]].copy_(key_quant)
+                    value_quant = send_task.v_quant_cache
+                    value_quant = value_quant.view(-1, value_quant.shape[-1])  # type:ignore
+                    self.v_buffer[: value_quant.shape[0]].copy_(value_quant)
 
-            (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
-
-            session_meta[session_id].src.extend(src_list)
-            session_meta[session_id].dst.extend(dst_list)
-            session_meta[session_id].length.extend(length_list)
-            session_meta[session_id].req_ids.append(req_id)
-            session_meta[session_id].req_slices[req_id] = (
-                len(session_meta[session_id].src) - len(src_list),
-                len(src_list),
-            )
-
-        if send_task.k_quant_cache is not None:
+        # 2) 数据就绪: 批内层任务按层序提交、事件在同一流上递增, 只需等
+        # 最后一个任务的事件, 即全部层 KV 已写入.
+        last_task = tasks[-1]
+        if last_task.k_quant_cache is not None:
             self.resharding_stream.synchronize()
         elif self.pd_head_ratio == 1:
             """
@@ -498,16 +506,39 @@ class KVCacheSendingLayerThread(threading.Thread):
             You can manually build the master branch of the project at https://gitcode.com/cann/hixl
             to resolve this issue before the 8.5.RC1 release.
             """
-            send_task.wait_event.synchronize()  # type:ignore
+            last_task.wait_event.synchronize()  # type:ignore
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
 
+        # 3) 跨任务按 (session, req) 聚合 ranges
+        session_meta: dict[str, TransferMeta] = {}
+        for send_task in tasks:
+            layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
+            for req_id, req_meta in send_task.send_request.items():
+                session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
+                meta = session_meta.get(session_id)
+                if meta is None:
+                    meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+                    session_meta[session_id] = meta
+                if req_id not in meta.req_ids:
+                    meta.req_ids.append(req_id)
+                meta.req_peer[req_id] = (req_meta.remote_host, req_meta.remote_port)
+                (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
+                if not src_list:
+                    continue
+                start = len(meta.src)
+                meta.src.extend(src_list)
+                meta.dst.extend(dst_list)
+                meta.length.extend(length_list)
+                meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
+
+        # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 if global_te.use_tcp:
-                    # H2H: 逐层 D2H —— 先把本层各请求的 KV 块从 NPU 刷进 CPU
-                    # staging(只拷本层字节区间), 再把 src 换成 staging 地址,
-                    # 因为 TCP 传输只能读写注册的 host 内存.
+                    # H2H: 批内各层各请求的 KV 块一次性从 NPU 刷进 CPU staging
+                    # (批量 DMA), 再把 src 换成 staging 地址 —— TCP 只能读写
+                    # 注册的 host 内存.
                     global_te.sync_npu_to_cpu_for_npu_addrs(transfer_meta.src, transfer_meta.length)
                     staging_src = []
                     for src_addr in transfer_meta.src:
@@ -534,28 +565,29 @@ class KVCacheSendingLayerThread(threading.Thread):
                     total_transfer_size = sum(transfer_meta.length) / 1024
                     req_transfer_elapsed = (req_end_time - req_start_time) * 1000
                     logger.debug(
-                        "Layer%d KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
-                        send_task.layer_idx,
+                        "Layers batch KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
                         total_transfer_size,
                         session_id,
                         req_transfer_elapsed,
                     )
                     if global_te.use_tcp:
-                        # 逐层通知 D 该层数据已写入其 staging, 等 D 完成该层
-                        # H2D 后回 ACK 才继续下一层(同线程串行). 由于请求级
-                        # DONE_SENDING 在最后层的 ACK 之后才发, D 的请求级
-                        # done 必然晚于全部层的 H2D, 满足"收到完整 KV 后才
-                        # 启动计算"的不变式.
+                        # 批传输完成后通知 D(该批全部层范围), D 完成 H2D 后回
+                        # ACK 才处理下一批(同线程串行). 请求级 DONE_SENDING 只在
+                        # 含最后层的批的 ACK 之后发出, D 的请求级 done 必然晚于
+                        # 全部层的 H2D, 满足"收到完整 KV 后才启动计算"的不变式.
                         layer_done_ok = True
                         peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
                         for layer_req_id in transfer_meta.req_ids:
-                            req_start, req_count = transfer_meta.req_slices[layer_req_id]
-                            layer_req_meta = send_task.send_request[layer_req_id]
-                            peer_key = (layer_req_meta.remote_host, layer_req_meta.remote_port)
+                            peer_key = transfer_meta.req_peer[layer_req_id]
                             if peer_key not in peer_layer_msgs:
                                 peer_layer_msgs[peer_key] = ([], [])
-                            peer_layer_msgs[peer_key][0].extend(transfer_meta.dst[req_start : req_start + req_count])
-                            peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
+                            for req_start, req_count in transfer_meta.req_slices[layer_req_id]:
+                                peer_layer_msgs[peer_key][0].extend(
+                                    transfer_meta.dst[req_start : req_start + req_count]
+                                )
+                                peer_layer_msgs[peer_key][1].extend(
+                                    transfer_meta.length[req_start : req_start + req_count]
+                                )
                         for (peer_host, peer_port), (peer_addrs, peer_lengths) in peer_layer_msgs.items():
                             if not self._send_layer_done_signal(peer_host, peer_port, peer_addrs, peer_lengths):
                                 layer_done_ok = False
@@ -563,15 +595,23 @@ class KVCacheSendingLayerThread(threading.Thread):
                         if not layer_done_ok:
                             for failed_req_id in transfer_meta.req_ids:
                                 self.failed_reqs.add(failed_req_id)
-                if send_task.layer_idx == (self.total_layers - 1):
-                    for req_id in transfer_meta.req_ids:
-                        req_meta = send_task.send_request[req_id]
-                        if req_meta.chunk_finish:
-                            if req_id in self.failed_reqs:
-                                self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
-                                self.failed_reqs.discard(req_id)
-                            else:
-                                self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+
+        # 5) 请求级完成信号: 批内含最后层任务时, 对实际有传输段的请求发
+        #    DONE/FAILED. 含最后层的任务才触发, 保证 DONE 晚于本请求全部
+        #    层批的 ACK; 无任何传输段的请求不回调(与原逐层语义一致).
+        transferred_reqs = {req_id for meta in session_meta.values() for req_id in meta.req_ids}
+        for send_task in tasks:
+            if send_task.layer_idx == (self.total_layers - 1):
+                layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
+                for req_id, req_meta in send_task.send_request.items():
+                    if req_id not in transferred_reqs:
+                        continue
+                    if req_meta.chunk_finish:
+                        if req_id in self.failed_reqs:
+                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
+                            self.failed_reqs.discard(req_id)
+                        else:
+                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
 
     def _send_layer_done_signal(
         self,
