@@ -82,6 +82,10 @@ if TYPE_CHECKING:
 
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
+LAYER_DONE_SENDING_MSG = b"layer_done_sending_msg"
+
+# 逐层 LAYER_DONE 握手使用独立连接, 需覆盖 D 侧 H2D 时间.
+LAYER_DONE_TIMEOUT_S = 30.0
 
 
 @dataclass
@@ -150,6 +154,9 @@ class TransferMeta:
     dst: list[int]
     length: list[int]
     req_ids: list[str]
+    # req_id -> (start, count) 在 src/dst/length 中的区间, 用于按请求拆分
+    # LAYER_DONE 通知(不同请求可能对应不同 D 侧信道).
+    req_slices: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -477,6 +484,10 @@ class KVCacheSendingLayerThread(threading.Thread):
             session_meta[session_id].dst.extend(dst_list)
             session_meta[session_id].length.extend(length_list)
             session_meta[session_id].req_ids.append(req_id)
+            session_meta[session_id].req_slices[req_id] = (
+                len(session_meta[session_id].src) - len(src_list),
+                len(src_list),
+            )
 
         if send_task.k_quant_cache is not None:
             self.resharding_stream.synchronize()
@@ -493,6 +504,21 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
+                if global_te.use_tcp:
+                    # H2H: 逐层 D2H —— 先把本层各请求的 KV 块从 NPU 刷进 CPU
+                    # staging(只拷本层字节区间), 再把 src 换成 staging 地址,
+                    # 因为 TCP 传输只能读写注册的 host 内存.
+                    global_te.sync_npu_to_cpu_for_npu_addrs(transfer_meta.src, transfer_meta.length)
+                    staging_src = []
+                    for src_addr in transfer_meta.src:
+                        cpu_addr = global_te.npu_addr_to_cpu_addr(src_addr)
+                        if cpu_addr is None:
+                            raise RuntimeError(
+                                f"H2H layerwise: NPU addr 0x{src_addr:x} not found "
+                                "in TCP staging map."
+                            )
+                        staging_src.append(cpu_addr)
+                    transfer_meta.src = staging_src
                 req_start_time = time.perf_counter()
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
@@ -504,7 +530,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         ret,
                     )
-                    self.failed_reqs.add(req_id)
+                    for failed_req_id in transfer_meta.req_ids:
+                        self.failed_reqs.add(failed_req_id)
                 else:
                     req_end_time = time.perf_counter()
                     total_transfer_size = sum(transfer_meta.length) / 1024
@@ -516,6 +543,33 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_id,
                         req_transfer_elapsed,
                     )
+                    if global_te.use_tcp:
+                        # 逐层通知 D 该层数据已写入其 staging, 等 D 完成该层
+                        # H2D 后回 ACK 才继续下一层(同线程串行). 由于请求级
+                        # DONE_SENDING 在最后层的 ACK 之后才发, D 的请求级
+                        # done 必然晚于全部层的 H2D, 满足"收到完整 KV 后才
+                        # 启动计算"的不变式.
+                        layer_done_ok = True
+                        peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int]]] = {}
+                        for layer_req_id in transfer_meta.req_ids:
+                            req_start, req_count = transfer_meta.req_slices[layer_req_id]
+                            layer_req_meta = send_task.send_request[layer_req_id]
+                            peer_key = (layer_req_meta.remote_host, layer_req_meta.remote_port)
+                            if peer_key not in peer_layer_msgs:
+                                peer_layer_msgs[peer_key] = ([], [])
+                            peer_layer_msgs[peer_key][0].extend(
+                                transfer_meta.dst[req_start : req_start + req_count]
+                            )
+                            peer_layer_msgs[peer_key][1].extend(
+                                transfer_meta.length[req_start : req_start + req_count]
+                            )
+                        for (peer_host, peer_port), (peer_addrs, peer_lengths) in peer_layer_msgs.items():
+                            if not self._send_layer_done_signal(peer_host, peer_port, peer_addrs, peer_lengths):
+                                layer_done_ok = False
+                                break
+                        if not layer_done_ok:
+                            for failed_req_id in transfer_meta.req_ids:
+                                self.failed_reqs.add(failed_req_id)
                 if send_task.layer_idx == (self.total_layers - 1):
                     for req_id in transfer_meta.req_ids:
                         req_meta = send_task.send_request[req_id]
@@ -525,6 +579,38 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 self.failed_reqs.discard(req_id)
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+
+    def _send_layer_done_signal(
+        self,
+        remote_host: str,
+        remote_port: int,
+        dst_addrs: list[int],
+        lengths: list[int],
+    ) -> bool:
+        """H2H: 通知 D 本层 KV 已写入其 staging, 等待 D 完成该层 H2D 后的 ACK.
+
+        REQ-REP 同步往返同时充当流控: ACK 未回前不进入下一层, 保证 D 侧
+        请求级 done (由最后层的 DONE_SENDING 触发) 严格晚于全层 H2D.
+        """
+        path = make_zmq_path("tcp", remote_host, remote_port)
+        encoder = msgspec.msgpack.Encoder()
+        data_bytes = encoder.encode((LAYER_DONE_SENDING_MSG, dst_addrs, lengths))
+        try:
+            with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                timeout_ms = int(LAYER_DONE_TIMEOUT_S * 1000)
+                sock.setsockopt(zmq.SNDTIMEO, timeout_ms)  # type: ignore
+                sock.setsockopt(zmq.RCVTIMEO, timeout_ms)  # type: ignore
+                sock.send(data_bytes)
+                resp = sock.recv()
+                return resp == b"ACK"
+        except zmq.ZMQError as e:  # type: ignore
+            logger.error(
+                "Layer done signal to %s:%d failed: %s",
+                remote_host,
+                remote_port,
+                e,
+            )
+            return False
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
@@ -641,9 +727,28 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
                         self.update_failed_task(request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
+                    elif msg[0] == LAYER_DONE_SENDING_MSG:
+                        # H2H: P 已完成本层推送, 数据落在本节点 CPU staging 中.
+                        # 把该层字节区间 H2D 拷回 NPU KV cache 后回 ACK; P 收到
+                        # ACK 才推进下一层, 保证请求级 done 严格晚于全层 H2D.
+                        logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(msg[1]))
+                        layer_reply = b"ACK"
+                        try:
+                            global_te.sync_cpu_to_npu_for_transfer(msg[1], msg[2])
+                        except Exception as e:
+                            logger.error(
+                                "LAYER_DONE_SENDING_MSG H2D failed: %s. "
+                                "msg=%s",
+                                e,
+                                msg,
+                            )
+                            layer_reply = b"NAK"
+                        sock.send_multipart((identity, b"", layer_reply))
                     else:
                         logger.error(
-                            "Unexpected message type: %s. expected GET_META_MSG or DONE_RECVING_MSG. msg=%s",
+                            "Unexpected message type: %s. expected GET_META_MSG, "
+                            "DONE_SENDING_MSG, FAILED_SENDING_MSG or "
+                            "LAYER_DONE_SENDING_MSG. msg=%s",
                             msg[0] if msg else "empty",
                             msg,
                         )
@@ -1331,7 +1436,45 @@ class MooncakeLayerwiseConnectorWorker:
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+
+        if global_te.use_tcp:
+            # H2H (TCP) layerwise v1 范围: pd_head_ratio==1 的统一 attention、
+            # 无 KV 量化/混合模型 —— 这些路径的 k/v buffer、mamba/共享 tensor
+            # 注册语义尚未在 staging 模式下适配, 先显式报错避免静默走错路径.
+            if (
+                self.pd_head_ratio != 1
+                or self.enable_kv_quant
+                or self.enable_c8_quant
+                or self.use_attn_mamba_hybrid
+            ):
+                raise RuntimeError(
+                    "H2H (TCP) layerwise v1 only supports pd_head_ratio==1 uniform "
+                    "attention without kv/c8 quantization or attn-mamba hybrid. "
+                    f"pd_head_ratio={self.pd_head_ratio}, enable_kv_quant="
+                    f"{self.enable_kv_quant}, enable_c8_quant={self.enable_c8_quant}, "
+                    f"use_attn_mamba_hybrid={self.use_attn_mamba_hybrid}"
+                )
+            global_te.register_tcp_staging(kv_caches)
+            if self.vllm_config.kv_transfer_config.is_kv_consumer:
+                # consumer 发布的是自己 CPU staging 的地址: P 推写的目的地.
+                # producer 侧 layer_metadata 保留 NPU 地址供内部 src 计算.
+                for layer_name, layer_meta in self.layer_metadata.items():
+                    replaced = []
+                    for base_addr in layer_meta.kv_caches_base_addr:
+                        cpu_addr = global_te.get_cpu_address_for_npu(base_addr)
+                        if cpu_addr is None:
+                            raise RuntimeError(
+                                f"H2H layerwise: layer {layer_name} tensor "
+                                f"0x{base_addr:x} not found in TCP staging map."
+                            )
+                        replaced.append(cpu_addr)
+                    layer_meta.kv_caches_base_addr = replaced
+                logger.info(
+                    "TCP mode: consumer published CPU staging addrs for %d layers.",
+                    len(self.layer_metadata),
+                )
+        else:
+            global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
 
         if use_kv_buffer:
             self.create_kv_buffer(kv_buffer)

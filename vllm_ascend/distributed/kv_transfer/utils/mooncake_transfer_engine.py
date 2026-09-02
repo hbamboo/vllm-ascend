@@ -4,8 +4,8 @@ import time
 from bisect import bisect_right
 
 import torch
-
 from vllm.logger import logger
+
 from vllm_ascend.distributed.kv_transfer.utils.utils import iter_kv_cache_tensors
 
 _BG_SYNC_INTERVAL = float(os.getenv("MC_TCP_BG_SYNC_INTERVAL", "1.0"))
@@ -47,6 +47,8 @@ class GlobalTE:
         self._npu_to_cpu_offset: dict[int, tuple[int, torch.Tensor]] = {}
         self._region_offsets: list[int] = []
         self._regions_by_offset: list[tuple[int, int, torch.Tensor]] = []
+        self._npu_region_bases: list[int] = []
+        self._npu_regions_by_base: list[tuple[int, int, torch.Tensor]] = []
         self._use_tcp: bool | None = None
         self._bg_sync_thread: threading.Thread | None = None
         self._bg_sync_stop = threading.Event()
@@ -189,6 +191,13 @@ class GlobalTE:
             for npu_ptr, (off, tensor) in self._npu_to_cpu_offset.items()
         )
         self._region_offsets = [off for off, _, _ in self._regions_by_offset]
+        # 按 NPU 首地址升序建索引, 供按任意 NPU 字节地址换算 staging 地址
+        # (逐层 H2H: flush 与 src 地址替换).
+        self._npu_regions_by_base = sorted(
+            (npu_ptr, off, tensor)
+            for npu_ptr, (off, tensor) in self._npu_to_cpu_offset.items()
+        )
+        self._npu_region_bases = [base for base, _, _ in self._npu_regions_by_base]
 
         ret_value = self.transfer_engine.register_memory(cpu_base, total_bytes)
         if ret_value != 0:
@@ -331,6 +340,62 @@ class GlobalTE:
             time.perf_counter() - t0,
         )
         return copied_bytes
+
+    def sync_npu_to_cpu_for_npu_addrs(
+        self, npu_addrs: list[int], lengths: list[int]
+    ) -> int:
+        """P 侧: 把任意 NPU 字节区间(层内 block 地址)拷到 CPU staging (D2H).
+        逐层 H2H 时在 batch_transfer_sync_write 前调用, 保证 push 出去的是
+        最新 KV 而非陈旧快照. 返回实际拷贝的字节数."""
+        if not self._cpu_tensors or not self._npu_regions_by_base:
+            return 0
+        cpu_tensor = self._cpu_tensors[0]
+        t0 = time.perf_counter()
+        copied_bytes = 0
+        skipped = 0
+        torch.npu.synchronize()
+        for npu_addr, byte_size in zip(npu_addrs, lengths):
+            idx = bisect_right(self._npu_region_bases, npu_addr) - 1
+            if idx < 0:
+                skipped += 1
+                continue
+            npu_base, np_offset, npu_tensor = self._npu_regions_by_base[idx]
+            npu_byte_size = npu_tensor.numel() * npu_tensor.element_size()
+            if npu_addr >= npu_base + npu_byte_size:
+                skipped += 1
+                continue
+            inner_offset = npu_addr - npu_base
+            actual_size = min(byte_size, npu_byte_size - inner_offset)
+            if actual_size <= 0:
+                skipped += 1
+                continue
+            cpu_view = cpu_tensor[np_offset + inner_offset : np_offset + inner_offset + actual_size]
+            _safe_copy_npu_to_cpu(cpu_view, npu_tensor, actual_size, inner_offset)
+            copied_bytes += actual_size
+        torch.npu.synchronize()
+        logger.info(
+            "[mooncake][TCP] layerwise flush (NPU->CPU): ranges=%d bytes=%d "
+            "skipped=%d elapsed=%.3fs",
+            len(npu_addrs),
+            copied_bytes,
+            skipped,
+            time.perf_counter() - t0,
+        )
+        return copied_bytes
+
+    def npu_addr_to_cpu_addr(self, npu_addr: int) -> int | None:
+        """把任意 NPU 字节地址换算成 staging 中的对应 CPU 地址.
+        用于把逐层传输的 src (NPU 块地址) 整体替换为 TCP 可读的 staging 地址."""
+        if not self._cpu_tensors or not self._npu_regions_by_base:
+            return None
+        idx = bisect_right(self._npu_region_bases, npu_addr) - 1
+        if idx < 0:
+            return None
+        npu_base, np_offset, npu_tensor = self._npu_regions_by_base[idx]
+        npu_byte_size = npu_tensor.numel() * npu_tensor.element_size()
+        if npu_addr >= npu_base + npu_byte_size:
+            return None
+        return self._cpu_tensors[0].data_ptr() + np_offset + (npu_addr - npu_base)
 
     def sync_cpu_to_npu_for_region(self, npu_ptr: int, byte_size: int):
         if not self._cpu_tensors:
