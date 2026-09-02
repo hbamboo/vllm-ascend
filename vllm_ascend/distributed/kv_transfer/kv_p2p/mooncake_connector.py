@@ -979,6 +979,19 @@ class KVCacheRecvingThread(threading.Thread):
             session_id,
         )
 
+        h2d_start_time = time.perf_counter()
+        if global_te.use_tcp:
+             global_te.sync_cpu_to_npu_for_transfer(src_list, length_list)
+        h2d_end_time = time.perf_counter()
+        h2d_elapsed = (h2d_end_time - h2d_start_time) * 1000
+        logger.info(
+            "KV cache transfer CPU to NPU sync for request %s took %.2f ms. local_ip %s local_device_id %s remote_session_id %s", remote_request_id,
+                        h2d_elapsed,
+                        get_ip(),
+                        self.tp_rank,
+                        session_id,
+        )
+
         ready_attention_group_reformat_block_ids = []
         for reformat_group, is_group_transfer_end in attention_group_reformat_block_ids:
             if is_group_transfer_end:
@@ -2394,7 +2407,25 @@ class MooncakeConnectorWorker:
             register_regions = collect_storage_merged_register_regions(kv_caches)
 
         validate_register_region_count(register_regions)
-        global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
+
+        if global_te.use_tcp:
+            global_te.register_tcp_staging(kv_caches=kv_caches)
+            if self.kv_role == "kv_producer":
+                global_te.start_bg_sync()
+            cpu_addr = global_te.get_cpu_address_for_npu(self.kv_caches_base_addr[0][0])
+            if cpu_addr is not None:
+                for layer_idx, layer_addrs in enumerate(self.kv_caches_base_addr):
+                    self.kv_caches_base_addr[layer_idx] = [
+                          global_te.get_cpu_address_for_npu(a) if
+                          global_te.get_cpu_address_for_npu(a) is not None else a
+                          for a in layer_addrs
+                      ]
+                    logger.info(
+                      "TCP mode: replaced NPU base addrs with CPU staging addrs (CPU staging at 0x%x)",
+                      cpu_addr - self.block_len_per_addr[0][0] * 0,  # staging base for display
+                  )
+            else:
+                global_te.register_buffer(register_regions.ptrs,register_regions.lengths)
 
         logger.debug(
             "Mooncake register kv caches metadata: kv_group2layeridx=%s, kv_caches_base_addr=%s, "

@@ -110,6 +110,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Mooncake transfer protocol for PD disaggregation.
+    # Supported: "ascend" (default, uses AscendDirect/RDMA), "tcp" (uses TCP
+    # with CPU-side staging buffers for cross-datacenter scenarios).
+    # When set to "tcp", KV cache data is staged through CPU DRAM before
+    # being transferred by mooncake. This enables TCP-only interconnects
+    # but adds NPU<->CPU copy overhead.
+    "VLLM_ASCEND_MOONCAKE_PROTOCOL": lambda: os.getenv(
+        "VLLM_ASCEND_MOONCAKE_PROTOCOL", "ascend"
+    ),
 }
 
 # end-env-vars-definition
