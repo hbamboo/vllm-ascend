@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+from bisect import bisect_right
 
 import torch
 
@@ -44,6 +45,8 @@ class GlobalTE:
         self._protocol: str = ""
         self._cpu_tensors: list[torch.Tensor] = []
         self._npu_to_cpu_offset: dict[int, tuple[int, torch.Tensor]] = {}
+        self._region_offsets: list[int] = []
+        self._regions_by_offset: list[tuple[int, int, torch.Tensor]] = []
         self._use_tcp: bool | None = None
         self._bg_sync_thread: threading.Thread | None = None
         self._bg_sync_stop = threading.Event()
@@ -180,6 +183,13 @@ class GlobalTE:
             self._npu_to_cpu_offset[npu_ptr] = (offset, cache)
             offset += byte_size
 
+        # 按 staging 偏移升序建索引, 供按 CPU 地址反查 region (flush 用).
+        self._regions_by_offset = sorted(
+            (off, npu_ptr, tensor)
+            for npu_ptr, (off, tensor) in self._npu_to_cpu_offset.items()
+        )
+        self._region_offsets = [off for off, _, _ in self._regions_by_offset]
+
         ret_value = self.transfer_engine.register_memory(cpu_base, total_bytes)
         if ret_value != 0:
             logger.error(
@@ -274,6 +284,53 @@ class GlobalTE:
         torch.npu.synchronize()
         _safe_copy_npu_to_cpu(cpu_view, npu_tensor, actual_size, 0)
         torch.npu.synchronize()
+
+    def sync_npu_to_cpu_for_addrs(
+        self, cpu_addrs: list[int], lengths: list[int]
+    ) -> int:
+        """P 侧: 收到 D 的 FLUSH 请求后, 按 staging 地址反查 NPU region,
+        把 D 即将读取的字节区间从 NPU 拷回 CPU staging (D2H), 保证 TCP
+        读到的不是陈旧快照. 返回实际拷贝的字节数."""
+        if not self._cpu_tensors or not self._regions_by_offset:
+            return 0
+        cpu_tensor = self._cpu_tensors[0]
+        cpu_base = cpu_tensor.data_ptr()
+        t0 = time.perf_counter()
+        copied_bytes = 0
+        skipped = 0
+        torch.npu.synchronize()
+        for cpu_addr, byte_size in zip(cpu_addrs, lengths):
+            rel = cpu_addr - cpu_base
+            if rel < 0:
+                skipped += 1
+                continue
+            idx = bisect_right(self._region_offsets, rel) - 1
+            if idx < 0:
+                skipped += 1
+                continue
+            np_offset, _, npu_tensor = self._regions_by_offset[idx]
+            npu_byte_size = npu_tensor.numel() * npu_tensor.element_size()
+            if rel >= np_offset + npu_byte_size:
+                skipped += 1
+                continue
+            inner_offset = rel - np_offset
+            actual_size = min(byte_size, npu_byte_size - inner_offset)
+            if actual_size <= 0:
+                skipped += 1
+                continue
+            cpu_view = cpu_tensor[rel : rel + actual_size]
+            _safe_copy_npu_to_cpu(cpu_view, npu_tensor, actual_size, inner_offset)
+            copied_bytes += actual_size
+        torch.npu.synchronize()
+        logger.info(
+            "[mooncake][TCP] flush for pull: ranges=%d bytes=%d "
+            "skipped=%d elapsed=%.3fs",
+            len(cpu_addrs),
+            copied_bytes,
+            skipped,
+            time.perf_counter() - t0,
+        )
+        return copied_bytes
 
     def sync_cpu_to_npu_for_region(self, npu_ptr: int, byte_size: int):
         if not self._cpu_tensors:

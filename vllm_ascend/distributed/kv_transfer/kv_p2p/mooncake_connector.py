@@ -80,6 +80,10 @@ if TYPE_CHECKING:
 
 GET_META_MSG = b"get_meta_msg"
 DONE_RECVING_MSG = b"done_recving_msg"
+FLUSH_STAGING_MSG = b"flush_staging_msg"
+
+# FLUSH 握手走独立连接, 需要覆盖 P 侧完整 D2H 时间 (并发排队时可能数秒).
+FLUSH_STAGING_TIMEOUT_S = 30.0
 
 
 # A busy peer can otherwise keep a global executor worker forever when the
@@ -384,10 +388,39 @@ class KVCacheSendingThread(threading.Thread):
                             # If the socket is not ready, retry sending.
                             logger.debug("Socket not ready, retrying to send ACK for request %s", msg[1])
                             time.sleep(0.01)
+                elif msg[0] == FLUSH_STAGING_MSG:
+                    # msg = (FLUSH_STAGING_MSG, dst_addrs, lengths): D 即将读取
+                    # 本 rank staging 上的这些字节区间, 先把对应的 NPU KV 数据
+                    # 拷回 CPU staging (D2H), 确保 TCP 读到的不是陈旧快照.
+                    logger.debug(
+                        "Got FLUSH_STAGING_MSG for %d ranges",
+                        len(msg[1]) if len(msg) > 1 else 0,
+                    )
+                    flush_reply = b"ACK"
+                    try:
+                        global_te.sync_npu_to_cpu_for_addrs(msg[1], msg[2])
+                    except Exception as e:
+                        logger.error(
+                            "FLUSH_STAGING_MSG handling failed: %s. "
+                            "Full message: %s. ",
+                            e,
+                            msg,
+                        )
+                        flush_reply = b"NAK"
+                    while True:
+                        try:
+                            sock.send_multipart(
+                                (identity, b"", flush_reply), flags=zmq.NOBLOCK  # type: ignore
+                            )
+                            break
+                        except zmq.Again:  # type: ignore
+                            # If the socket is not ready, retry sending.
+                            logger.debug("Socket not ready, retrying to send flush reply")
+                            time.sleep(0.01)
                 else:
                     logger.error(
                         "Connection listener received unexpected message type. "
-                        "Expected: GET_META_MSG or DONE_RECVING_MSG. "
+                        "Expected: GET_META_MSG, DONE_RECVING_MSG or FLUSH_STAGING_MSG. "
                         "Actual: %s. "
                         "Full message: %s. "
                         "Check: Verify message protocol implementation.",
@@ -959,6 +992,10 @@ class KVCacheRecvingThread(threading.Thread):
             dst_list,
             length_list,
         )
+        if global_te.use_tcp and dst_list:
+            # dst_list 是 P 侧 CPU staging 地址: 拉取前先让 P 把对应区间从
+            # NPU 刷到 staging (D2H), 避免 TCP 读到陈旧快照导致精度错误.
+            self._flush_remote_staging(remote_host, remote_handshake_port, dst_list, length_list)
         ret = self.engine.batch_transfer_sync_read(session_id, src_list, dst_list, length_list)
         if ret < 0:
             logger.error(
@@ -1448,6 +1485,53 @@ class KVCacheRecvingThread(threading.Thread):
             if sock is not None:
                 self._return_remote_socket(sock, remote_host, remote_handshake_port)
                 logger.debug("Returned socket to pool for %s:%d", remote_host, remote_handshake_port)
+
+    def _flush_remote_staging(
+        self,
+        remote_host: str,
+        remote_handshake_port: int,
+        dst_addrs: list[int],
+        lengths: list[int],
+    ) -> None:
+        """TCP 模式: batch_transfer_sync_read 前请求 P 把将要读取的 staging
+        区间从 NPU 刷到 CPU (D2H), 保证读到的是最新 KV 而非陈旧快照.
+
+        等待 P 回 ACK 后才返回, 返回后调用方才允许发起真正的拉取.
+        P 回 NAK 或连接失败时抛错, 由调用方走现有 failed-request 路径.
+        """
+        remote_path = make_zmq_path("tcp", remote_host, remote_handshake_port)
+        logger.debug(
+            "Sending flush-staging request to %s for %d ranges",
+            remote_path,
+            len(dst_addrs),
+        )
+        # FLUSH 需要覆盖 P 侧完整 D2H 时间(并发排队时可能数秒), 不能复用
+        # 1s 超时的共享连接池, 这里用独立短生命周期连接.
+        ctx = zmq.Context()  # type: ignore
+        sock = make_zmq_socket(
+            ctx=ctx,
+            path=remote_path,
+            socket_type=zmq.REQ,  # type: ignore
+            bind=False,
+        )
+        timeout_ms = int(FLUSH_STAGING_TIMEOUT_S * 1000)
+        sock.setsockopt(zmq.SNDTIMEO, timeout_ms)  # type: ignore
+        sock.setsockopt(zmq.RCVTIMEO, timeout_ms)  # type: ignore
+        data_bytes = self.encoder.encode((FLUSH_STAGING_MSG, dst_addrs, lengths))
+        try:
+            sock.send(data_bytes)
+            resp = sock.recv()
+        except zmq.ZMQError as e:  # type: ignore
+            raise RuntimeError(
+                f"Flush-staging request to {remote_path} failed: {e}"
+            ) from e
+        finally:
+            sock.close()
+            ctx.term()
+        if resp != b"ACK":
+            raise RuntimeError(
+                f"Remote staging flush failed. source={remote_path}, resp={resp!r}"
+            )
 
     def _get_remote_socket(self, remote_host: str, remote_handshake_port: int) -> zmq.Socket:  # type: ignore
         """Get a socket to the remote host."""
