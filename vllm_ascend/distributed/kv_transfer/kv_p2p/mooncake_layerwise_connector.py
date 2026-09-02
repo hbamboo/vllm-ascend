@@ -513,10 +513,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     for src_addr in transfer_meta.src:
                         cpu_addr = global_te.npu_addr_to_cpu_addr(src_addr)
                         if cpu_addr is None:
-                            raise RuntimeError(
-                                f"H2H layerwise: NPU addr 0x{src_addr:x} not found "
-                                "in TCP staging map."
-                            )
+                            raise RuntimeError(f"H2H layerwise: NPU addr 0x{src_addr:x} not found in TCP staging map.")
                         staging_src.append(cpu_addr)
                     transfer_meta.src = staging_src
                 req_start_time = time.perf_counter()
@@ -557,12 +554,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                             peer_key = (layer_req_meta.remote_host, layer_req_meta.remote_port)
                             if peer_key not in peer_layer_msgs:
                                 peer_layer_msgs[peer_key] = ([], [])
-                            peer_layer_msgs[peer_key][0].extend(
-                                transfer_meta.dst[req_start : req_start + req_count]
-                            )
-                            peer_layer_msgs[peer_key][1].extend(
-                                transfer_meta.length[req_start : req_start + req_count]
-                            )
+                            peer_layer_msgs[peer_key][0].extend(transfer_meta.dst[req_start : req_start + req_count])
+                            peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
                         for (peer_host, peer_port), (peer_addrs, peer_lengths) in peer_layer_msgs.items():
                             if not self._send_layer_done_signal(peer_host, peer_port, peer_addrs, peer_lengths):
                                 layer_done_ok = False
@@ -688,6 +681,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
 
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
+        # LAYER_DONE H2D 在本线程执行 (sync_cpu_to_npu_for_transfer), 必须显式
+        # 绑定本 rank 的 NPU 设备: torch_npu 的设备/流上下文是线程级的, 未
+        # set_device 的线程在自定义 op 内 aclrtGetDevice 会拿到非预期设备,
+        # 导致 aclrtMemcpyBatchAsync 参数校验失败 (107000). 与发送线程
+        # (KVCacheSendingLayerThread.run) 的 set_device 保持一致.
+        local_rank = get_world_group().local_rank
+        device = torch.device(f"npu:{local_rank}")
+        torch.npu.set_device(device)
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
         logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
@@ -737,8 +738,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             global_te.sync_cpu_to_npu_for_transfer(msg[1], msg[2])
                         except Exception as e:
                             logger.error(
-                                "LAYER_DONE_SENDING_MSG H2D failed: %s. "
-                                "msg=%s",
+                                "LAYER_DONE_SENDING_MSG H2D failed: %s. msg=%s",
                                 e,
                                 msg,
                             )
@@ -1441,12 +1441,7 @@ class MooncakeLayerwiseConnectorWorker:
             # H2H (TCP) layerwise v1 范围: pd_head_ratio==1 的统一 attention、
             # 无 KV 量化/混合模型 —— 这些路径的 k/v buffer、mamba/共享 tensor
             # 注册语义尚未在 staging 模式下适配, 先显式报错避免静默走错路径.
-            if (
-                self.pd_head_ratio != 1
-                or self.enable_kv_quant
-                or self.enable_c8_quant
-                or self.use_attn_mamba_hybrid
-            ):
+            if self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant or self.use_attn_mamba_hybrid:
                 raise RuntimeError(
                     "H2H (TCP) layerwise v1 only supports pd_head_ratio==1 uniform "
                     "attention without kv/c8 quantization or attn-mamba hybrid. "
