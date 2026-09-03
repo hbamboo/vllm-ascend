@@ -166,6 +166,15 @@ class GlobalTE:
         self._regions_by_offset: list[tuple[int, int, torch.Tensor]] = []
         self._npu_region_bases: list[int] = []
         self._npu_regions_by_base: list[tuple[int, int, torch.Tensor]] = []
+        # Region-mode staging (attn-mamba hybrid / shared-tensor layouts):
+        # mirrors whole physical NPU regions (incl. inter-view padding) 1:1
+        # into CPU staging, so any NPU byte address inside a region maps
+        # linearly to its staging address. Populated by
+        # ``register_tcp_staging_regions``.
+        self._regions_npu_base: list[int] = []
+        self._regions_npu: list[tuple[int, int, int]] = []  # (npu_base, len, cpu_off)
+        self._regions_cpu_off: list[int] = []
+        self._regions_cpu: list[tuple[int, int, int]] = []  # (cpu_off, len, npu_base)
         self._use_tcp: bool | None = None
         self._bg_sync_thread: threading.Thread | None = None
         self._bg_sync_stop = threading.Event()
@@ -240,6 +249,128 @@ class GlobalTE:
                 return
             self._build_tcp_staging_from_tensors(kv_caches)
             self.is_register_buffer = True
+
+    def register_tcp_staging_regions(self, npu_regions: list[tuple[int, int]]) -> None:
+        """Region-mode TCP staging: mirror whole physical NPU regions into CPU staging.
+
+        ``npu_regions`` is a list of ``(npu_base, byte_len)`` covering every byte
+        range that may ever be flushed / transferred (the physical KV cache
+        tensors, with the same [min(shared addr) - mamba conv padding, size]
+        semantics as the D2D ``use_attn_mamba_hybrid`` registration).  Layout
+        inside each region is preserved 1:1 (including padding between layer
+        views of a shared buffer), so any NPU byte address inside a region maps
+        to a unique staging address via ``npu_addr_to_cpu_addr`` and back via
+        ``sync_cpu_to_npu_for_transfer``.
+
+        Required for attn-mamba hybrid models whose per-layer caches are views
+        of a shared physical tensor with non-contiguous page / padding layout;
+        the per-view staging built by ``register_tcp_staging`` drops those gaps
+        and cannot address them consistently.
+        """
+        with self.register_buffer_lock:
+            assert self.transfer_engine is not None, "Transfer engine must be initialized"
+            if self.is_register_buffer:
+                return
+            assert not self._cpu_tensors, "staging buffer already built"
+            regions = sorted((base, length) for base, length in npu_regions if length > 0)
+            prev_end = 0
+            for base, length in regions:
+                if base < prev_end:
+                    raise RuntimeError(
+                        f"Overlapping TCP staging regions: 0x{base:x} < previous end 0x{prev_end:x}. "
+                        "Region-mode staging requires disjoint physical KV cache regions."
+                    )
+                prev_end = base + length
+            total_bytes = sum(length for _, length in regions)
+            cpu_buffer = torch.empty(total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True)
+            cpu_base = cpu_buffer.data_ptr()
+            cpu_off = 0
+            self._regions_npu = []
+            self._regions_cpu = []
+            for base, length in regions:
+                self._regions_npu.append((base, length, cpu_off))
+                self._regions_cpu.append((cpu_off, length, base))
+                cpu_off += length
+            self._regions_npu_base = [base for base, _, _ in self._regions_npu]
+            self._regions_cpu_off = [off for off, _, _ in self._regions_cpu]
+            ret_value = self.transfer_engine.register_memory(cpu_base, total_bytes)
+            if ret_value != 0:
+                logger.error(
+                    "Mooncake TCP register_memory failed: ptr=0x%x size=%d ret=%d",
+                    cpu_base,
+                    total_bytes,
+                    ret_value,
+                )
+                raise RuntimeError("Mooncake memory registration failed.")
+            self._cpu_tensors.append(cpu_buffer)
+            self.is_register_buffer = True
+            logger.info(
+                "TCP region-mode staging ready: CPU buffer at 0x%x (%.2f GiB), %d regions.",
+                cpu_base,
+                total_bytes / (1024**3),
+                len(regions),
+            )
+
+    def _npu_to_cpu_addr_in_regions(self, npu_addr: int) -> int | None:
+        """Region-mode: map an arbitrary NPU byte address to its staging address."""
+        if not self._regions_npu:
+            return None
+        idx = bisect_right(self._regions_npu_base, npu_addr) - 1
+        if idx < 0:
+            return None
+        base, length, cpu_off = self._regions_npu[idx]
+        if npu_addr >= base + length:
+            return None
+        return self._cpu_tensors[0].data_ptr() + cpu_off + (npu_addr - base)
+
+    def _cpu_to_npu_addr_in_regions(self, cpu_addr: int) -> int | None:
+        """Region-mode: map a staging address back to its NPU address."""
+        if not self._regions_cpu:
+            return None
+        cpu_base = self._cpu_tensors[0].data_ptr()
+        rel = cpu_addr - cpu_base
+        idx = bisect_right(self._regions_cpu_off, rel) - 1
+        if idx < 0:
+            return None
+        off, length, base = self._regions_cpu[idx]
+        if rel >= off + length:
+            return None
+        return base + (rel - off)
+
+    @property
+    def _region_mode(self) -> bool:
+        return bool(self._regions_npu)
+
+    def _flush_cpu_addrs_region_mode(self, cpu_addrs: list[int], lengths: list[int]) -> int:
+        """Region-mode FLUSH (pull path): copy the byte ranges a remote reader
+        is about to read back from NPU into this node's CPU staging."""
+        t0 = time.perf_counter()
+        copied_bytes = 0
+        skipped = 0
+        # 前置同步: 确保 NPU cache 数据(计算流)已就绪; 拷贝在专用 DMA 流.
+        torch.npu.synchronize()
+        src_ptrs: list[int] = []
+        dst_ptrs: list[int] = []
+        sizes: list[int] = []
+        for cpu_addr, byte_size in zip(cpu_addrs, lengths):
+            npu_addr = self._cpu_to_npu_addr_in_regions(cpu_addr)
+            if npu_addr is None:
+                skipped += 1
+                continue
+            src_ptrs.append(npu_addr)
+            dst_ptrs.append(cpu_addr)
+            sizes.append(byte_size)
+            copied_bytes += byte_size
+        self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_D2H)
+        log_fn = logger.info if _PERF_LOG else logger.debug
+        log_fn(
+            "[mooncake][TCP] region flush for pull: ranges=%d bytes=%d skipped=%d elapsed=%.3fs",
+            len(cpu_addrs),
+            copied_bytes,
+            skipped,
+            time.perf_counter() - t0,
+        )
+        return copied_bytes
 
     def start_bg_sync(self):
         self._start_bg_sync()
@@ -353,6 +484,24 @@ class GlobalTE:
         total_bytes = 0
         # 前置同步: 确保 NPU cache 数据(计算流)就绪; 拷贝在专用 DMA 流执行.
         torch.npu.synchronize()
+        if self._region_mode:
+            src_ptrs: list[int] = []
+            dst_ptrs: list[int] = []
+            sizes: list[int] = []
+            for npu_base, byte_size, cpu_off in self._regions_npu:
+                total_bytes += byte_size
+                src_ptrs.append(npu_base)
+                dst_ptrs.append(self._cpu_tensors[0].data_ptr() + cpu_off)
+                sizes.append(byte_size)
+            self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_D2H)
+            if first:
+                logger.info(
+                    "[mooncake][TCP] bg_sync D2H (NPU->CPU) first pass: %.2f MiB in %.3fs, regions=%d",
+                    total_bytes / (1024**2),
+                    time.perf_counter() - t0,
+                    len(self._regions_npu),
+                )
+            return
         items: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
         for npu_ptr, (offset, npu_tensor) in self._npu_to_cpu_offset.items():
             byte_size = npu_tensor.numel() * npu_tensor.element_size()
@@ -378,6 +527,8 @@ class GlobalTE:
     def get_cpu_address_for_npu(self, npu_ptr: int) -> int | None:
         if not self._cpu_tensors:
             return None
+        if self._region_mode:
+            return self._npu_to_cpu_addr_in_regions(npu_ptr)
         entry = self._npu_to_cpu_offset.get(npu_ptr)
         if entry is None:
             return None
@@ -402,7 +553,11 @@ class GlobalTE:
         """P 侧: 收到 D 的 FLUSH 请求后, 按 staging 地址反查 NPU region,
         把 D 即将读取的字节区间从 NPU 拷回 CPU staging (D2H), 保证 TCP
         读到的不是陈旧快照. 返回实际拷贝的字节数."""
-        if not self._cpu_tensors or not self._regions_by_offset:
+        if not self._cpu_tensors:
+            return 0
+        if self._region_mode:
+            return self._flush_cpu_addrs_region_mode(cpu_addrs, lengths)
+        if not self._regions_by_offset:
             return 0
         cpu_tensor = self._cpu_tensors[0]
         cpu_base = cpu_tensor.data_ptr()
@@ -451,7 +606,11 @@ class GlobalTE:
         """P 侧: 把任意 NPU 字节区间(层内 block 地址)拷到 CPU staging (D2H).
         逐层 H2H 时在 batch_transfer_sync_write 前调用, 保证 push 出去的是
         最新 KV 而非陈旧快照. 返回实际拷贝的字节数."""
-        if not self._cpu_tensors or not self._npu_regions_by_base:
+        if not self._cpu_tensors:
+            return 0
+        if self._region_mode:
+            return self._sync_npu_to_cpu_regions(npu_addrs, lengths)
+        if not self._npu_regions_by_base:
             return 0
         cpu_tensor = self._cpu_tensors[0]
         t0 = time.perf_counter()
@@ -497,10 +656,73 @@ class GlobalTE:
         )
         return copied_bytes
 
+    def _sync_npu_to_cpu_regions(self, npu_addrs: list[int], lengths: list[int]) -> int:
+        """Region-mode D2H flush: map NPU ranges to staging addrs and batch-copy."""
+        t0 = time.perf_counter()
+        copied_bytes = 0
+        skipped = 0
+        src_ptrs: list[int] = []
+        dst_ptrs: list[int] = []
+        sizes: list[int] = []
+        for npu_addr, byte_size in zip(npu_addrs, lengths):
+            if byte_size <= 0:
+                continue
+            cpu_addr = self._npu_to_cpu_addr_in_regions(npu_addr)
+            if cpu_addr is None:
+                skipped += 1
+                continue
+            src_ptrs.append(npu_addr)
+            dst_ptrs.append(cpu_addr)
+            sizes.append(byte_size)
+            copied_bytes += byte_size
+        self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_D2H)
+        log_fn = logger.info if _PERF_LOG else logger.debug
+        log_fn(
+            "[mooncake][TCP] region flush (NPU->CPU): ranges=%d bytes=%d skipped=%d elapsed=%.5f ms",
+            len(npu_addrs),
+            copied_bytes,
+            skipped,
+            (time.perf_counter() - t0) * 1000,
+        )
+        return copied_bytes
+
+    def _sync_cpu_to_npu_regions(self, cpu_addrs: list[int], lengths: list[int]) -> None:
+        """Region-mode H2D: map staging addrs back to NPU ranges and batch-copy."""
+        t0 = time.perf_counter()
+        total_bytes = 0
+        src_ptrs: list[int] = []
+        dst_ptrs: list[int] = []
+        sizes: list[int] = []
+        for cpu_addr, byte_size in zip(cpu_addrs, lengths):
+            if byte_size <= 0:
+                continue
+            npu_addr = self._cpu_to_npu_addr_in_regions(cpu_addr)
+            if npu_addr is None:
+                raise RuntimeError(
+                    f"H2H layerwise: CPU staging addr 0x{cpu_addr:x} not found in region map. "
+                    "Remote producer wrote to an address outside the registered staging regions."
+                )
+            src_ptrs.append(cpu_addr)
+            dst_ptrs.append(npu_addr)
+            sizes.append(byte_size)
+            total_bytes += byte_size
+        self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_H2D)
+        log_fn = logger.info if _PERF_LOG else logger.debug
+        log_fn(
+            "[mooncake][TCP] region H2D (CPU->NPU): ranges=%d bytes=%d elapsed=%.5f ms",
+            len(cpu_addrs),
+            total_bytes,
+            (time.perf_counter() - t0) * 1000,
+        )
+
     def npu_addr_to_cpu_addr(self, npu_addr: int) -> int | None:
         """把任意 NPU 字节地址换算成 staging 中的对应 CPU 地址.
         用于把逐层传输的 src (NPU 块地址) 整体替换为 TCP 可读的 staging 地址."""
-        if not self._cpu_tensors or not self._npu_regions_by_base:
+        if not self._cpu_tensors:
+            return None
+        if self._region_mode:
+            return self._npu_to_cpu_addr_in_regions(npu_addr)
+        if not self._npu_regions_by_base:
             return None
         idx = bisect_right(self._npu_region_bases, npu_addr) - 1
         if idx < 0:
@@ -527,6 +749,9 @@ class GlobalTE:
 
     def sync_cpu_to_npu_for_transfer(self, src_addrs: list[int], lengths: list[int]):
         if not self._cpu_tensors:
+            return
+        if self._region_mode:
+            self._sync_cpu_to_npu_regions(src_addrs, lengths)
             return
         cpu_tensor = self._cpu_tensors[0]
         cpu_base = cpu_tensor.data_ptr()
@@ -653,6 +878,39 @@ class GlobalTE:
                 flat.view(torch.uint8)[npu_off : npu_off + byte_size].copy_(cpu_view)
         if sync:
             torch.npu.synchronize()
+
+    def submit_dma_copy_ptrs(
+        self,
+        src_ptrs: list[int],
+        dst_ptrs: list[int],
+        sizes: list[int],
+        direction: int,
+        sync: bool = True,
+    ) -> None:
+        """Region-mode batch NPU<->CPU staging copy over raw byte addresses.
+
+        Same batch-DMA backend as ``submit_dma_copy``, but takes raw source /
+        destination byte pointers instead of tensors, so region ranges that do
+        not map to a single torch tensor (shared-buffer padding offsets) can be
+        flushed / H2D'd in one ``aclrtMemcpyBatchAsync`` call. Region mode
+        requires the custom batch op: there is no safe per-range torch fallback
+        for arbitrary byte ranges.
+        """
+        if not src_ptrs:
+            return
+        if not _HAS_SWAP_BLOCKS_BATCH:
+            raise RuntimeError(
+                "[mooncake][TCP] region-mode staging requires the swap_blocks_batch "
+                "custom op for batch DMA; it is unavailable in this environment."
+            )
+        stream = self._get_copy_stream(direction)
+        src_t = torch.from_numpy(np.asarray(src_ptrs, dtype=np.int64))
+        dst_t = torch.from_numpy(np.asarray(dst_ptrs, dtype=np.int64))
+        size_t = torch.from_numpy(np.asarray(sizes, dtype=np.int64))
+        with torch.npu.stream(stream):
+            torch.ops._C_ascend.swap_blocks_batch(src_t, dst_t, size_t, direction)
+        if sync:
+            stream.synchronize()
 
 
 global_te = GlobalTE()

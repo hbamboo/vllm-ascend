@@ -2585,6 +2585,16 @@ class NPUModelRunner(GPUModelRunner):
                 global_stream().wait_event(self.sampling_done_event)
                 self._update_states_after_model_execute(sampler_output.sampled_token_ids, scheduler_output)
 
+        # Hybrid (attn+mamba) layerwise KV transfer: mamba/GDN 状态缓存的最终
+        # 内容由上面的 postprocess (global stream) 写定, 逐层 flush 若在 forward
+        # 中途读取将拿到非最终状态. 通知 layerwise connector 记录 step-end 事件
+        # (记录在 global stream, 晚于 postprocess 入队), 发送线程据此延迟冲刷
+        # mamba 层任务. 其它 connector 无此方法, 跳过.
+        if has_kv_transfer_group():
+            notify = getattr(get_kv_transfer_group(), "notify_runner_step_end", None)
+            if notify is not None:
+                notify()
+
         # In async scheduling + PP, broadcast sampled token ids from the
         # last PP rank so other PP ranks can receive them without going
         # through the scheduler/engine IPC path.
