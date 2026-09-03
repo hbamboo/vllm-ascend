@@ -452,7 +452,8 @@ class GlobalTE:
         copied_bytes = 0
         skipped = 0
         # 前置同步: 确保本层 KV(计算流)已写完; 拷贝在专用 DMA 流上批量执行.
-        torch.npu.synchronize()
+        # TODO: push模式已通过wait_event保证数据ready；pull无前序保证，需完善
+        # torch.npu.synchronize()
         items: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
         for npu_addr, byte_size in zip(npu_addrs, lengths):
             idx = bisect_right(self._npu_region_bases, npu_addr) - 1
