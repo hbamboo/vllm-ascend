@@ -11,6 +11,98 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import iter_kv_cache_tensor
 
 _BG_SYNC_INTERVAL = float(os.getenv("MC_TCP_BG_SYNC_INTERVAL", "1.0"))
 
+# 传输线程 CPU 绑核开关: 1=开启. 开启后发送/接收线程自动绑定到当前进程
+# 允许核集(Cpus_allowed_list, 已受 vllm-ascend cpu_binding 的 taskset 约束)中
+# 负载最低的核, 外层无需感知具体核号. 默认关闭, 避免与模型计算意外争抢.
+_CPU_BIND_ENABLED = os.getenv("MC_TCP_CPU_BIND", "0") == "1"
+_cpu_bind_lock = threading.Lock()
+_cpu_bind_used: set[int] = set()
+
+
+def _parse_cpus_allowed() -> list[int]:
+    """解析 /proc/self/status 的 Cpus_allowed_list(容器 cpuset + 已绑核的交集)."""
+    try:
+        with open("/proc/self/status") as f:
+            for line in f:
+                if line.startswith("Cpus_allowed_list"):
+                    cpus: list[int] = []
+                    for part in line.split(":", 1)[1].strip().split(","):
+                        part = part.strip()
+                        if "-" in part:
+                            lo, hi = part.split("-")
+                            cpus.extend(range(int(lo), int(hi) + 1))
+                        elif part:
+                            cpus.append(int(part))
+                    return cpus
+    except Exception:  # noqa: BLE001
+        pass
+    return []
+
+
+def _cpu_busy_ratios() -> dict[int, float]:
+    """两次采样 /proc/stat 计算各 CPU 的忙碌比例(近似负载)."""
+
+    def sample() -> dict[int, tuple[int, int]]:
+        out: dict[int, tuple[int, int]] = {}
+        try:
+            with open("/proc/stat") as f:
+                for line in f:
+                    if not line.startswith("cpu"):
+                        continue
+                    parts = line.split()
+                    if not parts[0][3:].isdigit():
+                        continue
+                    cpu = int(parts[0][3:])
+                    vals = [int(x) for x in parts[1:]]
+                    idle = vals[3] + vals[4]  # idle + iowait
+                    total = sum(vals)
+                    out[cpu] = (idle, total)
+        except Exception:  # noqa: BLE001
+            pass
+        return out
+
+    s1 = sample()
+    time.sleep(0.05)
+    s2 = sample()
+    ratios: dict[int, float] = {}
+    for cpu, (idle2, total2) in s2.items():
+        if cpu in s1:
+            idle1, total1 = s1[cpu]
+            delta_total = total2 - total1
+            if delta_total > 0:
+                ratios[cpu] = 1.0 - (idle2 - idle1) / delta_total
+    return ratios
+
+
+def bind_current_thread_to_idle_cpu(tag: str) -> bool:
+    """把当前线程绑定到进程允许核集中负载最低、且未被本进程其它传输线程
+    占用的核. 失败(无权限/无可用核)只告警, 不影响功能. 返回是否绑定成功."""
+    if not _CPU_BIND_ENABLED:
+        return False
+    allowed = _parse_cpus_allowed()
+    if not allowed:
+        logger.warning("[mooncake][TCP] cpu bind skipped for %s: no allowed cpus", tag)
+        return False
+    ratios = _cpu_busy_ratios()
+    with _cpu_bind_lock:
+        candidates = [c for c in allowed if c not in _cpu_bind_used]
+        if not candidates:
+            logger.warning("[mooncake][TCP] cpu bind skipped for %s: allowed cpus all in use", tag)
+            return False
+        candidates.sort(key=lambda c: ratios.get(c, 0.0))
+        chosen = candidates[0]
+        _cpu_bind_used.add(chosen)
+    try:
+        os.sched_setaffinity(0, {chosen})
+        logger.info("[mooncake][TCP] thread %s bound to cpu %d (allowed=%s)", tag, chosen, allowed)
+        return True
+    except OSError as e:
+        with _cpu_bind_lock:
+            _cpu_bind_used.discard(chosen)
+        logger.warning("[mooncake][TCP] cpu bind failed for %s on cpu %d: %s", tag, chosen, e)
+        return False
+
+
 # Direction codes shared with csrc/torch_binding.cpp::swap_blocks_batch
 # (see vllm_ascend/simple_kv_offload/npu_mem_ops.py).
 _DIRECTION_H2D = 0

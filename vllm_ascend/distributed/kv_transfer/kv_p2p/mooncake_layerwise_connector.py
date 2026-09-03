@@ -55,7 +55,10 @@ from vllm.v1.worker.utils import extract_layer_index
 
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
-from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
+    bind_current_thread_to_idle_cpu,
+    global_te,
+)
 from vllm_ascend.distributed.kv_transfer.utils.utils import (
     RegisterRegions,
     align_memory,
@@ -282,6 +285,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         local_rank = get_world_group().local_rank
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
+        # MC_TCP_CPU_BIND=1 时把本线程绑到进程允许核集中负载最低的核
+        # (受 vllm-ascend cpu_binding taskset 约束, 在 main 核集内选取).
+        bind_current_thread_to_idle_cpu(f"kv-send-rank{local_rank}")
         self.ready_event.set()
         # 攒批: 攒满 _LAYER_BATCH 层或遇到最后层/层序号断裂(跨步)才整批处理.
         # 发送线程始终及时取走队列任务, 模型 forward 不被逐层传输钳制.
@@ -729,6 +735,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_rank = get_world_group().local_rank
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
+        # MC_TCP_CPU_BIND=1 时把本线程绑到进程允许核集中负载最低的核.
+        bind_current_thread_to_idle_cpu(f"kv-recv-rank{local_rank}")
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
         logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
