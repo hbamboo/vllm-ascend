@@ -73,7 +73,7 @@ from vllm_ascend.distributed.kv_transfer.utils.utils import (
     validate_register_region_count,
 )
 from vllm_ascend.distributed.utils import get_decode_context_model_parallel_rank
-from vllm_ascend.utils import npu_stream_switch, trans_nd_to_nz
+from vllm_ascend.utils import global_stream, npu_stream_switch, trans_nd_to_nz
 
 # isort: off
 if TYPE_CHECKING:
@@ -163,6 +163,10 @@ class SendTask:
     v_quant_cache: torch.Tensor | None = None
     layer_idx: int = 0
     layer_name: str = ""
+    # Hybrid (attn+mamba): mamba/GDN 线性态缓存的最终内容由 step 结束后的
+    # postprocess 写定, 逐层任务先延迟, 到 step-end (worker.wait_for_save)
+    # 之后才允许 flush. 默认 False.
+    defer_to_step_end: bool = False
     # trans block info
     group_rearrange_block_ids: list[list[int]] | None = None
     group_num_blocks: list[int] | None = None
@@ -262,6 +266,38 @@ class _PipeJob:
     failed: dict[str, list[str]] = field(default_factory=dict)
 
 
+class StepEndGate:
+    """P 侧 step-end 通知: worker.wait_for_save (model forward 及 mamba
+    postprocess 全部入队后) 记录计算流事件并递增序号; 发送线程在 flush 混合
+    模型的 mamba 层任务前, 先等待序号推进再同步该事件, 保证读到的 conv/ssm
+    状态是 postprocess 之后的最终内容."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._seq = 0
+        self._ready = threading.Event()
+        self.event: torch.npu.Event | None = None
+
+    def notify_step_end(self) -> None:
+        event = torch.npu.Event()
+        event.record()
+        with self._lock:
+            self.event = event
+            self._seq += 1
+            self._ready.set()
+
+    def wait_for_step_end(self, last_seen: int) -> int:
+        """等待序号推进到 > last_seen 并同步对应计算流事件, 返回新序号."""
+        while True:
+            with self._lock:
+                seq = self._seq
+                event = self.event
+            if seq > last_seen and event is not None:
+                event.synchronize()
+                return seq
+            self._ready.wait(timeout=0.1)
+
+
 class KVCacheSendingLayerThread(threading.Thread):
     def __init__(
         self,
@@ -284,6 +320,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_kv_quant: bool,
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
+        step_end_gate: StepEndGate | None = None,
         callback_func: Callable[..., None] = lambda x: None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
@@ -308,6 +345,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
         self.resharding_stream = resharding_stream
         self.current_layer = -1
+        # Hybrid: 已完成的 step-end 数 (每次 flush 含最后层的批 +1).
+        self._steps_flushed = 0
+        self._step_end_gate = step_end_gate
 
         send_queue_size = 0
         if self.pd_head_ratio != 1:
@@ -356,15 +396,39 @@ class KVCacheSendingLayerThread(threading.Thread):
         # 攒批: 攒满 _LAYER_BATCH 层或遇到最后层/层序号断裂(跨步)才整批处理.
         # 发送线程始终及时取走队列任务, 模型 forward 不被逐层传输钳制.
         pending: list[SendTask] = []
+        # Hybrid: mamba/GDN 层任务延迟到 step-end; 其余层照常攒批流水.
+        deferred: list[SendTask] = []
         while True:
             send_task = self.send_queue.get()
-            if pending and send_task.layer_idx != pending[-1].layer_idx + 1:
+            is_deferred = self._is_deferred(send_task)
+            is_last = send_task.layer_idx == (self.total_layers - 1)
+            if is_deferred:
+                deferred.append(send_task)
+            else:
+                if pending and send_task.layer_idx != pending[-1].layer_idx + 1:
+                    self._handle_batch(pending)
+                    pending = []
+                pending.append(send_task)
+                if len(pending) >= _LAYER_BATCH and not is_last:
+                    self._handle_batch(pending)
+                    pending = []
+            if is_last:
+                # 本 step 的最后层任务 (无论是否延迟): hybrid 下先等 step-end
+                # (mamba postprocess 入队并执行完毕), 再连同延迟的 mamba 层一起
+                # 冲刷, 保证 D 收到的是最终状态; 均匀 attention 模型无延迟
+                # 任务, 行为不变.
+                if self._step_end_gate is not None:
+                    self._steps_flushed = self._step_end_gate.wait_for_step_end(self._steps_flushed)
+                if deferred:
+                    deferred.sort(key=lambda t: t.layer_idx)
+                    pending.extend(deferred)
+                    deferred = []
+                    pending.sort(key=lambda t: t.layer_idx)
                 self._handle_batch(pending)
                 pending = []
-            pending.append(send_task)
-            if len(pending) >= _LAYER_BATCH or send_task.layer_idx == (self.total_layers - 1):
-                self._handle_batch(pending)
-                pending = []
+
+    def _is_deferred(self, send_task: SendTask) -> bool:
+        return self.use_attn_mamba_hybrid and self._step_end_gate is not None and send_task.defer_to_step_end
 
     def _handle_batch(self, tasks: list[SendTask]):
         try:
@@ -1433,6 +1497,16 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
         """MooncakeLayerwiseConnector does not save explicitly."""
         pass
 
+    def notify_runner_step_end(self) -> None:
+        """Model runner 在 mamba postprocess (global stream) 入队后每步调用.
+
+        混合模型 (attn+mamba/GDN) 下 mamba 状态缓存的最终内容由 postprocess
+        写定, 需等它执行完才能冲刷 mamba 层; 该通知记录 step-end 事件供发送
+        线程等待. 非 hybrid 或无 gate 时为空操作.
+        """
+        assert self.connector_worker is not None
+        self.connector_worker.notify_runner_step_end()
+
 
 class MooncakeLayerwiseConnectorScheduler:
     """Implementation of Scheduler side methods"""
@@ -1860,6 +1934,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.virtual_request: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
+        # Hybrid (attn+mamba): step-end gate, producer 注册 KV cache 时创建.
+        self._step_end_gate: StepEndGate | None = None
 
     def create_kv_buffer(self, first_kv_cache_tuple):
         alignment = 2 * 1024 * 1024
@@ -1980,25 +2056,39 @@ class MooncakeLayerwiseConnectorWorker:
         validate_register_region_count(register_regions)
 
         if global_te.use_tcp:
-            # H2H (TCP) layerwise v1 范围: pd_head_ratio==1 的统一 attention、
-            # 无 KV 量化/混合模型 —— 这些路径的 k/v buffer、mamba/共享 tensor
-            # 注册语义尚未在 staging 模式下适配, 先显式报错避免静默走错路径.
-            if self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant or self.use_attn_mamba_hybrid:
+            # H2H (TCP) layerwise 范围: pd_head_ratio==1、无 KV 量化 ——
+            # 这些路径的 k/v reshard buffer 语义尚未在 staging 模式下适配,
+            # 先显式报错避免静默走错路径.
+            if self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant:
                 raise RuntimeError(
-                    "H2H (TCP) layerwise v1 only supports pd_head_ratio==1 uniform "
-                    "attention without kv/c8 quantization or attn-mamba hybrid. "
+                    "H2H (TCP) layerwise only supports pd_head_ratio==1 without "
+                    "kv/c8 quantization. "
                     f"pd_head_ratio={self.pd_head_ratio}, enable_kv_quant="
-                    f"{self.enable_kv_quant}, enable_c8_quant={self.enable_c8_quant}, "
-                    f"use_attn_mamba_hybrid={self.use_attn_mamba_hybrid}"
+                    f"{self.enable_kv_quant}, enable_c8_quant={self.enable_c8_quant}"
                 )
-            global_te.register_tcp_staging(kv_caches)
+            if self.use_attn_mamba_hybrid:
+                # Hybrid (attn + mamba/GDN linear-attn) 模型: 各层 cache 是共享
+                # 物理 tensor 上的视图(含页填充/对齐空隙), 按物理 tensor 整体
+                # 镜像到 CPU staging (region mode), 保持任意字节地址的线性映射,
+                # 与 D2D 的 use_attn_mamba_hybrid 注册语义一致.
+                hybrid_regions = []
+                for kv_cache_tensor in self.kv_cache_config.kv_cache_tensors:
+                    tensor_addrs = []
+                    for layer_name in kv_cache_tensor.shared_by:
+                        tensor_addrs.extend(self.layer_metadata[layer_name].kv_caches_base_addr)
+                        if "mtp" in layer_name:
+                            tensor_addrs.append(min(tensor_addrs) - conv_total_padding_size)
+                    hybrid_regions.append((min(tensor_addrs), kv_cache_tensor.size))
+                global_te.register_tcp_staging_regions(hybrid_regions)
+            else:
+                global_te.register_tcp_staging(kv_caches)
             if self.vllm_config.kv_transfer_config.is_kv_consumer:
                 # consumer 发布的是自己 CPU staging 的地址: P 推写的目的地.
                 # producer 侧 layer_metadata 保留 NPU 地址供内部 src 计算.
                 for layer_name, layer_meta in self.layer_metadata.items():
                     replaced = []
                     for base_addr in layer_meta.kv_caches_base_addr:
-                        cpu_addr = global_te.get_cpu_address_for_npu(base_addr)
+                        cpu_addr = global_te.npu_addr_to_cpu_addr(base_addr)
                         if cpu_addr is None:
                             raise RuntimeError(
                                 f"H2H layerwise: layer {layer_name} tensor "
@@ -2037,6 +2127,9 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
+            if self.use_attn_mamba_hybrid:
+                # 混合模型: mamba 层任务延迟至 step-end 冲刷.
+                self._step_end_gate = StepEndGate()
             ready_event = threading.Event()
             self.kv_send_layer_thread = KVCacheSendingLayerThread(
                 engine=self.engine,
@@ -2058,6 +2151,7 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_kv_quant=self.enable_kv_quant,
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
+                step_end_gate=self._step_end_gate,
                 callback_func=self.send_done_send_signal,
             )
             self.kv_send_layer_thread.start()
@@ -2487,6 +2581,11 @@ class MooncakeLayerwiseConnectorWorker:
 
             assert self.kv_send_layer_thread is not None
             assert reshape_cache_event is not None
+            # Hybrid: mamba/GDN 状态缓存由 step-end postprocess 写定, 该层任务
+            # 延迟到 step-end 之后才冲刷; full-attention 层照常流水传输.
+            defer_to_step_end = self.use_attn_mamba_hybrid and isinstance(
+                self.kv_cache_specs[layer_group_idx], MambaSpec
+            )
             layer_send_task = SendTask(
                 wait_event=reshape_cache_event,
                 k_cache=keys,
@@ -2495,6 +2594,7 @@ class MooncakeLayerwiseConnectorWorker:
                 v_quant_cache=quant_values,
                 layer_idx=self.current_layer,
                 layer_name=layer_name,
+                defer_to_step_end=defer_to_step_end,
                 group_rearrange_block_ids=send_task.group_rearrange_block_ids,
             )
             for req_id, req_meta in connector_metadata.requests.items():
@@ -2665,6 +2765,18 @@ class MooncakeLayerwiseConnectorWorker:
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
+
+    def notify_runner_step_end(self) -> None:
+        """记录 step-end 事件 (global stream, 晚于 mamba postprocess 入队).
+
+        发送线程冲刷混合模型的 mamba 层任务前等待该事件, 保证读到的是
+        postprocess 之后的最终 conv/ssm 状态. 仅在 producer 且 hybrid 时
+        有 gate, 其余情况为空操作.
+        """
+        if self._step_end_gate is None:
+            return
+        with npu_stream_switch(global_stream()):
+            self._step_end_gate.notify_step_end()
 
 
 @contextlib.contextmanager
