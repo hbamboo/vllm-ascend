@@ -15,6 +15,10 @@ _BG_SYNC_INTERVAL = float(os.getenv("MC_TCP_BG_SYNC_INTERVAL", "1.0"))
 # 允许核集(Cpus_allowed_list, 已受 vllm-ascend cpu_binding 的 taskset 约束)中
 # 负载最低的核, 外层无需感知具体核号. 默认关闭, 避免与模型计算意外争抢.
 _CPU_BIND_ENABLED = os.getenv("MC_TCP_CPU_BIND", "0") == "1"
+
+# 性能观测开关(与 layerwise connector 同 env): 1=热路径(flush/H2D)耗时以
+# INFO 输出供逐批观测; 否则降为 DEBUG 避免每批刷屏.
+_PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
 _cpu_bind_lock = threading.Lock()
 _cpu_bind_used: set[int] = set()
 
@@ -432,7 +436,9 @@ class GlobalTE:
             copied_bytes += actual_size
         # 一次 aclrtMemcpyBatchAsync 批量 D2H; 内部只同步专用拷贝流.
         self.submit_dma_copy(items, direction=_DIRECTION_D2H)
-        logger.info(
+        # 热路径日志门控: MC_TCP_PERF_LOG=1 时 INFO(供逐批观测), 否则 DEBUG 防刷屏.
+        log_fn = logger.info if _PERF_LOG else logger.debug
+        log_fn(
             "[mooncake][TCP] flush for pull: ranges=%d bytes=%d skipped=%d elapsed=%.3fs",
             len(cpu_addrs),
             copied_bytes,
@@ -481,12 +487,13 @@ class GlobalTE:
             copied_bytes += actual_size
         # 一次 aclrtMemcpyBatchAsync 批量 D2H; 内部只同步专用拷贝流.
         self.submit_dma_copy(items, direction=_DIRECTION_D2H)
-        logger.info(
-            "[mooncake][TCP] layerwise flush (NPU->CPU): ranges=%d bytes=%d skipped=%d elapsed=%.3fs",
+        log_fn = logger.info if _PERF_LOG else logger.debug
+        log_fn(
+            "[mooncake][TCP] layerwise flush (NPU->CPU): ranges=%d bytes=%d skipped=%d elapsed=%.5f ms",
             len(npu_addrs),
             copied_bytes,
             skipped,
-            time.perf_counter() - t0,
+            (time.perf_counter() - t0) * 1000,
         )
         return copied_bytes
 
@@ -554,11 +561,12 @@ class GlobalTE:
         self.submit_dma_copy(items, direction=_DIRECTION_H2D)
         if synced:
             # consumer 侧: TCP get 完成后把 staging 数据拷回 NPU (H2D)
-            logger.info(
-                "[mooncake][TCP] H2D (CPU->NPU) after TCP get: regions=%d bytes=%d elapsed=%.3fs tensors=%d",
+            log_fn = logger.info if _PERF_LOG else logger.debug
+            log_fn(
+                "[mooncake][TCP] H2D (CPU->NPU) after TCP get: regions=%d bytes=%d elapsed=%.5f ms tensors=%d",
                 len(src_addrs),
                 total_bytes,
-                time.perf_counter() - t0,
+                (time.perf_counter() - t0) * 1000,
                 len(synced),
             )
 
