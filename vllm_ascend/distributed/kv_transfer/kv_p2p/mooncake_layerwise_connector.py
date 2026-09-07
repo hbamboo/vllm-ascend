@@ -726,6 +726,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                 total_ms - batch_wait_ms - event_ms - flush_ms - write_ms - layerdone_ms,
             )
             batch_ext_reqs = [get_external_request_id(r) for r in transferred_reqs]
+            # 本批实际写入对端的 payload 字节(去重后各 session ranges 长度和),
+            # 用于吞吐与带宽利用率统计.
+            batch_bytes = sum(sum(m.length) for m in session_meta.values())
 
             def _win_str(a: float | None, b: float | None) -> str:
                 # 绝对窗口 [起点,终点] (秒, CLOCK_MONOTONIC); 无该阶段时为 "-".
@@ -734,7 +737,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             logger.info(
                 "[mooncake][perf] P batch=%d layers=%s reqs=%s wait=%.1f event=%.1f "
                 "flush=%.1f write=%.1f layerdone=%.1f misc=%.1f total=%.1f ms "
-                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s",
+                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s bytes=%d",
                 batch_id,
                 [t.layer_idx for t in tasks],
                 batch_ext_reqs,
@@ -749,6 +752,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 _win_str(flush_win0, flush_win1),
                 _win_str(write_win0, write_win1),
                 _win_str(layerdone_win0, layerdone_win1),
+                batch_bytes,
             )
             # 请求级累计(批共享口径: flush/write/layerdone 是该批全部请求共享的
             # 墙钟, 每个请求都记全值; 单请求场景下即精确分解).
@@ -986,6 +990,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                 total_ms - job.batch_wait_ms - job.event_ms - job.flush_ms - job.write_ms - layerdone_ms,
             )
             batch_ext_reqs = [get_external_request_id(r) for r in job.transferred_reqs]
+            # 本批实际写出的 payload 字节(排除写失败的 session).
+            batch_bytes = sum(
+                sum(meta.length)
+                for sid, meta in job.sessions
+                if len(meta.src) > 0 and sid not in job.failed
+            )
 
             def _win_str(a: float | None, b: float | None) -> str:
                 return "-" if a is None else f"{a:.6f},{b:.6f}"
@@ -993,7 +1003,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             logger.info(
                 "[mooncake][perf] P batch=%d layers=%s reqs=%s wait=%.1f event=%.1f "
                 "flush=%.1f write=%.1f layerdone=%.1f misc=%.1f total=%.1f ms "
-                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s",
+                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s bytes=%d",
                 job.batch_id,
                 [t.layer_idx for t in job.tasks],
                 batch_ext_reqs,
@@ -1008,6 +1018,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 _win_str(job.flush_win0, job.flush_win1),
                 _win_str(job.write_win0, job.write_win1),
                 _win_str(layerdone_win0, layerdone_win1),
+                batch_bytes,
             )
             for ext_req in batch_ext_reqs:
                 acc = self._perf_req.get(ext_req)
