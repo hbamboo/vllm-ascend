@@ -718,6 +718,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
                 )
+                if _PERF_LOG:
+                    write_ms += _perf_ms(req_start_time)
+                    # H2H write 窗口: 多 session 取并集(起点最早, 终点最晚),
+                    # 与 flush/layerdone 窗口口径一致.
+                    if write_win0 is None:
+                        write_win0 = req_start_time
+                    write_win1 = time.perf_counter()
                 if ret < 0:
                     logger.error(
                         "Mooncake transfer failed for send requests. req_ids=%s, destination=%s, ret=%d. ",
