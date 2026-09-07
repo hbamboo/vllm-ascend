@@ -93,6 +93,7 @@ import ipaddress
 import json
 import os
 import sys
+import time
 import uuid
 from contextlib import asynccontextmanager
 
@@ -153,6 +154,10 @@ class ProxyState:
         heapq.heapify(self.decoder_heap)
         self.req_id_future = {}
         self.req_data_dict = {}
+        # perf: 请求级绝对时刻打点 (uuid -> dict), 供 TTFT 端到端分解:
+        # in=proxy 受理 / meta=D 触发 remote prefill / pf=派发 P / tok=首 token 转发.
+        # perf_counter 为 CLOCK_MONOTONIC, 与 P/D 引擎同机可比.
+        self.req_perf: dict[str, dict] = {}
 
     def _update_prefiller_priority(self, server_idx: int):
         """Update the priority of a prefiller server in the heap."""
@@ -427,6 +432,7 @@ async def _handle_completions(api: str, request: Request):
         request_length = len(req_body)
         request_id = await proxy_state.next_req_id()
         request_id_api = get_api_request_id(api, request_id)
+        proxy_state.req_perf[request_id] = {"in": time.perf_counter()}
         proxy_state.req_data_dict[request_id_api] = (copy.deepcopy(req_data), request_length, api)
         req_data["kv_transfer_params"] = {
             "do_remote_decode": False,
@@ -504,6 +510,9 @@ async def _handle_completions(api: str, request: Request):
                         message = choice.get("message") or {}
                         content = delta.get("content") or message.get("content") or choice.get("text") or ""
                         generated_token += content
+                        # perf: 首个含文本的 chunk 时刻 = 首 token 可用(转发给客户端前)
+                        if content and "tok" not in proxy_state.req_perf.get(request_id, {}):
+                            proxy_state.req_perf[request_id]["tok"] = time.perf_counter()
 
                         stop_reason = choice.get("stop_reason")
                         usage = chunk_json.get("usage", {})
@@ -539,6 +548,19 @@ async def _handle_completions(api: str, request: Request):
             finally:
                 # After streaming done, release tokens
                 proxy_state.release_decoder(decoder_idx, decoder_score)
+                # perf: 请求收尾时打印端到端分解时刻 (与引擎日志 uuid 同源).
+                st = proxy_state.req_perf.pop(request_id, None)
+                if st:
+
+                    def _f(k: str) -> str:
+                        return f"{st[k]:.6f}" if k in st else "-"
+
+                    # nohup 下 vllm logger 行会缓冲, 改用 print(flush=True) 直出.
+                    print(
+                        f"[h2h][perf] proxy req={request_id} in={_f('in')} meta={_f('meta')} "
+                        f"pf={_f('pf')} tok={_f('tok')} done={time.perf_counter():.6f}",
+                        flush=True,
+                    )
 
         if stream_flag:
             return StreamingResponse(generate_stream(), media_type="text/event-stream")
@@ -607,6 +629,10 @@ async def metaserver(request: Request):
         req_data, request_length, api = proxy_state.req_data_dict[request_id]
         request_id = get_origin_request_id(api, request_id)
         req_data["kv_transfer_params"] = kv_transfer_params
+        # perf: D 触发 remote prefill 到达 proxy 的时刻.
+        st = proxy_state.req_perf.get(request_id)
+        if st is not None:
+            st["meta"] = time.perf_counter()
         prefiller_score = proxy_state.calculate_prefill_scores(request_length)
         logger.debug("Request length: %s, Prefiller score: %s", request_length, prefiller_score)
 
@@ -614,6 +640,10 @@ async def metaserver(request: Request):
         prefiller_idx = proxy_state.select_prefiller(prefiller_score)
         prefiller = proxy_state.prefillers[prefiller_idx]
         logger.debug("Using prefill prefiller.url=%r req_data=%r", prefiller.url, req_data)
+        # perf: 派发 P 的时刻 (P 受理 ≈ 此后 +网络/API/调度).
+        st = proxy_state.req_perf.get(request_id)
+        if st is not None:
+            st["pf"] = time.perf_counter()
         # Send request to prefiller
         await send_request_to_service(
             prefiller.client,
