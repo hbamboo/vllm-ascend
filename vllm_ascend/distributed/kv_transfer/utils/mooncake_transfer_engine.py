@@ -536,7 +536,7 @@ class GlobalTE:
         items: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
         # 前置同步: H2D 写 NPU cache 前确保计算流不再读写这些块; 拷贝本身
         # 在专用 DMA 流上批量执行, 不占用计算流.
-        torch.npu.synchronize()
+        # torch.npu.synchronize()
         for cpu_addr, byte_size in zip(src_addrs, lengths):
             cpu_offset = cpu_addr - cpu_base
             if cpu_offset < 0:

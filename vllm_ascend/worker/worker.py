@@ -20,6 +20,7 @@
 import copy
 import gc
 import logging
+import time
 from types import NoneType
 
 import torch
@@ -612,6 +613,10 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
+        if envs_ascend.ENABLE_PERF_DEBUG:
+            # perf: worker 收到 executor 下发批次的时刻; model_runner 在前向
+            # 开始处读取该值, 计算"收到请求→开始前向"耗时 (H2H 时延定位).
+            self.model_runner.batch_recv_time = time.perf_counter()
         self.log_memory_stats()
         # enable msMonitor to monitor the performance of vllm-ascend
         if get_ascend_config().msmonitor_use_daemon:

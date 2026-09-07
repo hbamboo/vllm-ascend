@@ -119,6 +119,14 @@ env_variables: dict[str, Callable[[], Any]] = {
     "VLLM_ASCEND_MOONCAKE_PROTOCOL": lambda: os.getenv(
         "VLLM_ASCEND_MOONCAKE_PROTOCOL", "ascend"
     ),
+    # Perf debug: 1=打印模型执行各阶段耗时行(配合 MC_TCP_PERF_LOG 做时间线分析).
+    "ENABLE_PERF_DEBUG": lambda: bool(int(os.getenv("ENABLE_PERF_DEBUG", "0"))),
+    # H2H 写线程流水 (仅 protocol=tcp 且 pd_head_ratio==1): 1=发送线程只做
+    # 等事件+D2H flush, write 交给独立写线程连续占满数据面, LAYER_DONE 在对应
+    # write 完成后按序发出(与后续批重叠). 关闭时保持单线程原语义.
+    "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
+    # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
+    "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
 }
 
 # end-env-vars-definition
