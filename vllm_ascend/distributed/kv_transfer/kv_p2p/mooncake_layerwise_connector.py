@@ -83,6 +83,17 @@ if TYPE_CHECKING:
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
 
+# 性能观测: 1=逐层打印 [mooncake][perf] 阶段耗时行, 做 layerwise (D2D 直传 /
+# H2H TCP) 各部件时间线分析. 行格式与 H2H 路径共用: D2D 无 CPU staging 与
+# LAYER_DONE 往返, 故 flush/layerdone 恒为 0/-; 有效阶段为
+# wait(层间等待) / event(等 NPU 数据就绪) / write(D2D 直传或 TCP write).
+_PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
+
+
+def _perf_ms(t0: float) -> float:
+    """perf_counter 差值的毫秒数."""
+    return (time.perf_counter() - t0) * 1e3
+
 
 @dataclass
 class LayerMetadata:
@@ -262,6 +273,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.enable_c8_quant = enable_c8_quant
         self.ready_event = ready_event
         self.callback_func = callback_func
+        # perf: 上一层处理完成时刻(算层间等待)与层序号(perf 行 batch 字段).
+        self._last_layer_end_at: float | None = None
+        self._layer_seq = 0
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -270,6 +284,11 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event.set()
         while True:
             send_task = self.send_queue.get()
+            if _PERF_LOG:
+                # 层间等待 = 上一层处理完成 → 本层开始处理(含队列空闲).
+                self._wait_ms = (
+                    _perf_ms(self._last_layer_end_at) if self._last_layer_end_at is not None else 0.0
+                )
             self._handle_request(send_task)
 
     def _handle_request(self, send_task: SendTask):
@@ -281,6 +300,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 send_task.layer_idx,
                 e,
             )
+        if _PERF_LOG:
+            self._last_layer_end_at = time.perf_counter()
 
     def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
         src_list: list[int] = []
@@ -445,6 +466,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         return (src_list, dst_list, length_list)
 
     def _transfer_kv_cache(self, send_task: SendTask):
+        # perf: 本层墙钟起点(对齐 H2H 批行 t0: 层任务开始处理时刻).
+        t_layer0 = time.perf_counter()
         layer_name = send_task.layer_name
         layer_group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
         key = send_task.k_cache
@@ -490,6 +513,15 @@ class KVCacheSendingLayerThread(threading.Thread):
             send_task.wait_event.synchronize()  # type:ignore
         elif self.pd_head_ratio > 1:
             self.resharding_stream.synchronize()
+        # perf: 本层开始处理 → 数据就绪(event 覆盖 reshard/聚合/等 NPU 事件).
+        t_event1 = time.perf_counter()
+        if _PERF_LOG:
+            event_ms = (t_event1 - t_layer0) * 1e3
+            write_ms = 0.0
+            write_win0 = write_win1 = None
+        else:
+            event_ms = write_ms = 0.0
+            write_win0 = write_win1 = None
 
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
@@ -497,6 +529,12 @@ class KVCacheSendingLayerThread(threading.Thread):
                 ret = self.engine.batch_transfer_sync_write(
                     session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
                 )
+                if _PERF_LOG:
+                    # D2D 直传窗口(跨 session 取并集; 单 session 即精确边界).
+                    write_ms += _perf_ms(req_start_time)
+                    if write_win0 is None:
+                        write_win0 = req_start_time
+                    write_win1 = time.perf_counter()
                 if ret < 0:
                     logger.error(
                         "Mooncake transfer failed for send requests. req_ids=%s, destination=%s, ret=%d. ",
@@ -525,6 +563,30 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 self.failed_reqs.discard(req_id)
                             else:
                                 self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+
+        # perf 层级行: 与 H2H 批行同格式; flush/layerdone 无意义(D2D 无 CPU
+        # staging/LAYER_DONE), 填 0/- 保持解析脚本兼容. wait 由 run() 预填.
+        if _PERF_LOG:
+            self._layer_seq += 1
+            total_ms = _perf_ms(t_layer0)
+            misc_ms = max(0.0, total_ms - self._wait_ms - event_ms - write_ms)
+            write_str = "-" if write_win0 is None else f"{write_win0:.6f},{write_win1:.6f}"
+            ext_reqs = [get_external_request_id(r) for r in send_task.send_request]
+            logger.info(
+                "[mooncake][perf] P batch=%d layers=%s reqs=%s wait=%.1f event=%.1f "
+                "flush=0.0 write=%.1f layerdone=0.0 misc=%.1f total=%.1f ms "
+                "t0=%.6f flush_win=- write_win=%s layerdone_win=-",
+                self._layer_seq,
+                [send_task.layer_idx],
+                ext_reqs,
+                self._wait_ms,
+                event_ms,
+                write_ms,
+                misc_ms,
+                total_ms,
+                t_layer0,
+                write_str,
+            )
 
 
 class KVCacheRecvingLayerThread(threading.Thread):

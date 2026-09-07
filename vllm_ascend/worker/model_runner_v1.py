@@ -102,6 +102,7 @@ from vllm.v1.worker.ubatch_utils import (
 from vllm.v1.worker.utils import AttentionGroup, select_common_block_size
 
 # yapf: enable
+from vllm_ascend import envs as ascend_envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_v1 import AscendAttentionBackend, AscendAttentionState
 from vllm_ascend.attention.context_parallel.dsa_cp import AscendDSACPMetadataBuilder
@@ -2317,9 +2318,36 @@ class NPUModelRunner(GPUModelRunner):
         ):
             if self.cache_config.mamba_cache_mode == "align":
                 mamba_utils.do_mamba_copy_block(preprocess_bufs)
+            if ascend_envs.ENABLE_PERF_DEBUG and torch.distributed.get_rank() == 0:
+                model_exec_start_time = time.perf_counter()
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
+            if ascend_envs.ENABLE_PERF_DEBUG and torch.distributed.get_rank() == 0:
+                model_exec_end_time = time.perf_counter()
+                # reqs 为该批 external request id (如 chatcmpl-xxx), P/D 两侧
+                # 同 id 便于时间线对应.
+                reqs = ",".join(self.input_batch.req_ids)
+                # 配对 worker.execute_model 入口打点(batch_recv_time), 打印
+                # 收到批次 → 开始前向 的耗时 (含输入准备/同步/层数据等待).
+                batch_recv_time = getattr(self, "batch_recv_time", None)
+                if batch_recv_time is not None:
+                    logger.info(
+                        "reqs=%sRecv at %.6f, forward start at %.6f, "
+                        "Recv to forward time: %.6f ms Model forward time: %.6f ms",
+                        reqs,
+                        batch_recv_time,
+                        model_exec_start_time,
+                        (model_exec_start_time - batch_recv_time) * 1000,
+                        (model_exec_end_time - model_exec_start_time) * 1000,
+                    )
+                else:
+                    logger.info(
+                        "Model forward time: %.6f ms reqs=%s",
+                        (model_exec_end_time - model_exec_start_time) * 1000,
+                        reqs,
+                    )
+
         with record_function_or_nullcontext("post process"):
             aux_hidden_states = None
             if self.use_aux_hidden_state_outputs:

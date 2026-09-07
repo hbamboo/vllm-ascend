@@ -110,6 +110,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # Control the aclrtMemcpyBatchAsync compile path for KV cache offloading.
     # "1": force enable, "0": force disable, None: auto-detect from CANN headers.
     "VLLM_ASCEND_ENABLE_BATCH_MEMCPY": lambda: os.getenv("VLLM_ASCEND_ENABLE_BATCH_MEMCPY", None),
+    # Perf debug: 1=打印模型执行各阶段耗时行(worker 收批时刻 + forward 起止,
+    # 配合 connector 的 MC_TCP_PERF_LOG 层级耗时做 layerwise 时间线分析).
+    "ENABLE_PERF_DEBUG": lambda: bool(int(os.getenv("ENABLE_PERF_DEBUG", "0"))),
 }
 
 # end-env-vars-definition
