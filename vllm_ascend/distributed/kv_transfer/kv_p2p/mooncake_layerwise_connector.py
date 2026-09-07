@@ -258,6 +258,10 @@ class _PipeJob:
     flush_ms: float
     flush_win0: float | None
     flush_win1: float | None
+    # 本 step 的最后层任务 (请求级 DONE 的载体). 均匀模型由含最后层的批
+    # 自己承担 (done_task 即批内任务, 批内 DONE); hybrid 下最后层数据批先行
+    # 冲刷、DONE 延后到延迟批 (mamba) 的 LAYER_DONE 之后由 done_task 补发.
+    done_task: Any | None = None
     # 以下由写线程填充:
     write_ms: float = 0.0
     write_win0: float | None = None
@@ -296,6 +300,20 @@ class StepEndGate:
                 event.synchronize()
                 return seq
             self._ready.wait(timeout=0.1)
+
+    def try_wait(self, last_seen: int) -> int:
+        """非阻塞查询: 序号推进到 > last_seen 则同步事件并返回新序号.
+
+        供发送线程在等待期间穿插 drain (pipe 模式, 让已完成 write 的批尽快
+        发 LAYER_DONE) 时轮询; 未推进时原样返回 last_seen.
+        """
+        with self._lock:
+            seq = self._seq
+            event = self.event
+        if seq > last_seen and event is not None:
+            event.synchronize()
+            return seq
+        return last_seen
 
 
 class KVCacheSendingLayerThread(threading.Thread):
@@ -399,7 +417,17 @@ class KVCacheSendingLayerThread(threading.Thread):
         # Hybrid: mamba/GDN 层任务延迟到 step-end; 其余层照常攒批流水.
         deferred: list[SendTask] = []
         while True:
-            send_task = self.send_queue.get()
+            if self._pipe_writer is not None:
+                # 空闲等待期间顺带消化已完成 write 的批: LAYER_DONE 不再等到
+                # 下一次攒批触发才发, 数据写完即通知 D (消除批间 LD 排队延迟).
+                while True:
+                    try:
+                        send_task = self.send_queue.get(timeout=0.005)
+                        break
+                    except queue.Empty:
+                        self._pipe_drain(block=False)
+            else:
+                send_task = self.send_queue.get()
             is_deferred = self._is_deferred(send_task)
             is_last = send_task.layer_idx == (self.total_layers - 1)
             if is_deferred:
@@ -413,29 +441,50 @@ class KVCacheSendingLayerThread(threading.Thread):
                     self._handle_batch(pending)
                     pending = []
             if is_last:
-                # 本 step 的最后层任务 (无论是否延迟): hybrid 下先等 step-end
-                # (mamba postprocess 入队并执行完毕), 再连同延迟的 mamba 层一起
-                # 冲刷, 保证 D 收到的是最终状态; 均匀 attention 模型无延迟
-                # 任务, 行为不变.
-                if self._step_end_gate is not None:
-                    self._steps_flushed = self._step_end_gate.wait_for_step_end(self._steps_flushed)
+                # 本 step 最后层任务到达. hybrid 下最后层是数据层 (attn), 其
+                # KV 内容已最终, 立即冲刷 (批内含阻塞 drain, 已写完成的批同步
+                # 发 LAYER_DONE); mamba/GDN 层内容由 step-end postprocess 写定,
+                # 等门放行后单独冲刷, 并把请求级 DONE 延后到该批 LAYER_DONE
+                # 之后 — 保证 D 收到全部层 H2D 后才启动 decode. 均匀 attention
+                # 模型无延迟任务, 最后层批即本 step 最终批, 批内照旧发 DONE.
                 if deferred:
+                    self._handle_batch(pending)
+                    pending = []
+                    if self._step_end_gate is not None:
+                        if self._pipe_writer is not None:
+                            self._steps_flushed = self._wait_step_end_drain()
+                        else:
+                            self._steps_flushed = self._step_end_gate.wait_for_step_end(self._steps_flushed)
                     deferred.sort(key=lambda t: t.layer_idx)
-                    pending.extend(deferred)
+                    self._handle_batch(deferred, done_task=send_task)
                     deferred = []
-                    pending.sort(key=lambda t: t.layer_idx)
-                self._handle_batch(pending)
-                pending = []
+                else:
+                    self._handle_batch(pending, done_task=send_task)
+                    pending = []
+
+    def _wait_step_end_drain(self) -> int:
+        """等 step-end 事件放行, 期间持续 drain 已写完成的批 (pipe 模式).
+
+        否则发送线程阻塞在门上的 ~1s 内, 先于 mamba 批完成 write 的数据批
+        的 LAYER_DONE 会一直压到门后下一次 transfer 才发, D 侧 H2D 被同步
+        拖后. 轮询粒度 2ms.
+        """
+        while True:
+            self._pipe_drain(block=False)
+            seq = self._step_end_gate.try_wait(self._steps_flushed)  # type: ignore[union-attr]
+            if seq > self._steps_flushed:
+                return seq
+            time.sleep(0.002)
 
     def _is_deferred(self, send_task: SendTask) -> bool:
         return self.use_attn_mamba_hybrid and self._step_end_gate is not None and send_task.defer_to_step_end
 
-    def _handle_batch(self, tasks: list[SendTask]):
+    def _handle_batch(self, tasks: list[SendTask], done_task: SendTask | None = None):
         try:
             if _PIPE_WRITER and global_te.use_tcp and self.pd_head_ratio == 1:
-                self._transfer_kv_cache_batch_pipe(tasks)
+                self._transfer_kv_cache_batch_pipe(tasks, done_task)
             else:
-                self._transfer_kv_cache_batch(tasks)
+                self._transfer_kv_cache_batch(tasks, done_task)
         except Exception as e:
             logger.error(
                 "Failed to transfer KV cache batch. layer_idx=%s, error=%s. Check transfer engine and memory state.",
@@ -607,7 +656,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         length_list.append(block_len)
         return (src_list, dst_list, length_list)
 
-    def _transfer_kv_cache_batch(self, tasks: list[SendTask]):
+    def _transfer_kv_cache_batch(self, tasks: list[SendTask], done_task: SendTask | None = None):
         """批量传输攒齐的多个层任务: 跨任务合并 ranges 后, 每 session 一次
         D2H flush + 一次 sync_write + 每 peer 一次 LAYER_DONE(携带批内全部层
         范围), 摊薄逐层传输的固定开销. tasks 为空时直接返回."""
@@ -782,9 +831,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                             for failed_req_id in transfer_meta.req_ids:
                                 self.failed_reqs.add(failed_req_id)
 
-        # 5) 请求级完成信号: 批内含最后层任务时, 对实际有传输段的请求发
-        #    DONE/FAILED. 含最后层的任务才触发, 保证 DONE 晚于本请求全部
-        #    层批的 ACK; 无任何传输段的请求不回调(与原逐层语义一致).
+        # 5) 请求级完成信号: 本批是 step 的最终传输批(done_task 非空)时, 对
+        #    done_task(最后层任务)携带且有实际传输段的请求发 DONE/FAILED.
+        #    均匀模型最后层批内即触发; hybrid 下最后层数据批先冲刷、DONE 延后
+        #    到 mamba 批的 LAYER_DONE 之后由 done_task 补发 — 保证 DONE 晚于
+        #    本请求全部层批的 ACK; 无任何传输段的请求不回调(与原逐层语义一致).
         transferred_reqs = {req_id for meta in session_meta.values() for req_id in meta.req_ids}
 
         # perf 批级行与请求级累计: 必须在第 5 步 DONE 打印之前执行, 否则最后
@@ -846,44 +897,44 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["write"] += write_ms
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += batch_wait_ms
-        for send_task in tasks:
-            if send_task.layer_idx == (self.total_layers - 1):
-                layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
-                for req_id, req_meta in send_task.send_request.items():
-                    if req_id not in transferred_reqs:
-                        continue
-                    if req_meta.chunk_finish:
-                        if _PERF_LOG:
-                            ext_req = get_external_request_id(req_id)
-                            acc = self._perf_req.pop(ext_req, None)
-                            if acc is not None:
-                                # 请求级汇总: t0=发送线程开始处理该请求首任务,
-                                # total=到 DONE 发出的墙钟跨度.
-                                logger.info(
-                                    "[mooncake][perf] P req=%s done batches=%d "
-                                    "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
-                                    "wait=%.1f total=%.1f ms",
-                                    ext_req,
-                                    int(acc["batches"]),
-                                    acc["event"],
-                                    acc["flush"],
-                                    acc["write"],
-                                    acc["layerdone"],
-                                    acc["wait"],
-                                    _perf_ms(acc["t0"]),
-                                )
-                        if req_id in self.failed_reqs:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
-                            self.failed_reqs.discard(req_id)
-                        else:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+        if done_task is not None:
+            layer_group_idx = self.layer_metadata[done_task.layer_name].tensor_group_idx[0]
+            for req_id, req_meta in done_task.send_request.items():
+                if req_id not in transferred_reqs:
+                    continue
+                if req_meta.chunk_finish:
+                    if _PERF_LOG:
+                        ext_req = get_external_request_id(req_id)
+                        acc = self._perf_req.pop(ext_req, None)
+                        if acc is not None:
+                            # 请求级汇总: t0=发送线程开始处理该请求首任务,
+                            # total=到 DONE 发出的墙钟跨度.
+                            logger.info(
+                                "[mooncake][perf] P req=%s done batches=%d "
+                                "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
+                                "wait=%.1f total=%.1f ms",
+                                ext_req,
+                                int(acc["batches"]),
+                                acc["event"],
+                                acc["flush"],
+                                acc["write"],
+                                acc["layerdone"],
+                                acc["wait"],
+                                _perf_ms(acc["t0"]),
+                            )
+                    if req_id in self.failed_reqs:
+                        self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
+                        self.failed_reqs.discard(req_id)
+                    else:
+                        self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
 
     # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, 仅 protocol=tcp 且 pd==1) ----
     # 阶段归属: 发送线程 = 等事件 + D2H flush + 攒批; 写线程 = TCP write(数据面
     # 连续占满); 发送线程 drain = LAYER_DONE(与后续批 write 重叠) + perf/请求级
     # DONE. 不变式与单线程版一致: LAYER_DONE g 只在 write g 完成后发出; 请求级
-    # DONE 只在含最后层的批的 ACK 之后(由 contains_last 批的阻塞 drain 保证).
-    def _transfer_kv_cache_batch_pipe(self, tasks: list[SendTask]):
+    # DONE 由 step 最终批 (done_task) 的 ACK 之后补发 (阻塞 drain 保证).
+    # 发送线程空闲/等门期间持续 drain, LAYER_DONE 不再等下一次攒批触发.
+    def _transfer_kv_cache_batch_pipe(self, tasks: list[SendTask], done_task: SendTask | None = None):
         if not tasks:
             return
         # 先发掉已完成 write 的 LAYER_DONE(与本次 等事件/flush 重叠).
@@ -958,6 +1009,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             sessions=list(session_meta.items()),
             transferred_reqs=transferred_reqs,
             contains_last=any(t.layer_idx == (self.total_layers - 1) for t in tasks),
+            done_task=done_task,
             t_batch0=t_batch0,
             batch_wait_ms=batch_wait_ms,
             event_ms=event_ms,
@@ -966,9 +1018,11 @@ class KVCacheSendingLayerThread(threading.Thread):
             flush_win1=flush_win1,
         )
         self._pipe_push(job)
-        if job.contains_last:
-            # 请求最后一批: 阻塞 drain 至本请求全部 write 完成并发出 LAYER_DONE,
-            # 保证下一请求 flush 前数据面清空、请求级 DONE 不早于全层 H2D.
+        if job.contains_last or job.done_task is not None:
+            # step 收尾批 (含最后层的数据批, 或 hybrid 补发 DONE 的 mamba 延迟
+            # 批): 阻塞 drain 至其 write 完成并发出 LAYER_DONE (done_task 批还
+            # 在 finalize 中补发请求级 DONE), 保证下一请求 flush 前数据面清空、
+            # 请求级 DONE 不早于全层 H2D.
             self._pipe_drain(block=True)
 
     def _pipe_writer_loop(self):
@@ -1103,36 +1157,37 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["write"] += job.write_ms
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += job.batch_wait_ms
-        # 请求级完成信号(镜像单线程版第 5 步).
-        for send_task in job.tasks:
-            if send_task.layer_idx == (self.total_layers - 1):
-                layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
-                for req_id, req_meta in send_task.send_request.items():
-                    if req_id not in job.transferred_reqs:
-                        continue
-                    if req_meta.chunk_finish:
-                        if _PERF_LOG:
-                            ext_req = get_external_request_id(req_id)
-                            acc = self._perf_req.pop(ext_req, None)
-                            if acc is not None:
-                                logger.info(
-                                    "[mooncake][perf] P req=%s done batches=%d "
-                                    "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
-                                    "wait=%.1f total=%.1f ms",
-                                    ext_req,
-                                    int(acc["batches"]),
-                                    acc["event"],
-                                    acc["flush"],
-                                    acc["write"],
-                                    acc["layerdone"],
-                                    acc["wait"],
-                                    _perf_ms(acc["t0"]),
-                                )
-                        if req_id in self.failed_reqs:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
-                            self.failed_reqs.discard(req_id)
-                        else:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+        # 请求级完成信号(镜像单线程版第 5 步): 本批是 step 最终传输批
+        # (done_task 非空)时, 由 done_task(最后层任务)携带的请求补发 DONE.
+        done_task = job.done_task
+        if done_task is not None:
+            layer_group_idx = self.layer_metadata[done_task.layer_name].tensor_group_idx[0]
+            for req_id, req_meta in done_task.send_request.items():
+                if req_id not in job.transferred_reqs:
+                    continue
+                if req_meta.chunk_finish:
+                    if _PERF_LOG:
+                        ext_req = get_external_request_id(req_id)
+                        acc = self._perf_req.pop(ext_req, None)
+                        if acc is not None:
+                            logger.info(
+                                "[mooncake][perf] P req=%s done batches=%d "
+                                "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
+                                "wait=%.1f total=%.1f ms",
+                                ext_req,
+                                int(acc["batches"]),
+                                acc["event"],
+                                acc["flush"],
+                                acc["write"],
+                                acc["layerdone"],
+                                acc["wait"],
+                                _perf_ms(acc["t0"]),
+                            )
+                    if req_id in self.failed_reqs:
+                        self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
+                        self.failed_reqs.discard(req_id)
+                    else:
+                        self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
         if _PERF_LOG:
             # 批"处理结束"以 LAYER_DONE 全部发出计(与单线程版语义对齐).
             self._last_batch_end_at = time.perf_counter()
