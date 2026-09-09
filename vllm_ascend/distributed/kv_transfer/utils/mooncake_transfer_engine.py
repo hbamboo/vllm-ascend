@@ -242,12 +242,23 @@ class GlobalTE:
             self._register_buffer_native(ptrs, sizes)
             self.is_register_buffer = True
 
-    def register_tcp_staging(self, kv_caches: dict[str, torch.Tensor]):
+    def register_tcp_staging(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
+        """Per-view TCP staging: 把 kv cache 张量(以及可选 extra_tensors, 如
+        layerwise 的 k/v reshard buffer)镜像进同一块注册到 mooncake 的 CPU buffer.
+
+        extra_tensors 一并进入 NPU->staging 地址映射, 使 ``npu_addr_to_cpu_addr``
+        与 ``sync_npu_to_cpu_for_npu_addrs`` 能覆盖它们 (pd_head_ratio>1 或量化
+        时数据面 src 落在这些 buffer 上).
+        """
         with self.register_buffer_lock:
             assert self.transfer_engine is not None, "Transfer engine must be initialized"
             if self.is_register_buffer:
                 return
-            self._build_tcp_staging_from_tensors(kv_caches)
+            self._build_tcp_staging_from_tensors(kv_caches, extra_tensors)
             self.is_register_buffer = True
 
     def register_tcp_staging_regions(self, npu_regions: list[tuple[int, int]]) -> None:
@@ -393,7 +404,11 @@ class GlobalTE:
             total / (1024**3),
         )
 
-    def _build_tcp_staging_from_tensors(self, kv_caches: dict[str, torch.Tensor]):
+    def _build_tcp_staging_from_tensors(
+        self,
+        kv_caches: dict[str, torch.Tensor],
+        extra_tensors: list[torch.Tensor] | None = None,
+    ):
         t0 = time.perf_counter()
         # cache_list: list[torch.Tensor] = []
         # for cache_or_caches in kv_caches.values():
@@ -401,6 +416,9 @@ class GlobalTE:
         #         cache_list.append(cache)
 
         cache_list = list(iter_kv_cache_tensors(kv_caches))
+        # 额外 NPU 张量(reshard/量化 buffer): 与 kv cache 张量同等地建 NPU->CPU
+        # 映射, 逐层传输的 src 才能被 flush/地址替换覆盖.
+        cache_list.extend(t for t in (extra_tensors or []) if t is not None)
 
         total_bytes = sum(c.numel() * c.element_size() for c in cache_list)
         logger.info(

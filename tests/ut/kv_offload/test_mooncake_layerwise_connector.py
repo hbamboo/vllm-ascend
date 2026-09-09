@@ -46,6 +46,7 @@ for _m in _to_remove:
     _saved_modules[_m] = sys.modules.pop(_m)
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (  # noqa: E402
+    _LAYER_BATCH,
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
     KVConnectorRole,
@@ -64,6 +65,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     string_to_int64_hash,
     zmq_ctx,
 )
+from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te  # noqa: E402
 
 # Restore the mocked modules so other test files still work correctly.
 # For keys that our real import loaded, overwrite with the saved mock.
@@ -83,6 +85,19 @@ def _make_layer_metadata(**overrides):
     )
     defaults.update(overrides)
     return LayerMetadata(**defaults)
+
+
+def _set_single_peer(req_meta):
+    """把单 peer 兼容字段搬进 peer_transfer(start_load_kv 之后发送路径按 peer 走)."""
+    peer = (req_meta.remote_host, req_meta.remote_port)
+    req_meta.peer_transfer[peer] = {
+        "local_block_ids": req_meta.local_block_ids,
+        "remote_block_ids": req_meta.remote_block_ids,
+        "trans_count": [1] * len(req_meta.local_block_ids),
+    }
+    req_meta.peer_layer_metadata[peer] = req_meta.remote_layer_metadata
+    req_meta.peer_te_rpc_port[peer] = req_meta.remote_te_rpc_port
+    return req_meta
 
 
 def _make_mock_kv_cache_config(block_size=16):
@@ -260,6 +275,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         mock_group.return_value = ([[10, 11], [20, 21]], [])
         key = torch.zeros((1, 8), dtype=torch.float32)
         value = torch.zeros((1, 8), dtype=torch.float32)
+        _set_single_peer(req_meta)
 
         send_task = SendTask(
             send_request={"req1": req_meta},
@@ -271,7 +287,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             group_rearrange_block_ids=[[5, 8]],
         )
 
-        thread._transfer_kv_cache(send_task)
+        thread._transfer_kv_cache_batch([send_task])
 
         self.engine.batch_transfer_sync_write.assert_called_once()
         session_id, src_list, dst_list, length_list = self.engine.batch_transfer_sync_write.call_args[0]
@@ -304,7 +320,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             layer_name="layer0",
             group_rearrange_block_ids=[[]],
         )
-        self.thread._transfer_kv_cache(send_task)
+        self.thread._transfer_kv_cache_batch([send_task])
         self.engine.batch_transfer_sync_write.assert_not_called()
 
     @patch(
@@ -337,6 +353,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
 
         key = torch.zeros((1, 8), dtype=torch.float32)
         value = torch.zeros((1, 8), dtype=torch.float32)
+        _set_single_peer(req_meta)
 
         send_task = SendTask(
             send_request={"req5": req_meta},
@@ -347,9 +364,129 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             layer_name="layer2",
             group_rearrange_block_ids=[[]],
         )
-        self.thread._transfer_kv_cache(send_task)
+        self.thread._transfer_kv_cache_batch([send_task])
 
         self.thread.callback_func.assert_called_once()
+
+    def test_transfer_multi_peer_splits_sessions(self):
+        """同一请求的不同 peer: 拆成多个 session, 各自用自己的 dst 与 rpc 端口."""
+        req_meta = self.req_meta_base
+        peer_a = ("127.0.0.1", 7777)
+        peer_b = ("127.0.0.1", 7778)
+        req_meta.peer_transfer = {
+            peer_a: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [1]},
+            peer_b: {"local_block_ids": [[8]], "remote_block_ids": [[20]], "trans_count": [1]},
+        }
+        req_meta.peer_layer_metadata = {
+            peer_a: {
+                "layer0": _make_layer_metadata(
+                    kv_caches_base_addr=[4000, 8000], block_len=[64, 64], block_size_scale=[1, 1]
+                )
+            },
+            peer_b: {
+                "layer0": _make_layer_metadata(
+                    kv_caches_base_addr=[9000, 9000], block_len=[64, 64], block_size_scale=[1, 1]
+                )
+            },
+        }
+        req_meta.peer_te_rpc_port = {peer_a: 6000, peer_b: 6001}
+
+        send_task = SendTask(
+            send_request={"req1": req_meta},
+            wait_event=MagicMock(),
+            layer_idx=0,
+            layer_name="layer0",
+            group_rearrange_block_ids=[[5, 8]],
+        )
+        self.thread._transfer_kv_cache_batch([send_task])
+
+        self.assertEqual(self.engine.batch_transfer_sync_write.call_count, 2)
+        sessions = {call[0][0] for call in self.engine.batch_transfer_sync_write.call_args_list}
+        self.assertEqual(sessions, {"127.0.0.1:6000", "127.0.0.1:6001"})
+        # block_len 取自本端 layer_metadata(1024/2048), 目的地址用各 peer 自己的 base.
+        dst_by_session = {
+            call[0][0]: call[0][2][0] for call in self.engine.batch_transfer_sync_write.call_args_list
+        }
+        self.assertEqual(dst_by_session["127.0.0.1:6000"], 4000 + 10 * 1024)
+        self.assertEqual(dst_by_session["127.0.0.1:6001"], 9000 + 20 * 1024)
+
+    def _make_send_thread(self, **overrides):
+        """构造发送线程(默认与 setUp 一致), 便于按 pd_head_ratio/量化开关定制."""
+        kwargs = dict(
+            engine=self.engine,
+            vllm_config=self.vllm_config,
+            kv_cache_config=self.kv_cache_config,
+            kv_cache_specs=self.kv_cache_specs,
+            attn_resharding_group_idx=set(),
+            total_layers=3,
+            ready_event=self.ready_event,
+            tp_size=1,
+            tp_rank=0,
+            pd_head_ratio=1,
+            num_head_replica=1,
+            layer_metadata=self.layer_metadata,
+            use_mla=True,
+            use_attn_mamba_hybrid=False,
+            k_buffer=self.fake_k_buffer,
+            v_buffer=self.fake_v_buffer,
+            enable_kv_quant=False,
+            enable_c8_quant=False,
+            resharding_stream=MagicMock(),
+            callback_func=MagicMock(),
+        )
+        kwargs.update(overrides)
+        return KVCacheSendingLayerThread(**kwargs)
+
+    def test_reshard_path_caps_layer_batch(self):
+        """pd_head_ratio>1 的传输 src 落在单槽 k_buffer/v_buffer 上, 必须逐层传."""
+        reshard_thread = self._make_send_thread(pd_head_ratio=2)
+        self.assertTrue(reshard_thread.uses_reshard_buffers)
+        self.assertEqual(reshard_thread.max_batch_layers, 1)
+        self.assertFalse(self.thread.uses_reshard_buffers)
+        self.assertEqual(self.thread.max_batch_layers, _LAYER_BATCH)
+
+    def test_quant_path_caps_layer_batch(self):
+        for override in ({"enable_kv_quant": True}, {"enable_c8_quant": True}):
+            thread = self._make_send_thread(**override)
+            self.assertTrue(thread.uses_reshard_buffers)
+            self.assertEqual(thread.max_batch_layers, 1)
+
+    def test_wait_task_ready_polls_until_event_fires(self):
+        """就绪等待按任务轮询 event.query(), 不用整条流 synchronize()."""
+        thread = self._make_send_thread(pd_head_ratio=2)
+        event = MagicMock()
+        event.query.side_effect = [False, False, True]
+        task = SendTask(layer_idx=0, layer_name="layer0", wait_event=event)
+        thread._wait_task_ready(task)
+        self.assertEqual(event.query.call_count, 3)
+
+    def test_wait_task_ready_times_out_without_raising(self):
+        thread = self._make_send_thread(pd_head_ratio=2)
+        event = MagicMock()
+        event.query.return_value = False
+        task = SendTask(layer_idx=3, layer_name="layer0", wait_event=event)
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.LAYER_DONE_TIMEOUT_S",
+            0.001,
+        ):
+            thread._wait_task_ready(task)
+
+    def test_transfer_batch_rejects_multilayer_reshard(self):
+        """兜底不变式: 单槽 buffer 路径收到多层批时显式报错, 而不是静默覆盖."""
+        reshard_thread = self._make_send_thread(pd_head_ratio=2)
+        tasks = [SendTask(layer_idx=i, layer_name="layer0", group_rearrange_block_ids=[[]]) for i in range(2)]
+        with self.assertRaises(RuntimeError):
+            reshard_thread._transfer_kv_cache_batch(tasks)
+
+    def test_pipe_writer_disabled_for_reshard_path(self):
+        """流水让批间 flush 重叠, 单槽 buffer 会被后一批覆盖 → 两路径互斥."""
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector._PIPE_WRITER", True),
+        ):
+            self.assertTrue(self._make_send_thread(pd_head_ratio=1).use_pipe_writer)
+            self.assertFalse(self._make_send_thread(pd_head_ratio=2).use_pipe_writer)
+            self.assertFalse(self._make_send_thread(enable_kv_quant=True).use_pipe_writer)
 
 
 class TestKVCacheRecvingLayerThread(unittest.TestCase):
@@ -1145,6 +1282,89 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         self.assertIsNotNone(worker.kv_send_layer_thread)
         self.assertIsNone(worker.kv_recv_layer_thread)
 
+    @staticmethod
+    def _install_reshard_buffers(worker):
+        """让 worker 走 reshard/量化路径并装上假的 k/v buffer(跳过真实 NPU 分配)."""
+        worker.pd_head_ratio = 2
+        worker.enable_c8_quant = True
+
+        def _fake_create_kv_buffer(_first_kv_cache_tuple):
+            worker.k_buffer = torch.zeros(8192, dtype=torch.uint8)
+            worker.v_buffer = torch.zeros(8192, dtype=torch.uint8)
+
+        worker.create_kv_buffer = _fake_create_kv_buffer
+
+    def test_register_kv_caches_tcp_producer_stages_reshard_buffers(self):
+        """TCP + reshard 路径: k/v buffer 是数据面 src, 必须作为 extra 进 staging."""
+        self.vllm_config.kv_transfer_config.is_kv_producer = True
+        self.vllm_config.kv_transfer_config.is_kv_consumer = False
+        worker = MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
+        self._install_reshard_buffers(worker)
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch.object(global_te, "register_tcp_staging") as mock_staging,
+        ):
+            worker.register_kv_caches(self.kv_caches)
+        self.assertEqual(mock_staging.call_args[1]["extra_tensors"], [worker.k_buffer, worker.v_buffer])
+
+    def test_register_kv_caches_consumer_skips_reshard_buffers(self):
+        """consumer 只收不发: 既不分配 reshard buffer, 也不为其付 CPU 镜像开销."""
+        self.vllm_config.kv_transfer_config.is_kv_producer = False
+        self.vllm_config.kv_transfer_config.is_kv_consumer = True
+        worker = MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
+        worker.pd_head_ratio = 2
+        worker.enable_c8_quant = True  # 让 use_kv_buffer 为真, 验证仍被 producer 判定挡住
+        worker.create_kv_buffer = MagicMock()
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch.object(global_te, "register_tcp_staging") as mock_staging,
+            patch.object(global_te, "npu_addr_to_cpu_addr", return_value=0xABCD0000),
+        ):
+            worker.register_kv_caches(self.kv_caches)
+        worker.create_kv_buffer.assert_not_called()
+        self.assertIsNone(worker.k_buffer)
+        self.assertEqual(mock_staging.call_args[1]["extra_tensors"], [])
+
+    def test_done_signal_skips_peers_without_group_data(self):
+        """只承载了其它层数据的 peer 不发请求级 DONE(其 D 侧期望计数为 0)."""
+        self.vllm_config.kv_transfer_config.is_kv_producer = True
+        self.vllm_config.kv_transfer_config.is_kv_consumer = False
+        worker = MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
+        req_meta = ReqMeta(
+            local_block_ids=[[5]],
+            token_ids=None,
+            remote_block_ids=[[10]],
+            remote_block_size=[[16]],
+            remote_engine_id="remote_engine",
+            remote_host="127.0.0.1",
+            remote_port=7777,
+            remote_te_rpc_port=6000,
+            remote_layer_metadata={},
+            metaserver=None,
+            remote_tp_size=2,
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+        )
+        peer_attn = ("127.0.0.1", 7777)
+        peer_mamba = ("127.0.0.1", 7778)
+        req_meta.peer_transfer = {
+            peer_attn: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [2]},
+            peer_mamba: {"local_block_ids": [[], [7]], "remote_block_ids": [[], [11]], "trans_count": [0, 2]},
+        }
+        with (
+            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx") as mock_ctx,
+            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_send"),
+        ):
+            sock = mock_ctx.return_value.__enter__.return_value
+            sock.poll.return_value = True
+            sock.recv.return_value = b"ACK"
+            worker.send_done_send_signal("req1", req_meta, group_idx=0)
+
+        self.assertEqual(mock_ctx.call_count, 1)
+        path = mock_ctx.call_args[0][1]
+        self.assertIn("7777", path)
+        self.assertNotIn("7778", path)
+
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.is_kv_producer = False
         self.vllm_config.kv_transfer_config.is_kv_consumer = True
@@ -1170,3 +1390,45 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker.register_kv_caches(mla_caches)
         self.assertTrue(worker.use_mla)
         self.assertEqual(len(worker.layer_metadata["encoder.layer.0"].block_len), 2)
+
+
+class TestGlobalTEStagingExtras(unittest.TestCase):
+    """TCP staging 必须覆盖 k/v reshard buffer(pd_head_ratio>1 / 量化的数据面 src)."""
+
+    def _make_te(self):
+        from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import GlobalTE
+
+        te = GlobalTE()
+        te.transfer_engine = MagicMock()
+        te.transfer_engine.register_memory.return_value = 0
+        return te
+
+    def test_extra_tensors_join_per_tensor_staging(self):
+        te = self._make_te()
+        kv_caches = {"layer0": torch.zeros(4096, dtype=torch.uint8)}
+        k_buffer = torch.zeros(8192, dtype=torch.uint8)
+        v_buffer = torch.zeros(8192, dtype=torch.uint8)
+
+        te.register_tcp_staging(kv_caches, extra_tensors=[k_buffer, v_buffer])
+
+        # staging 布局: kv(4096) + k_buffer(8192) + v_buffer(8192)
+        cpu_base = te._cpu_tensors[0].data_ptr()
+        self.assertEqual(te.npu_addr_to_cpu_addr(k_buffer.data_ptr() + 4096), cpu_base + 4096 + 4096)
+        self.assertEqual(te.npu_addr_to_cpu_addr(v_buffer.data_ptr()), cpu_base + 4096 + 8192)
+
+        te.submit_dma_copy = MagicMock()
+        te.sync_npu_to_cpu_for_npu_addrs([k_buffer.data_ptr(), v_buffer.data_ptr()], [8192, 8192])
+        items = te.submit_dma_copy.call_args[0][0]
+        self.assertEqual([size for _, _, _, size in items], [8192, 8192])
+
+    def test_extra_regions_join_region_staging(self):
+        """hybrid 模型走 region 模式: 追加 region 后任意字节地址仍线性映射."""
+        te = self._make_te()
+        te.register_tcp_staging_regions([(0x100000, 4096), (0x200000, 8192)])
+
+        cpu_base = te._cpu_tensors[0].data_ptr()
+        self.assertEqual(te.npu_addr_to_cpu_addr(0x200000 + 512), cpu_base + 4096 + 512)
+
+        te.submit_dma_copy_ptrs = MagicMock()
+        te.sync_npu_to_cpu_for_npu_addrs([0x200000], [8192])
+        self.assertEqual(te.submit_dma_copy_ptrs.call_args[0][2], [8192])
