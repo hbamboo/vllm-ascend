@@ -99,7 +99,7 @@ _LAYER_BATCH = int(os.getenv("MC_TCP_LAYER_BATCH", "8"))
 # 用于定位 H2H 通路相对 D2D 的 TTFT 增量来源(攒批等待/事件/D2H/写/LAYER_DONE/H2D).
 _PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
 
-# H2H 写线程流水 A/B (仅 protocol=tcp 且 pd_head_ratio==1): 1=发送线程只做
+# H2H 写线程流水 A/B (仅 protocol=tcp 且非 reshard/量化路径): 1=发送线程只做
 # "等事件 + D2H flush", write 交给独立写线程连续占满数据面, LAYER_DONE 在对应
 # write 完成后按序发出(与后续批的 write / flush 重叠). 关闭时保持单线程原语义.
 _PIPE_WRITER = os.getenv("MC_TCP_PIPE_WRITER", "0") == "1"
@@ -148,6 +148,14 @@ class ReqMeta:
     local_computed_tokens: int = 0
     local_transed_tokens: int = 0
     do_virtual: bool = False
+    # 多 peer: 同一请求的不同 kv cache group 可能落在不同 D rank 上
+    # (hybrid 模型里 attn 组按 head/cp-group 选 peer, mamba 组按连续分片选
+    # peer, 不等 TP 下两者可能不一致). 键为 (host, port), 值为该 peer 的
+    # 按 group 索引的 block ids / 期望 DONE 数.
+    peer_transfer: dict[tuple[str, int], dict[str, Any]] = field(default_factory=dict)
+    # (host, port) -> 对端各层元数据 / TE rpc 端口
+    peer_layer_metadata: dict[tuple[str, int], dict[str, LayerMetadata]] = field(default_factory=dict)
+    peer_te_rpc_port: dict[tuple[str, int], int] = field(default_factory=dict)
 
 
 @dataclass
@@ -321,6 +329,14 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.v_buffer = v_buffer
         self.enable_kv_quant = enable_kv_quant
         self.enable_c8_quant = enable_c8_quant
+        # reshard/量化路径的传输 src 是单槽 k_buffer/v_buffer(所有层复用同一
+        # 偏移), 多层攒批会互相覆盖 → 该路径强制逐层传输.
+        self.uses_reshard_buffers = pd_head_ratio != 1 or enable_kv_quant or enable_c8_quant
+        self.max_batch_layers = 1 if self.uses_reshard_buffers else _LAYER_BATCH
+        # 写线程流水要求「批间 staging 区域互不相同」: 它让下一批的 D2H flush
+        # 与上一批的在飞 write 重叠. 单槽 buffer 路径两批 flush 到同一 staging
+        # 区域, 会把上一批正在发送的字节覆盖掉, 故该路径禁用流水(退回单线程).
+        self.use_pipe_writer = _PIPE_WRITER and global_te.use_tcp and not self.uses_reshard_buffers
         self.ready_event = ready_event
         self.callback_func = callback_func
         # perf: 上一批处理完成的时刻(用于统计批间攒批等待)与批序号.
@@ -344,7 +360,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         # (受 vllm-ascend cpu_binding taskset 约束, 在 main 核集内选取).
         bind_current_thread_to_idle_cpu(f"kv-send-rank{local_rank}")
         self.ready_event.set()
-        if _PIPE_WRITER and global_te.use_tcp and self.pd_head_ratio == 1:
+        if self.use_pipe_writer:
             # 启动独立写线程; 队列在 __init__ 已按 _PIPE_WRITER 创建.
             self._write_queue = queue.Queue(maxsize=_PIPE_DEPTH)  # type: ignore[assignment]
             self._done_queue = queue.Queue()  # type: ignore[assignment]
@@ -358,7 +374,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         # conv/ssm 状态在各自层 forward 内已写定 (P 侧无投机, 不存在采样后的
         # 状态重写), 随批 flush 读到的是截至该层的最终值; 多 chunk 时中间
         # chunk 的状态会被后续 chunk 覆写, 请求级 DONE 在含最后层的批之后,
-        # D 在 decode 前收齐的即最终状态.
+        # D 在 decode 前收齐的即最终状态. 批大小上限见 max_batch_layers:
+        # reshard/量化路径为 1(单槽 buffer), 其余为 _LAYER_BATCH.
         pending: list[SendTask] = []
         while True:
             if self._pipe_writer is not None:
@@ -377,13 +394,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 self._handle_batch(pending)
                 pending = []
             pending.append(send_task)
-            if is_last or len(pending) >= _LAYER_BATCH:
+            if is_last or len(pending) >= self.max_batch_layers:
                 self._handle_batch(pending)
                 pending = []
 
     def _handle_batch(self, tasks: list[SendTask]):
         try:
-            if _PIPE_WRITER and global_te.use_tcp and self.pd_head_ratio == 1:
+            if self.use_pipe_writer:
                 self._transfer_kv_cache_batch_pipe(tasks)
             else:
                 self._transfer_kv_cache_batch(tasks)
@@ -393,20 +410,31 @@ class KVCacheSendingLayerThread(threading.Thread):
                 [t.layer_idx for t in tasks],
                 e,
             )
-        if _PERF_LOG and not (_PIPE_WRITER and global_te.use_tcp and self.pd_head_ratio == 1):
+        if _PERF_LOG and not self.use_pipe_writer:
             self._last_batch_end_at = time.perf_counter()
 
-    def get_transfer_meta(self, send_task: SendTask, req_id: str, req_meta: ReqMeta, layer_group_idx: int):
+    def get_transfer_meta(
+        self,
+        send_task: SendTask,
+        req_id: str,
+        req_meta: ReqMeta,
+        layer_group_idx: int,
+        peer: tuple[str, int],
+    ):
         src_list: list[int] = []
         dst_list: list[int] = []
         length_list: list[int] = []
 
+        peer_blocks = req_meta.peer_transfer[peer]
+        local_block_ids = peer_blocks["local_block_ids"][layer_group_idx]
+        remote_block_ids = peer_blocks["remote_block_ids"][layer_group_idx]
+        if not local_block_ids:
+            # 多 peer 场景: 该 group 不经这个 peer, 本 peer 没有要传的段.
+            return (src_list, dst_list, length_list)
         layer_name = send_task.layer_name
         layer_kv_cache_spec = self.kv_cache_specs[layer_group_idx]
-        remote_block_ids = req_meta.remote_block_ids[layer_group_idx]
-        remote_layer_metadata = req_meta.remote_layer_metadata[layer_name]
+        remote_layer_metadata = req_meta.peer_layer_metadata[peer][layer_name]
         local_layer_metadata = self.layer_metadata[layer_name]
-        local_block_ids = req_meta.local_block_ids[layer_group_idx]
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
@@ -558,12 +586,41 @@ class KVCacheSendingLayerThread(threading.Thread):
                         length_list.append(block_len)
         return (src_list, dst_list, length_list)
 
+    def _wait_task_ready(self, send_task: SendTask) -> None:
+        """等本任务的数据就绪事件(计算流上记录).
+
+        轮询 `Event.query()` 而非 `Event.synchronize()`: 本 CANN 版本的 event
+        同步有已知偶发挂死(见下方 _transfer_kv_cache_batch 内注释), 轮询还能
+        在超时后打日志, 而不是无声卡死.
+        """
+        event = send_task.wait_event
+        if event is None:
+            return
+        t0 = time.perf_counter()
+        while not event.query():
+            time.sleep(1e-4)
+            if time.perf_counter() - t0 > LAYER_DONE_TIMEOUT_S:
+                logger.error(
+                    "Wait task ready timeout: rank=%d layer=%s waited=%.1fs",
+                    self.tp_rank,
+                    send_task.layer_idx,
+                    time.perf_counter() - t0,
+                )
+                return
+
     def _transfer_kv_cache_batch(self, tasks: list[SendTask]):
         """批量传输攒齐的多个层任务: 跨任务合并 ranges 后, 每 session 一次
         D2H flush + 一次 sync_write + 每 peer 一次 LAYER_DONE(携带批内全部层
         范围), 摊薄逐层传输的固定开销. tasks 为空时直接返回."""
         if not tasks:
             return
+        if self.uses_reshard_buffers and len(tasks) > 1:
+            # 该路径各层的 src 都指向同一个 k_buffer/v_buffer 偏移, 多层批会
+            # 互相覆盖. max_batch_layers 已把批大小钳到 1, 这里只做不变式兜底.
+            raise RuntimeError(
+                "Layerwise reshard/quant transfer uses a single-slot k/v buffer; "
+                f"multi-layer batching is not supported (layers={[t.layer_idx for t in tasks]})."
+            )
 
         # perf: 批级阶段计时. 阶段分解: wait(批间攒批等待) / event(等NPU事件,
         # 含模型产出该批最后一层的等待) / flush(D2H) / write(TCP) /
@@ -585,7 +642,25 @@ class KVCacheSendingLayerThread(threading.Thread):
         flush_win0 = write_win0 = layerdone_win0 = None
         flush_win1 = write_win1 = layerdone_win1 = None
 
-        # 1) reshard/quant buffer 拷贝(逐任务; v1 TCP 守卫下不会触发, 保留兼容)
+        # 1) 数据就绪: reshard/量化路径等本任务自己的就绪事件(计算流上记录);
+        #    pd==1 无量化路径等 reshape 事件. 两者都只依赖本任务, 不能用整条
+        #    resharding_stream.synchronize() —— 那会连带等待主线程为后续层
+        #    enqueue 的 reshard 工作, 与对端进度成环(2026-09-09 定位的死锁).
+        last_task = tasks[-1]
+        if self.uses_reshard_buffers:
+            self._wait_task_ready(last_task)
+        elif self.pd_head_ratio == 1:
+            """
+            Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
+            This issue will be fixed in CANN version 8.5.rc1.
+            You can manually build the master branch of the project at https://gitcode.com/cann/hixl
+            to resolve this issue before the 8.5.RC1 release.
+            """
+            last_task.wait_event.synchronize()  # type:ignore
+
+        # 2) reshard/量化结果拷进单槽 k/v buffer(逐任务; 发送线程串行执行,
+        #    与随后的 flush 互斥). 拷贝提交在侧流上, 侧流此后只承载本线程
+        #    自己的拷贝, 等它排空不会牵扯其他线程/其他 rank 的进度.
         for send_task in tasks:
             key = send_task.k_cache
             value = send_task.v_cache
@@ -603,21 +678,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     value_quant = send_task.v_quant_cache
                     value_quant = value_quant.view(-1, value_quant.shape[-1])  # type:ignore
                     self.v_buffer[: value_quant.shape[0]].copy_(value_quant)
-
-        # 2) 数据就绪: 批内层任务按层序提交、事件在同一流上递增, 只需等
-        # 最后一个任务的事件, 即全部层 KV 已写入.
-        last_task = tasks[-1]
-        if last_task.k_quant_cache is not None:
-            self.resharding_stream.synchronize()
-        elif self.pd_head_ratio == 1:
-            """
-            Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
-            This issue will be fixed in CANN version 8.5.rc1.
-            You can manually build the master branch of the project at https://gitcode.com/cann/hixl
-            to resolve this issue before the 8.5.RC1 release.
-            """
-            last_task.wait_event.synchronize()  # type:ignore
-        elif self.pd_head_ratio > 1:
+        if self.uses_reshard_buffers:
             self.resharding_stream.synchronize()
         t_event1 = time.perf_counter()
 
@@ -626,22 +687,26 @@ class KVCacheSendingLayerThread(threading.Thread):
         for send_task in tasks:
             layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
             for req_id, req_meta in send_task.send_request.items():
-                session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
-                meta = session_meta.get(session_id)
-                if meta is None:
-                    meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
-                    session_meta[session_id] = meta
-                if req_id not in meta.req_ids:
-                    meta.req_ids.append(req_id)
-                meta.req_peer[req_id] = (req_meta.remote_host, req_meta.remote_port)
-                (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
-                if not src_list:
-                    continue
-                start = len(meta.src)
-                meta.src.extend(src_list)
-                meta.dst.extend(dst_list)
-                meta.length.extend(length_list)
-                meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
+                for peer, _peer_blocks in req_meta.peer_transfer.items():
+                    peer_host, peer_port = peer
+                    session_id = f"{peer_host}:{req_meta.peer_te_rpc_port[peer]}"
+                    meta = session_meta.get(session_id)
+                    if meta is None:
+                        meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+                        session_meta[session_id] = meta
+                    if req_id not in meta.req_ids:
+                        meta.req_ids.append(req_id)
+                    meta.req_peer[req_id] = (peer_host, peer_port)
+                    (src_list, dst_list, length_list) = self.get_transfer_meta(
+                        send_task, req_id, req_meta, layer_group_idx, peer
+                    )
+                    if not src_list:
+                        continue
+                    start = len(meta.src)
+                    meta.src.extend(src_list)
+                    meta.dst.extend(dst_list)
+                    meta.length.extend(length_list)
+                    meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
 
         # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
         for session_id, transfer_meta in session_meta.items():
@@ -829,7 +894,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         else:
                             self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
 
-    # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, 仅 protocol=tcp 且 pd==1) ----
+    # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, protocol=tcp 且非 reshard/量化) ----
     # 阶段归属: 发送线程 = 等事件 + D2H flush + 攒批; 写线程 = TCP write(数据面
     # 连续占满); 发送线程 drain = LAYER_DONE(与后续批 write 重叠) + perf/请求级
     # DONE. 不变式与单线程版一致: LAYER_DONE g 只在 write g 完成后发出; 请求级
@@ -866,22 +931,26 @@ class KVCacheSendingLayerThread(threading.Thread):
         for send_task in tasks:
             layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
             for req_id, req_meta in send_task.send_request.items():
-                session_id = f"{req_meta.remote_host}:{req_meta.remote_te_rpc_port}"
-                meta = session_meta.get(session_id)
-                if meta is None:
-                    meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
-                    session_meta[session_id] = meta
-                if req_id not in meta.req_ids:
-                    meta.req_ids.append(req_id)
-                meta.req_peer[req_id] = (req_meta.remote_host, req_meta.remote_port)
-                (src_list, dst_list, length_list) = self.get_transfer_meta(send_task, req_id, req_meta, layer_group_idx)
-                if not src_list:
-                    continue
-                start = len(meta.src)
-                meta.src.extend(src_list)
-                meta.dst.extend(dst_list)
-                meta.length.extend(length_list)
-                meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
+                for peer, _peer_blocks in req_meta.peer_transfer.items():
+                    peer_host, peer_port = peer
+                    session_id = f"{peer_host}:{req_meta.peer_te_rpc_port[peer]}"
+                    meta = session_meta.get(session_id)
+                    if meta is None:
+                        meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+                        session_meta[session_id] = meta
+                    if req_id not in meta.req_ids:
+                        meta.req_ids.append(req_id)
+                    meta.req_peer[req_id] = (peer_host, peer_port)
+                    (src_list, dst_list, length_list) = self.get_transfer_meta(
+                        send_task, req_id, req_meta, layer_group_idx, peer
+                    )
+                    if not src_list:
+                        continue
+                    start = len(meta.src)
+                    meta.src.extend(src_list)
+                    meta.dst.extend(dst_list)
+                    meta.length.extend(length_list)
+                    meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
 
         # 每 session: D2H flush 进本端 staging 并把 src 换成 staging 地址.
         # 写线程只读这些区域, flush 与上一批在飞的 write 区域不同, 可重叠.
@@ -1908,6 +1977,11 @@ class MooncakeLayerwiseConnectorWorker:
             )
         for tensor in (self.k_buffer, self.v_buffer):
             assert tensor.data_ptr() % alignment == 0, "The address of the registered kv cache should be aligned to 2M"
+            if global_te.use_tcp:
+                # TCP 数据面只能读写注册过的 host 内存: 设备内存不注册, reshard/
+                # 量化 buffer 的 CPU staging 由 register_kv_caches 随 kv cache
+                # 一并登记(见 register_tcp_staging 的 extra_tensors).
+                continue
             ret_value = self.engine.register_memory(tensor.data_ptr(), tensor.numel() * tensor.element_size())
             logger.info("Register memory buffer for transfer, buffer size:%s", tensor.numel() * tensor.element_size())
             if ret_value != 0:
@@ -2001,17 +2075,21 @@ class MooncakeLayerwiseConnectorWorker:
 
         validate_register_region_count(register_regions)
 
+        if use_kv_buffer and self.vllm_config.kv_transfer_config.is_kv_producer:
+            # reshard/量化 buffer 只服务于发送路径(get_transfer_meta 的 src 基址、
+            # save_kv_layer 的 reshard 落点), consumer 侧从不使用 → 不分配.
+            # 该 buffer 是「一整层物理 cache」大小: 1024-token page 下 D 侧单块
+            # 就有 3+ GiB, 而 decode 侧 0.95 util 下余量只有几百 MB, 分配即 OOM.
+            # 必须在 staging 构建前分配: TCP 下它也要镜像进 CPU staging.
+            self.create_kv_buffer(kv_buffer)
+
+        # TCP 下 reshard/量化 buffer 也要走 staging; 只有 producer 侧会传输,
+        # consumer 侧不必为其付出 CPU 镜像开销.
+        extra_staging_tensors: list[torch.Tensor] = []
+        if global_te.use_tcp and self.vllm_config.kv_transfer_config.is_kv_producer and self.k_buffer is not None:
+            extra_staging_tensors = [self.k_buffer, self.v_buffer]
+
         if global_te.use_tcp:
-            # H2H (TCP) layerwise 范围: pd_head_ratio==1、无 KV 量化 ——
-            # 这些路径的 k/v reshard buffer 语义尚未在 staging 模式下适配,
-            # 先显式报错避免静默走错路径.
-            if self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant:
-                raise RuntimeError(
-                    "H2H (TCP) layerwise only supports pd_head_ratio==1 without "
-                    "kv/c8 quantization. "
-                    f"pd_head_ratio={self.pd_head_ratio}, enable_kv_quant="
-                    f"{self.enable_kv_quant}, enable_c8_quant={self.enable_c8_quant}"
-                )
             if self.use_attn_mamba_hybrid:
                 # Hybrid (attn + mamba/GDN linear-attn) 模型: 各层 cache 是共享
                 # 物理 tensor 上的视图(含页填充/对齐空隙), 按物理 tensor 整体
@@ -2025,9 +2103,14 @@ class MooncakeLayerwiseConnectorWorker:
                         if "mtp" in layer_name:
                             tensor_addrs.append(min(tensor_addrs) - conv_total_padding_size)
                     hybrid_regions.append((min(tensor_addrs), kv_cache_tensor.size))
+                # reshard/量化 buffer 是独立物理分配, 作为额外 region 追加
+                # (region 模式要求各 region 互不重叠).
+                hybrid_regions.extend(
+                    (tensor.data_ptr(), tensor.numel() * tensor.element_size()) for tensor in extra_staging_tensors
+                )
                 global_te.register_tcp_staging_regions(hybrid_regions)
             else:
-                global_te.register_tcp_staging(kv_caches)
+                global_te.register_tcp_staging(kv_caches, extra_tensors=extra_staging_tensors)
             if self.vllm_config.kv_transfer_config.is_kv_consumer:
                 # consumer 发布的是自己 CPU staging 的地址: P 推写的目的地.
                 # producer 侧 layer_metadata 保留 NPU 地址供内部 src 计算.
@@ -2048,9 +2131,6 @@ class MooncakeLayerwiseConnectorWorker:
                 )
         else:
             global_te.register_buffer(register_regions.ptrs, register_regions.lengths)
-
-        if use_kv_buffer:
-            self.create_kv_buffer(kv_buffer)
 
         num_attn_module = 2 if self.vllm_config.model_config.hf_text_config.model_type == "longcat_flash" else 1
         mtp_layer_name = ""
@@ -2357,15 +2437,23 @@ class MooncakeLayerwiseConnectorWorker:
                         transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
                             (host, port)
                         ]["trans_count"]
-                assert len(transfer_mappings) <= 1, f"Not support add mutil transfer task for req_id:{req_id}"
+                # 一个请求的 KV 可能按 group 落到多个 D rank(见 ReqMeta.peer_transfer
+                # 注释), 这里全部记下来, 发送线程按 (peer, group) 分别推送.
                 update_req_meta = copy.deepcopy(req_meta)
                 for (host, port), block_dict in transfer_mappings.items():
-                    update_req_meta.remote_host = host
-                    update_req_meta.remote_port = port
-                    update_req_meta.local_block_ids = self._get_kernel_block_ids(block_dict["local_block_ids"])
-                    update_req_meta.remote_block_ids = self._get_kernel_block_ids(block_dict["remote_block_ids"])
-                    update_req_meta.trans_count = block_dict["trans_count"]
-                    update_metadata[req_id] = update_req_meta
+                    update_req_meta.peer_transfer[(host, port)] = {
+                        "local_block_ids": self._get_kernel_block_ids(block_dict["local_block_ids"]),
+                        "remote_block_ids": self._get_kernel_block_ids(block_dict["remote_block_ids"]),
+                        "trans_count": block_dict["trans_count"],
+                    }
+                # 兼容字段(日志/旧路径): 指向第一个 peer.
+                first_peer = next(iter(update_req_meta.peer_transfer), None)
+                if first_peer is not None:
+                    update_req_meta.remote_host, update_req_meta.remote_port = first_peer
+                    update_req_meta.local_block_ids = update_req_meta.peer_transfer[first_peer]["local_block_ids"]
+                    update_req_meta.remote_block_ids = update_req_meta.peer_transfer[first_peer]["remote_block_ids"]
+                    update_req_meta.trans_count = update_req_meta.peer_transfer[first_peer]["trans_count"]
+                update_metadata[req_id] = update_req_meta
             metadata.requests = {}
             for req_id, req_meta in update_metadata.items():
                 metadata.requests[req_id] = update_metadata[req_id]
@@ -2381,12 +2469,15 @@ class MooncakeLayerwiseConnectorWorker:
                 send_task.group_seq_start_tensor = [None for _ in range(self.num_kv_cache_groups)]
                 device = self.k_buffer.device  # type: ignore
                 for i in self.attn_resharding_group_idx:
+                    # 多 peer 下同一 group 的 block 可能记在不同 peer 名下(兼容字段
+                    # local_block_ids 只指向第一个 peer), 这里取所有 peer 的并集.
                     send_task.group_rearrange_block_ids[i].extend(
                         sorted(
                             {
                                 block_id
-                                for req_id in metadata.requests
-                                for block_id in metadata.requests[req_id].local_block_ids[i]
+                                for req_meta in metadata.requests.values()
+                                for peer_blocks in req_meta.peer_transfer.values()
+                                for block_id in peer_blocks["local_block_ids"][i]
                             }
                         )
                     )
@@ -2440,6 +2531,9 @@ class MooncakeLayerwiseConnectorWorker:
             values = None
             quant_keys = None
             quant_values = None
+            # reshard/量化路径: 计算流上记录的"本任务数据就绪"事件, 供发送线程
+            # 按任务等待(替代 resharding_stream 整条流 synchronize).
+            reshard_ready_event: torch.npu.Event | None = None
             if (
                 (
                     self.pd_head_ratio != 1
@@ -2450,83 +2544,92 @@ class MooncakeLayerwiseConnectorWorker:
                 or (self.enable_kv_quant and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers)
             ):
                 assert self.resharding_stream is not None
-                with npu_stream_switch(self.resharding_stream):
-                    reshape_cache_event.wait()
-                    device = self.k_buffer.device  # type: ignore
-                    # Initialize buffers
-                    keys = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[0].size()[-2:]),
-                        dtype=kv_layer[0].dtype,
-                        device=device,
-                    )
-                    values = torch.empty(
-                        (send_task.group_num_tokens[layer_group_idx], *kv_layer[1].size()[-2:]),
-                        dtype=kv_layer[1].dtype,
-                        device=device,
-                    )
+                # reshard 计算跑在计算流上(与 attention 同流): 顺序天然确定,
+                # 既不需要跨流 event.wait, 也不在侧流上发集合通信. 2026-09-09
+                # 实测侧流方案下设备侧 alltoall 会偶发永久等待(发送线程卡在
+                # resharding_stream.synchronize()), 队列随即堵死模型前向.
+                # 侧流此后只承载发送线程自己的 k/v buffer 拷贝.
+                reshape_cache_event.wait()
+                device = self.k_buffer.device  # type: ignore
+                # Initialize buffers
+                keys = torch.empty(
+                    (send_task.group_num_tokens[layer_group_idx], *kv_layer[0].size()[-2:]),
+                    dtype=kv_layer[0].dtype,
+                    device=device,
+                )
+                values = torch.empty(
+                    (send_task.group_num_tokens[layer_group_idx], *kv_layer[1].size()[-2:]),
+                    dtype=kv_layer[1].dtype,
+                    device=device,
+                )
 
-                    # Load cache data into buffers
-                    torch_npu.atb.npu_paged_cache_load(
-                        kv_layer[0],
-                        kv_layer[1],
-                        send_task.group_block_table[layer_group_idx],
-                        send_task.group_block_len_tensor[layer_group_idx],
-                        seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
-                        key=keys,
-                        value=values,
+                # Load cache data into buffers
+                torch_npu.atb.npu_paged_cache_load(
+                    kv_layer[0],
+                    kv_layer[1],
+                    send_task.group_block_table[layer_group_idx],
+                    send_task.group_block_len_tensor[layer_group_idx],
+                    seq_starts=send_task.group_seq_start_tensor[layer_group_idx],
+                    key=keys,
+                    value=values,
+                )
+                if self.pd_head_ratio != 1:
+                    # sort kv caches for each block
+                    keys = (
+                        keys.view(
+                            send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:]
+                        )
+                        .transpose(0, 1)
+                        .reshape_as(keys)
                     )
-                    if self.pd_head_ratio != 1:
-                        # sort kv caches for each block
-                        keys = (
-                            keys.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(keys)
+                    values = (
+                        values.view(
+                            send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *values.shape[1:]
                         )
-                        values = (
-                            values.view(
-                                send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *values.shape[1:]
-                            )
-                            .transpose(0, 1)
-                            .reshape_as(values)
-                        )
-                        # reshard kv cache
-                        keys = keys.reshape(-1, *kv_layer[0].shape[2:])
-                        values = values.reshape(-1, *kv_layer[1].shape[2:])
+                        .transpose(0, 1)
+                        .reshape_as(values)
+                    )
+                    # reshard kv cache
+                    keys = keys.reshape(-1, *kv_layer[0].shape[2:])
+                    values = values.reshape(-1, *kv_layer[1].shape[2:])
 
-                        (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
-                    if self.enable_c8_quant:
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        quant_keys = torch.clamp(
-                            torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_values = torch.clamp(
-                            torch.round(values * layer._c8_v_inv_scale + layer._c8_v_offset),
-                            -128,
-                            127,
-                        ).to(torch.int8)
-                        quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(quant_values, layer_group_idx)
-                    if (
-                        self.enable_kv_quant
-                        and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
-                    ):
-                        layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
-                        keys = torch.ops.vllm.quantize(
-                            keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
-                        )
-                        quant_keys = self.get_nz_cache(keys, layer_group_idx)
-                        quant_values = self.get_nz_cache(values, layer_group_idx)
+                    (keys, values) = kv_alltoall_and_rearrange(self.pd_head_ratio, keys, values)
+                if self.enable_c8_quant:
+                    layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
+                    quant_keys = torch.clamp(
+                        torch.round(keys * layer._c8_k_inv_scale + layer._c8_k_offset),
+                        -128,
+                        127,
+                    ).to(torch.int8)
+                    quant_values = torch.clamp(
+                        torch.round(values * layer._c8_v_inv_scale + layer._c8_v_offset),
+                        -128,
+                        127,
+                    ).to(torch.int8)
+                    quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
+                    quant_values = self.get_nz_cache(quant_values, layer_group_idx)
+                if (
+                    self.enable_kv_quant
+                    and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
+                ):
+                    layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
+                    keys = torch.ops.vllm.quantize(
+                        keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
+                    )
+                    quant_keys = self.get_nz_cache(keys, layer_group_idx)
+                    quant_values = self.get_nz_cache(values, layer_group_idx)
+                # 本任务的数据就绪事件(记录在计算流上): 发送线程按任务等待它,
+                # 而不是等整条 resharding stream —— 后者会连带等待后续层的
+                # reshard 工作, 与对端进度成环.
+                reshard_ready_event = torch.npu.Event()
+                reshard_ready_event.record()
 
             assert self.kv_send_layer_thread is not None
             assert reshape_cache_event is not None
             # 每层任务随批发送: mamba/GDN 状态在层 forward 内已写定 (P 侧无
             # 投机, 无采样后状态重写), 与 full-attention 层同路径攒批传输.
             layer_send_task = SendTask(
-                wait_event=reshape_cache_event,
+                wait_event=reshard_ready_event if reshard_ready_event is not None else reshape_cache_event,
                 k_cache=keys,
                 v_cache=values,
                 k_quant_cache=quant_keys,
@@ -2536,7 +2639,10 @@ class MooncakeLayerwiseConnectorWorker:
                 group_rearrange_block_ids=send_task.group_rearrange_block_ids,
             )
             for req_id, req_meta in connector_metadata.requests.items():
-                if len(req_meta.local_block_ids[layer_group_idx]) == 0:
+                # 多 peer 下本层的 group 可能只落在其中某个 peer 上, 要按所有 peer 判断.
+                if not any(
+                    blocks["local_block_ids"][layer_group_idx] for blocks in req_meta.peer_transfer.values()
+                ):
                     continue
                 try:
                     req_meta_update = self.update_decoder_info(req_id, req_meta)
@@ -2595,14 +2701,25 @@ class MooncakeLayerwiseConnectorWorker:
             return sock
 
     def update_decoder_info(self, req_id, req_meta: ReqMeta):
-        if (
-            req_meta.remote_engine_id not in self.remote_layer_metadata
-            or req_meta.remote_port not in self.remote_layer_metadata[req_meta.remote_engine_id]
-        ):
+        # 一个请求可能对应多个 D peer(见 ReqMeta.peer_transfer): 每个 peer 的
+        # KV base / 层元数据都要单独拉取.
+        for remote_host, remote_port in req_meta.peer_transfer:
+            self._ensure_peer_metadata(req_id, req_meta, remote_host, remote_port)
+        first_peer = next(iter(req_meta.peer_transfer), None)
+        if first_peer is not None:
+            req_meta.remote_host, req_meta.remote_port = first_peer
+            req_meta.remote_te_rpc_port = req_meta.peer_te_rpc_port[first_peer]
+            req_meta.remote_layer_metadata = req_meta.peer_layer_metadata[first_peer]
+        return req_meta
+
+    def _ensure_peer_metadata(self, req_id, req_meta: ReqMeta, remote_host: str, remote_port: int):
+        """拉取某个对端(host, port)的 KV 元信息(带缓存), 不等 TP 时预建链路."""
+        peer = (remote_host, remote_port)
+        if remote_port not in self.remote_layer_metadata[req_meta.remote_engine_id]:
             try:
                 encoded_data = self.encoder.encode((GET_META_MSG, req_id))
-                sock = self._get_remote_socket(req_meta.remote_host, req_meta.remote_port)
-                path = f"{req_meta.remote_host}:{req_meta.remote_port}"
+                sock = self._get_remote_socket(remote_host, remote_port)
+                path = f"{remote_host}:{remote_port}"
                 ensure_zmq_send(sock, encoded_data, path)
                 metadata_bytes = ensure_zmq_recv(sock, self.remote_poller, path)
                 agent_meta: MooncakeAgentMetadata = self.decoder.decode(metadata_bytes)
@@ -2610,96 +2727,114 @@ class MooncakeLayerwiseConnectorWorker:
                 logger.error(
                     "Query to port and kv base addr for request fail. req_id=%s, source=%s:%s, error=%s. ",
                     req_id,
-                    req_meta.remote_host,
-                    req_meta.remote_port,
+                    remote_host,
+                    remote_port,
                     e,
                 )
                 raise e
             assert req_meta.remote_engine_id != self.engine_id, (
                 f"Conflict engine id {req_meta.remote_engine_id} with local engine id {self.local_engine_id}."
             )
-            self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.layer_metadata
-            self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port] = agent_meta.te_rpc_port
+            self.remote_layer_metadata[req_meta.remote_engine_id][remote_port] = agent_meta.layer_metadata
+            self.remote_te_port[req_meta.remote_engine_id][remote_port] = agent_meta.te_rpc_port
             logger.debug(
                 "Query to port and kv base addr for request %s from %s:%s success "
                 "agent_meta.layer_metadata=%r agent_meta.te_rpc_port=%r",
                 req_id,
-                req_meta.remote_host,
-                req_meta.remote_port,
+                remote_host,
+                remote_port,
                 agent_meta.layer_metadata,
                 agent_meta.te_rpc_port,
             )
             if self.pd_head_ratio > 1:
                 # for tp inequal, pre-create link to prevent alltoall out of memory
-                session_id = f"{req_meta.remote_host}:{agent_meta.te_rpc_port}"
+                session_id = f"{remote_host}:{agent_meta.te_rpc_port}"
                 first_layer_name = next(iter(self.layer_metadata.keys()))
+                local_base_addr = self.layer_metadata[first_layer_name].kv_caches_base_addr[0]
+                if global_te.use_tcp:
+                    # TCP 数据面只能读注册过的 host 内存: 先把这 128B flush 到
+                    # CPU staging, 再用 staging 地址做 src(与逐层传输的 src
+                    # 替换语义一致). 目的地址是 consumer 发布的 staging 地址.
+                    global_te.sync_npu_to_cpu_for_npu_addrs([local_base_addr], [128])
+                    staging_base_addr = global_te.npu_addr_to_cpu_addr(local_base_addr)
+                    if staging_base_addr is None:
+                        raise RuntimeError(
+                            f"H2H layerwise: pre-create link src 0x{local_base_addr:x} not found in TCP staging map."
+                        )
+                    local_base_addr = staging_base_addr
                 ret = self.engine.batch_transfer_sync_write(
                     session_id,
-                    [self.layer_metadata[first_layer_name].kv_caches_base_addr[0]],
+                    [local_base_addr],
                     [agent_meta.layer_metadata[first_layer_name].kv_caches_base_addr[0]],
                     [128],
                 )
                 if ret < 0:
                     logger.error("Mooncake transfer failed to create link. session_id=%s, ret=%d. ", session_id, ret)
-        req_meta.remote_te_rpc_port = self.remote_te_port[req_meta.remote_engine_id][req_meta.remote_port]
-        req_meta.remote_layer_metadata = self.remote_layer_metadata[req_meta.remote_engine_id][req_meta.remote_port]
-        return req_meta
+        req_meta.peer_layer_metadata[peer] = self.remote_layer_metadata[req_meta.remote_engine_id][remote_port]
+        req_meta.peer_te_rpc_port[peer] = self.remote_te_port[req_meta.remote_engine_id][remote_port]
 
     def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
         external_req_id = get_external_request_id(req_id)
         send_msg_type = DONE_SENDING_MSG if trans_flag else FAILED_SENDING_MSG
-        logger.info(
-            "Sending transmitting signal %s for request %s to %s:%d",
-            send_msg_type,
-            external_req_id,
-            req_meta.remote_host,
-            req_meta.remote_port,
-        )
-        try:
-            path = make_zmq_path("tcp", req_meta.remote_host, req_meta.remote_port)
-            msg_encoder = msgspec.msgpack.Encoder()
-            side_channel_path = f"{self.side_channel_host}:{self.handshake_port}"
-            encoded_data = msg_encoder.encode(
-                (send_msg_type, external_req_id, req_meta.trans_count[group_idx], side_channel_path)
-            )
-            max_retries = 3
-            for attempt in range(1, max_retries + 1):
-                try:
-                    with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
-                        sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                        ensure_zmq_send(sock, encoded_data, f"{req_meta.remote_host}:{req_meta.remote_port}")
-                        if not sock.poll(int(self.timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
-                            raise TimeoutError(
-                                f"Timed out waiting for ACK from {req_meta.remote_host}:{req_meta.remote_port}"
-                            )
-                        ack = sock.recv()
-                        if ack != b"ACK":
-                            raise ValueError(f"Unexpected ACK response: {ack}")
-                        return
-                except Exception as e:
-                    if attempt < max_retries:
-                        logger.warning(
-                            "Failed to send done sending signal. "
-                            "request_id=%s, destination=%s:%d, attempt=%d/%d, error=%s. ",
-                            external_req_id,
-                            req_meta.remote_host,
-                            req_meta.remote_port,
-                            attempt,
-                            max_retries,
-                            e,
-                        )
-                        time.sleep(0.1)
-                    else:
-                        raise RuntimeError(f"Failed to receive ACK after {max_retries} attempts: {e}") from e
-        except Exception as e:
-            logger.error(
-                "Sending signal fail. signal_type=%s, request_id=%s, destination=%s:%s, error=%s. ",
+        side_channel_path = f"{self.side_channel_host}:{self.handshake_port}"
+        msg_encoder = msgspec.msgpack.Encoder()
+        # 每个承载了最后层(group_idx)数据的 peer 各收一份请求级 DONE, 带上该 peer
+        # 自己的期望计数; D 侧按不同 P 侧信道路径累计, 收齐即认为该请求完成.
+        # 只承载了其它层(如 mamba)数据的 peer 不发: 那些层的完整性由逐层
+        # LAYER_DONE 的 ACK 保证(且 TP 集合通信保证各 rank 不会超过一层之差),
+        # 而这类 peer 的 D 侧期望计数本来就是 0.
+        for (remote_host, remote_port), peer_blocks in req_meta.peer_transfer.items():
+            trans_count = peer_blocks["trans_count"][group_idx]
+            if trans_count <= 0:
+                continue
+            logger.info(
+                "Sending transmitting signal %s for request %s to %s:%d",
                 send_msg_type,
                 external_req_id,
-                req_meta.remote_host,
-                req_meta.remote_port,
-                e,
+                remote_host,
+                remote_port,
             )
+            try:
+                path = make_zmq_path("tcp", remote_host, remote_port)
+                encoded_data = msg_encoder.encode(
+                    (send_msg_type, external_req_id, trans_count, side_channel_path)
+                )
+                max_retries = 3
+                for attempt in range(1, max_retries + 1):
+                    try:
+                        with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                            sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
+                            ensure_zmq_send(sock, encoded_data, f"{remote_host}:{remote_port}")
+                            if not sock.poll(int(self.timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
+                                raise TimeoutError(f"Timed out waiting for ACK from {remote_host}:{remote_port}")
+                            ack = sock.recv()
+                            if ack != b"ACK":
+                                raise ValueError(f"Unexpected ACK response: {ack}")
+                            break
+                    except Exception as e:
+                        if attempt < max_retries:
+                            logger.warning(
+                                "Failed to send done sending signal. "
+                                "request_id=%s, destination=%s:%d, attempt=%d/%d, error=%s. ",
+                                external_req_id,
+                                remote_host,
+                                remote_port,
+                                attempt,
+                                max_retries,
+                                e,
+                            )
+                            time.sleep(0.1)
+                        else:
+                            raise RuntimeError(f"Failed to receive ACK after {max_retries} attempts: {e}") from e
+            except Exception as e:
+                logger.error(
+                    "Sending signal fail. signal_type=%s, request_id=%s, destination=%s:%s, error=%s. ",
+                    send_msg_type,
+                    external_req_id,
+                    remote_host,
+                    remote_port,
+                    e,
+                )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
