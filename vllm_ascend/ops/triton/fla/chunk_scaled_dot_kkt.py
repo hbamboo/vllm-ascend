@@ -23,7 +23,11 @@ from .utils import prepare_chunk_indices, safe_exp
         "USE_G": lambda args: args["g_cumsum"] is not None,
     }
 )
-@triton.jit(do_not_specialize=["T", "B"])
+# bh_step/task_num 随 batch 形状(序列数 × chunk 数)变化, 必须是运行期参数:
+# 作为 tl.constexpr 时每个新值都是一条新的 cache key, 现场重编译一次
+# (ttir→npubin ~2.5 s, 阻塞整个前向 → 该 step 的 KV 迟迟不出, TTFT 劣化).
+# 二者只用于 tl.range 边界与整除, 运行期合法, 与 T/B 同样 do_not_specialize.
+@triton.jit(do_not_specialize=["T", "B", "task_num", "bh_step"])
 def chunk_scaled_dot_kkt_fwd_kernel(
     k,
     beta,  # [H, B, T]
@@ -33,6 +37,8 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     chunk_indices,
     T,
     B,
+    bh_step,
+    task_num,
     H: tl.constexpr,
     Hg: tl.constexpr,
     K: tl.constexpr,
@@ -40,8 +46,6 @@ def chunk_scaled_dot_kkt_fwd_kernel(
     BK: tl.constexpr,
     IS_VARLEN: tl.constexpr,
     USE_G: tl.constexpr,
-    bh_step: tl.constexpr,
-    task_num: tl.constexpr,
     num_core: tl.constexpr,
 ):
     bt_stride = B * T
