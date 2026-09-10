@@ -59,6 +59,7 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     ReqMeta,
     SendReqInfo,
     SendTask,
+    TransferMeta,
     ensure_zmq_recv,
     ensure_zmq_send,
     group_concurrent_contiguous,
@@ -177,7 +178,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             enable_kv_quant=False,
             enable_c8_quant=False,
             resharding_stream=fake_resharding_stream,
-            callback_func=MagicMock(),
+            sender_path="127.0.0.1:9999",
         )
 
         self.req_meta_base = ReqMeta(
@@ -259,7 +260,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             enable_kv_quant=False,
             enable_c8_quant=False,
             resharding_stream=fake_resharding_stream,
-            callback_func=MagicMock(),
+            sender_path="127.0.0.1:9999",
         )
 
         req_meta = self.req_meta_base
@@ -328,7 +329,8 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         side_effect=group_concurrent_contiguous,
     )
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.torch.npu.synchronize")
-    def test_callback_invoked_on_final_layer(self, _mock_sync, _mock_group):
+    def test_layer_done_carries_req_done_on_final_layer(self, _mock_sync, _mock_group):
+        """末轮(chunk_finish)的请求级完成信息随含最后层的批 LAYER_DONE 一起下发."""
         req_meta = self.req_meta_base
         req_meta.chunk_finish = True
         req_meta.local_block_ids = [[5, 6]]
@@ -356,7 +358,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
         _set_single_peer(req_meta)
 
         send_task = SendTask(
-            send_request={"req5": req_meta},
+            send_request={"req5abcdefghi": req_meta},
             wait_event=MagicMock(),
             k_cache=key,
             v_cache=value,
@@ -364,9 +366,173 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             layer_name="layer2",
             group_rearrange_block_ids=[[]],
         )
-        self.thread._transfer_kv_cache_batch([send_task])
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch.object(global_te, "npu_addr_to_cpu_addr", return_value=0x1234),
+            patch.object(self.thread, "_send_layer_done_signal", return_value=True) as mock_ld,
+        ):
+            self.thread._transfer_kv_cache_batch([send_task])
 
-        self.thread.callback_func.assert_called_once()
+        mock_ld.assert_called_once()
+        done_list = mock_ld.call_args[0][5]
+        # (external_req_id, is_last, trans_count, failed): 末轮 → is_last=True;
+        # trans_count 取该 peer 在最后层所属 group 的期望路径数(_set_single_peer → 1).
+        self.assertEqual(done_list, [("req5", True, 1, False)])
+
+    def _final_layer_send_task(self, req_id: str) -> SendTask:
+        """构造"含最后层 + 末轮(chunk_finish)"的单任务, 供完成/失败信号测试复用."""
+        req_meta = self.req_meta_base
+        req_meta.chunk_finish = True
+        req_meta.local_block_ids = [[5, 6]]
+        req_meta.remote_block_ids = [[10, 11]]
+        req_meta.remote_layer_metadata = {
+            "layer2": _make_layer_metadata(
+                kv_caches_base_addr=[11000, 12000], block_len=[1024, 2048], block_size_scale=[1, 1]
+            ),
+        }
+        _set_single_peer(req_meta)
+        return SendTask(
+            send_request={req_id: req_meta},
+            wait_event=MagicMock(),
+            k_cache=torch.zeros((1, 8), dtype=torch.float32),
+            v_cache=torch.zeros((1, 8), dtype=torch.float32),
+            layer_idx=2,
+            layer_name="layer2",
+            group_rearrange_block_ids=[[]],
+        )
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.group_concurrent_contiguous",
+        side_effect=group_concurrent_contiguous,
+    )
+    def test_d2d_final_layer_sends_request_level_done(self, _mock_group):
+        """D2D(protocol=ascend) 没有 LAYER_DONE 可搭车 → 末轮发独立请求级 DONE."""
+        send_task = self._final_layer_send_task("req6abcdefghi")
+        with (
+            patch.object(global_te, "_use_tcp", False),
+            patch.object(self.thread, "_send_layer_done_signal") as mock_ld,
+            patch.object(self.thread, "_send_done_signal") as mock_done,
+        ):
+            self.thread._transfer_kv_cache_batch([send_task])
+
+        mock_ld.assert_not_called()
+        mock_done.assert_called_once()
+        req_id, _req_meta, group_idx = mock_done.call_args[0]
+        self.assertEqual(req_id, "req6abcdefghi")
+        self.assertEqual(group_idx, 0)
+
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.group_concurrent_contiguous",
+        side_effect=group_concurrent_contiguous,
+    )
+    def test_tcp_final_layer_skips_request_level_done(self, _mock_group):
+        """TCP: 完成信息随末批 LAYER_DONE 的 done_list 下发, 不再单发 DONE 往返."""
+        send_task = self._final_layer_send_task("req7abcdefghi")
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch.object(global_te, "npu_addr_to_cpu_addr", return_value=0x1234),
+            patch.object(self.thread, "_send_layer_done_signal", return_value=True) as mock_ld,
+            patch.object(self.thread, "_send_done_signal") as mock_done,
+        ):
+            self.thread._transfer_kv_cache_batch([send_task])
+
+        mock_ld.assert_called_once()
+        self.assertEqual(mock_ld.call_args[0][5], [("req7", True, 1, False)])
+        mock_done.assert_not_called()
+
+    def test_req_done_entry_skips_peer_without_last_layer_data(self):
+        """只承载了其它层(如 mamba)数据的 peer 既不产生请求级完成条目也不发 LAYER_DONE."""
+        req_meta = self.req_meta_base
+        req_meta.chunk_finish = True
+        peer_attn = ("127.0.0.1", 7777)
+        peer_mamba = ("127.0.0.1", 7778)
+        req_meta.peer_transfer = {
+            # peer_attn 承载本 group(layer2 → group 0)数据; peer_mamba 该 group 为空.
+            peer_attn: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [2]},
+            peer_mamba: {"local_block_ids": [[]], "remote_block_ids": [[]], "trans_count": [0]},
+        }
+        req_meta.peer_layer_metadata = {
+            peer_attn: {
+                "layer2": _make_layer_metadata(
+                    kv_caches_base_addr=[11000, 12000], block_len=[1024, 2048], block_size_scale=[1, 1]
+                )
+            },
+            peer_mamba: {
+                "layer2": _make_layer_metadata(
+                    kv_caches_base_addr=[13000, 14000], block_len=[1024, 2048], block_size_scale=[1, 1]
+                )
+            },
+        }
+        req_meta.peer_te_rpc_port = {peer_attn: 6000, peer_mamba: 6001}
+
+        send_task = SendTask(
+            send_request={"reqAabcdefghi": req_meta},
+            wait_event=MagicMock(),
+            k_cache=torch.zeros((1, 8), dtype=torch.float32),
+            v_cache=torch.zeros((1, 8), dtype=torch.float32),
+            layer_idx=2,
+            layer_name="layer2",
+            group_rearrange_block_ids=[[5]],
+        )
+        with (
+            patch.object(global_te, "_use_tcp", True),
+            patch.object(global_te, "npu_addr_to_cpu_addr", return_value=0x1234),
+            patch.object(self.thread, "_send_layer_done_signal", return_value=True) as mock_ld,
+        ):
+            self.thread._transfer_kv_cache_batch([send_task])
+
+        # peer_mamba 本批无数据 → 不建 LAYER_DONE(其 D 侧期望计数为 0).
+        self.assertEqual(len(mock_ld.call_args_list), 1)
+        host, port, _ids, _addrs, _lens, done_list = mock_ld.call_args[0]
+        self.assertEqual((host, port), peer_attn)
+        self.assertEqual(done_list, [("reqA", True, 2, False)])
+
+    def test_send_failed_signal_only_reaches_last_group_peers(self):
+        """失败通知只发给承载最后层所属 group 数据的 peer(期望计数为 0 的 peer 跳过)."""
+        req_meta = self.req_meta_base
+        peer_attn = ("127.0.0.1", 7777)
+        peer_mamba = ("127.0.0.1", 7778)
+        req_meta.peer_transfer = {
+            peer_attn: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [2]},
+            peer_mamba: {"local_block_ids": [[], [7]], "remote_block_ids": [[], [11]], "trans_count": [0]},
+        }
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx") as mock_ctx:
+            sock = mock_ctx.return_value.__enter__.return_value
+            sock.recv.return_value = b"ACK"
+            self.thread._send_failed_signal("reqAabcdefghi", req_meta, 0)
+
+        self.assertEqual(mock_ctx.call_count, 1)
+        self.assertIn("7777", mock_ctx.call_args[0][1])
+
+    def test_send_done_signal_tags_done_sending_msg(self):
+        """D2D 成功信号复用同一通道, 但消息类型必须是 DONE_SENDING_MSG(不是 FAILED)."""
+        req_meta = self.req_meta_base
+        peer_attn = ("127.0.0.1", 7777)
+        req_meta.peer_transfer = {
+            peer_attn: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [2]},
+        }
+        with patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx") as mock_ctx:
+            sock = mock_ctx.return_value.__enter__.return_value
+            sock.recv.return_value = b"ACK"
+            self.thread._send_done_signal("reqBabcdefghi", req_meta, 0)
+
+        self.assertEqual(mock_ctx.call_count, 1)
+        payload = sock.send.call_args[0][0]
+        self.assertIn(DONE_SENDING_MSG, payload)
+        self.assertIn(b"reqB", payload)
+
+    def test_req_done_list_filters_peer_and_marks_failed(self):
+        """请求级完成条目按 peer 过滤, 并携带 P 侧的失败标记."""
+        meta = TransferMeta(src=[], dst=[], length=[], req_ids=[])
+        meta.req_done[("127.0.0.1", 7777, "reqAabcdefghi")] = (True, 2)
+        meta.req_done[("127.0.0.1", 7778, "reqBabcdefghi")] = (False, 2)
+
+        self.assertEqual(self.thread._req_done_list(meta, "127.0.0.1", 7777), [("reqA", True, 2, False)])
+        # 另一 peer / 非末轮(is_last=False, 如中间 chunk)不产生条目.
+        self.assertEqual(self.thread._req_done_list(meta, "127.0.0.1", 7779), [])
+
+        self.thread.failed_reqs.add("reqAabcdefghi")
+        self.assertEqual(self.thread._req_done_list(meta, "127.0.0.1", 7777), [("reqA", True, 2, True)])
 
     def test_transfer_multi_peer_splits_sessions(self):
         """同一请求的不同 peer: 拆成多个 session, 各自用自己的 dst 与 rpc 端口."""
@@ -432,7 +598,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             enable_kv_quant=False,
             enable_c8_quant=False,
             resharding_stream=MagicMock(),
-            callback_func=MagicMock(),
+            sender_path="127.0.0.1:9999",
         )
         kwargs.update(overrides)
         return KVCacheSendingLayerThread(**kwargs)
@@ -578,6 +744,31 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         with th.lock:
             self.assertNotIn("reqX", th.task_tracker)
             self.assertIn("reqX", th.done_requests)
+
+    def test_apply_layer_done_meta_marks_done_and_failed(self):
+        """请求级完成信息随 LAYER_DONE 下发: is_last 计入完成(按路径收齐), failed 就地作废."""
+        th = KVCacheRecvingLayerThread(
+            tp_rank=0,
+            side_channel_port=5555,
+            tp_size=2,
+            pd_head_ratio=2,
+            local_engine_id="engineA",
+            metadata=self.meta,
+            ready_event=self.ready_event,
+        )
+        # P/D TP 不等: 同一请求的两条 P 侧路径都报齐才算完成.
+        th.apply_layer_done_meta([("reqA", True, 2, False)], "10.0.0.1:1234")
+        with th.lock:
+            self.assertNotIn("reqA", th.done_requests)
+        th.apply_layer_done_meta([("reqA", True, 2, False)], "10.0.0.2:1234")
+        with th.lock:
+            self.assertIn("reqA", th.done_requests)
+
+        # 中间 chunk(is_last=False)不触发完成; failed 直接作废重试.
+        th.apply_layer_done_meta([("reqB", False, 1, False), ("reqC", True, 1, True)], "10.0.0.1:1234")
+        with th.lock:
+            self.assertNotIn("reqB", th.done_requests)
+            self.assertIn("reqC", th.failed_requests)
 
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
@@ -1324,46 +1515,6 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
         worker.create_kv_buffer.assert_not_called()
         self.assertIsNone(worker.k_buffer)
         self.assertEqual(mock_staging.call_args[1]["extra_tensors"], [])
-
-    def test_done_signal_skips_peers_without_group_data(self):
-        """只承载了其它层数据的 peer 不发请求级 DONE(其 D 侧期望计数为 0)."""
-        self.vllm_config.kv_transfer_config.is_kv_producer = True
-        self.vllm_config.kv_transfer_config.is_kv_consumer = False
-        worker = MooncakeLayerwiseConnectorWorker(self.vllm_config, self.kv_cache_config, self.engine_id)
-        req_meta = ReqMeta(
-            local_block_ids=[[5]],
-            token_ids=None,
-            remote_block_ids=[[10]],
-            remote_block_size=[[16]],
-            remote_engine_id="remote_engine",
-            remote_host="127.0.0.1",
-            remote_port=7777,
-            remote_te_rpc_port=6000,
-            remote_layer_metadata={},
-            metaserver=None,
-            remote_tp_size=2,
-            remote_pcp_size=1,
-            remote_dcp_size=1,
-        )
-        peer_attn = ("127.0.0.1", 7777)
-        peer_mamba = ("127.0.0.1", 7778)
-        req_meta.peer_transfer = {
-            peer_attn: {"local_block_ids": [[5]], "remote_block_ids": [[10]], "trans_count": [2]},
-            peer_mamba: {"local_block_ids": [[], [7]], "remote_block_ids": [[], [11]], "trans_count": [0, 2]},
-        }
-        with (
-            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx") as mock_ctx,
-            patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.ensure_zmq_send"),
-        ):
-            sock = mock_ctx.return_value.__enter__.return_value
-            sock.poll.return_value = True
-            sock.recv.return_value = b"ACK"
-            worker.send_done_send_signal("req1", req_meta, group_idx=0)
-
-        self.assertEqual(mock_ctx.call_count, 1)
-        path = mock_ctx.call_args[0][1]
-        self.assertIn("7777", path)
-        self.assertNotIn("7778", path)
 
     def test_register_kv_caches_consumer(self):
         self.vllm_config.kv_transfer_config.is_kv_producer = False
