@@ -11,7 +11,7 @@ import struct
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Callable, Iterator
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -192,6 +192,10 @@ class TransferMeta:
     # req_id -> (remote_host, remote_port): LAYER_DONE 的控制面目的地(侧信道),
     # 攒批合并后不再能从单一任务取到, 在聚合阶段记录.
     req_peer: dict[str, tuple[str, int]] = field(default_factory=dict)
+    # (peer_host, peer_port, req_id) -> (is_last, trans_count): 只在含最后层的
+    # 批里记录 —— 该 peer 在该请求末轮应回的"请求级完成信息", 随本批 LAYER_DONE
+    # 一起下发(D 侧 H2D 成功后本地判定完成, 不再单发一次请求级 DONE 往返).
+    req_done: dict[tuple[str, int, str], tuple[bool, int]] = field(default_factory=dict)
 
 
 @dataclass
@@ -249,7 +253,7 @@ class _PipeJob:
 
     发送线程填充前段(事件等待/flush)后入写队列; 写线程完成 write 后填充
     write 计时/失败信息并入完成队列; 发送线程在 drain 阶段按序发 LAYER_DONE
-    并做 perf 与请求级 DONE 收尾.
+    (含请求级完成信息)并做 perf 收尾.
     """
     batch_id: int
     tasks: list[Any]
@@ -292,7 +296,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_kv_quant: bool,
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
-        callback_func: Callable[..., None] = lambda x: None,
+        sender_path: str,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -338,7 +342,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         # 区域, 会把上一批正在发送的字节覆盖掉, 故该路径禁用流水(退回单线程).
         self.use_pipe_writer = _PIPE_WRITER and global_te.use_tcp and not self.uses_reshard_buffers
         self.ready_event = ready_event
-        self.callback_func = callback_func
+        # 本 rank 的侧信道标识, 随 LAYER_DONE 下发供 D 侧做多路径(P/D TP 不等)计数.
+        self.sender_path = sender_path
         # perf: 上一批处理完成的时刻(用于统计批间攒批等待)与批序号.
         self._last_batch_end_at: float | None = None
         self._batch_seq = 0
@@ -373,7 +378,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         # 才整批处理. 混合模型 (attn+mamba) 与均匀模型同路径: mamba/GDN 层的
         # conv/ssm 状态在各自层 forward 内已写定 (P 侧无投机, 不存在采样后的
         # 状态重写), 随批 flush 读到的是截至该层的最终值; 多 chunk 时中间
-        # chunk 的状态会被后续 chunk 覆写, 请求级 DONE 在含最后层的批之后,
+        # chunk 的状态会被后续 chunk 覆写, 请求级完成信息在含最后层的批之后,
         # D 在 decode 前收齐的即最终状态. 批大小上限见 max_batch_layers:
         # reshard/量化路径为 1(单槽 buffer), 其余为 _LAYER_BATCH.
         pending: list[SendTask] = []
@@ -707,6 +712,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
+                    if send_task.layer_idx == (self.total_layers - 1):
+                        # 本任务含最后层: 记录该 peer 在该请求末轮的完成信息
+                        # (is_last=chunk_finish; trans_count=最后层所属 group 上
+                        # 该 peer 期望收到的 P 侧路径数), 随本批 LAYER_DONE 下发.
+                        meta.req_done[(peer_host, peer_port, req_id)] = (
+                            req_meta.chunk_finish,
+                            req_meta.peer_transfer[peer]["trans_count"][layer_group_idx],
+                        )
 
         # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
         for session_id, transfer_meta in session_meta.items():
@@ -762,9 +775,10 @@ class KVCacheSendingLayerThread(threading.Thread):
                     )
                     if global_te.use_tcp:
                         # 批传输完成后通知 D(该批全部层范围), D 完成 H2D 后回
-                        # ACK 才处理下一批(同线程串行). 请求级 DONE_SENDING 只在
-                        # 含最后层的批的 ACK 之后发出, D 的请求级 done 必然晚于
-                        # 全部层的 H2D, 满足"收到完整 KV 后才启动计算"的不变式.
+                        # ACK 才处理下一批(同线程串行). 请求级完成信息(is_last /
+                        # 期望路径数 / failed)随含最后层的批的 LAYER_DONE 一起
+                        # 下发, D 的请求级 done 必然晚于全部层的 H2D, 满足
+                        # "收到完整 KV 后才启动计算"的不变式.
                         layer_done_ok = True
                         peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str]]] = {}
                         for layer_req_id in transfer_meta.req_ids:
@@ -780,9 +794,10 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     transfer_meta.length[req_start : req_start + req_count]
                                 )
                         for (peer_host, peer_port), (peer_addrs, peer_lengths, peer_req_ids) in peer_layer_msgs.items():
+                            done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                             t_ld0 = time.perf_counter()
                             ok = self._send_layer_done_signal(
-                                peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths
+                                peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list
                             )
                             if _PERF_LOG:
                                 layerdone_ms += _perf_ms(t_ld0)
@@ -798,9 +813,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                             for failed_req_id in transfer_meta.req_ids:
                                 self.failed_reqs.add(failed_req_id)
 
-        # 5) 请求级完成信号: 批内含最后层任务时, 对实际有传输段的请求发
-        #    DONE/FAILED. 含最后层的任务才触发, 保证 DONE 晚于本请求全部
-        #    层批的 ACK; 无任何传输段的请求不回调(与原逐层语义一致).
+        # 5) 请求级完成信号: 含最后层任务时在 session 聚合阶段记入
+        #    TransferMeta.req_done, 随该批 LAYER_DONE 的 done_list 下发(见
+        #    _req_done_list) —— 保证 D 侧请求级 done 晚于本请求全部层批的 ACK;
+        #    无任何传输段的请求不产生条目(与原逐层语义一致).
+        #    仅 4) 的 perf 打印仍需要此集合, 故保留计算.
         transferred_reqs = {req_id for meta in session_meta.values() for req_id in meta.req_ids}
 
         # perf 批级行与请求级累计: 必须在第 5 步 DONE 打印之前执行, 否则最后
@@ -889,16 +906,26 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     _perf_ms(acc["t0"]),
                                 )
                         if req_id in self.failed_reqs:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
+                            # 失败仍走独立的请求级信号: 写失败的层批根本没有
+                            # LAYER_DONE 到达 D, 只靠路径计数会让请求永远等不到
+                            # 完成 —— 必须显式通知 D 作废旧块并重试.
+                            self._send_failed_signal(req_id, req_meta, layer_group_idx)
                             self.failed_reqs.discard(req_id)
+                        elif global_te.use_tcp:
+                            # TCP/H2H: 本请求的请求级完成信息已随末批 LAYER_DONE
+                            # 的 done_list 下发 (见 _req_done_list), 不再单独发一次
+                            # DONE 往返.
+                            pass
                         else:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+                            # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
+                            # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
+                            self._send_done_signal(req_id, req_meta, layer_group_idx)
 
     # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, protocol=tcp 且非 reshard/量化) ----
     # 阶段归属: 发送线程 = 等事件 + D2H flush + 攒批; 写线程 = TCP write(数据面
     # 连续占满); 发送线程 drain = LAYER_DONE(与后续批 write 重叠) + perf/请求级
-    # DONE. 不变式与单线程版一致: LAYER_DONE g 只在 write g 完成后发出; 请求级
-    # 请求级 DONE 只由含最后层的批在其 ACK 之后触发 (阻塞 drain 保证);
+    # 完成信息. 不变式与单线程版一致: LAYER_DONE g 只在 write g 完成后发出;
+    # 请求级完成信息由含最后层的批随其 LAYER_DONE 下发 (阻塞 drain 保证);
     # 发送线程空闲时持续 drain, LAYER_DONE 不再等下一次攒批触发.
     def _transfer_kv_cache_batch_pipe(self, tasks: list[SendTask]):
         if not tasks:
@@ -951,6 +978,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
+                    if send_task.layer_idx == (self.total_layers - 1):
+                        # 本任务含最后层: 记录该 peer 在该请求末轮的完成信息
+                        # (is_last=chunk_finish; trans_count=最后层所属 group 上
+                        # 该 peer 期望收到的 P 侧路径数), 随本批 LAYER_DONE 下发.
+                        meta.req_done[(peer_host, peer_port, req_id)] = (
+                            req_meta.chunk_finish,
+                            req_meta.peer_transfer[peer]["trans_count"][layer_group_idx],
+                        )
 
         # 每 session: D2H flush 进本端 staging 并把 src 换成 staging 地址.
         # 写线程只读这些区域, flush 与上一批在飞的 write 区域不同, 可重叠.
@@ -989,7 +1024,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self._pipe_push(job)
         if job.contains_last:
             # 请求最后一批: 阻塞 drain 至其 write 完成并发出 LAYER_DONE,
-            # 保证下一请求 flush 前数据面清空、请求级 DONE 不早于全层 H2D.
+            # 保证下一请求 flush 前数据面清空、请求级完成信息不早于全层 H2D.
             self._pipe_drain(block=True)
 
     def _pipe_writer_loop(self):
@@ -1064,8 +1099,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                     peer_layer_msgs[peer_key][0].extend(transfer_meta.dst[req_start : req_start + req_count])
                     peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
             for (peer_host, peer_port), (peer_addrs, peer_lengths, peer_req_ids) in peer_layer_msgs.items():
+                done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                 t_ld0 = time.perf_counter()
-                ok = self._send_layer_done_signal(peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths)
+                ok = self._send_layer_done_signal(
+                    peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list
+                )
                 if _PERF_LOG:
                     layerdone_ms += _perf_ms(t_ld0)
                     if layerdone_win0 is None:
@@ -1149,13 +1187,85 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     _perf_ms(acc["t0"]),
                                 )
                         if req_id in self.failed_reqs:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=False)
+                            # 失败仍走独立的请求级信号: 写失败的层批根本没有
+                            # LAYER_DONE 到达 D, 只靠路径计数会让请求永远等不到
+                            # 完成 —— 必须显式通知 D 作废旧块并重试.
+                            self._send_failed_signal(req_id, req_meta, layer_group_idx)
                             self.failed_reqs.discard(req_id)
+                        elif global_te.use_tcp:
+                            # TCP/H2H: 本请求的请求级完成信息已随末批 LAYER_DONE
+                            # 的 done_list 下发 (见 _req_done_list), 不再单独发一次
+                            # DONE 往返.
+                            pass
                         else:
-                            self.callback_func(req_id, req_meta, layer_group_idx, trans_flag=True)
+                            # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
+                            # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
+                            self._send_done_signal(req_id, req_meta, layer_group_idx)
         if _PERF_LOG:
             # 批"处理结束"以 LAYER_DONE 全部发出计(与单线程版语义对齐).
             self._last_batch_end_at = time.perf_counter()
+
+    def _send_done_signal(self, req_id, req_meta, layer_group_idx: int) -> None:
+        """请求级成功通知(D2D 专用).
+
+        TCP/H2H 的请求级完成信息随末批 LAYER_DONE 的 done_list 下发(见
+        _req_done_list), 不走本方法; D2D(protocol=ascend)数据直达对端 NPU,
+        两端之间没有逐层 LAYER_DONE 通道可搭车, 请求级完成只能显式通知
+        (与改版前 callback_func = send_done_send_signal 的成功路径语义一致).
+        """
+        self._send_req_signal(req_id, req_meta, layer_group_idx, DONE_SENDING_MSG)
+
+    def _send_failed_signal(self, req_id, req_meta, layer_group_idx: int) -> None:
+        """请求级失败通知(成功路径不需要).
+
+        TCP 下成功路径的请求级完成信息已随最后层批的 LAYER_DONE 下发; 但 P 侧写失败时
+        该请求的对应层批不会产生任何 LAYER_DONE, D 侧的路径计数永远收不齐, 会一直
+        等到 abort 超时 —— 所以失败仍显式通知 D 作废旧块并重试(与旧 FAILED 语义
+        一致: 只发给承载最后层所属 group 数据的 peer)。D2D 下没有 LAYER_DONE,
+        成功与失败都走本通道。
+        """
+        self._send_req_signal(req_id, req_meta, layer_group_idx, FAILED_SENDING_MSG)
+
+    def _send_req_signal(self, req_id, req_meta, layer_group_idx: int, msg_type: bytes) -> None:
+        """P→D 请求级信号: TCP 失败路径 / D2D 成功与失败共用(REQ-REP, 等 ACK)."""
+        external_req_id = get_external_request_id(req_id)
+        encoder = msgspec.msgpack.Encoder()
+        for (remote_host, remote_port), peer_blocks in req_meta.peer_transfer.items():
+            trans_count = peer_blocks["trans_count"][layer_group_idx]
+            if trans_count <= 0:
+                continue
+            try:
+                data_bytes = encoder.encode((msg_type, external_req_id, trans_count, self.sender_path))
+                with zmq_ctx(zmq.REQ, make_zmq_path("tcp", remote_host, remote_port)) as sock:  # type: ignore
+                    timeout_ms = int(LAYER_DONE_TIMEOUT_S * 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)  # type: ignore
+                    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)  # type: ignore
+                    sock.send(data_bytes)
+                    sock.recv()  # 等 D 侧 ACK: 确保完成/作废动作已被受理
+            except zmq.ZMQError as e:  # type: ignore
+                logger.error(
+                    "Failed to send signal %s for request %s to %s:%d: %s",
+                    msg_type,
+                    external_req_id,
+                    remote_host,
+                    remote_port,
+                    e,
+                )
+
+    def _req_done_list(
+        self, transfer_meta: TransferMeta, peer_host: str, peer_port: int
+    ) -> list[tuple[str, bool, int, bool]]:
+        """该 peer 在本批 LAYER_DONE 里携带的请求级完成信息.
+
+        [(ext_req_id, is_last, trans_count, failed), ...]: 只有末轮(chunk_finish)的
+        请求才有条目; failed 表示该请求在 P 侧已判失败, D 侧收到即作废并重试.
+        通常为空列表 —— 只有含最后层的批(即该请求的末轮)才会填.
+        """
+        return [
+            (get_external_request_id(rid), is_last, trans_count, rid in self.failed_reqs)
+            for (d_host, d_port, rid), (is_last, trans_count) in transfer_meta.req_done.items()
+            if is_last and d_host == peer_host and d_port == peer_port
+        ]
 
     def _send_layer_done_signal(
         self,
@@ -1164,17 +1274,32 @@ class KVCacheSendingLayerThread(threading.Thread):
         req_ids: list[str],
         dst_addrs: list[int],
         lengths: list[int],
+        done_list: list[tuple[str, bool, int, bool]] | None = None,
     ) -> bool:
         """H2H: 通知 D 本层 KV 已写入其 staging, 等待 D 完成该层 H2D 后的 ACK.
 
-        REQ-REP 同步往返同时充当流控: ACK 未回前不进入下一层, 保证 D 侧
-        请求级 done (由最后层的 DONE_SENDING 触发) 严格晚于全层 H2D.
+        REQ-REP 同步往返同时充当流控: ACK 未回前不进入下一层, 保证 D 侧请求级
+        done 严格晚于全层 H2D。请求级完成信息(末轮/期望路径数/失败)随本批
+        payload 一起下发: D 侧 H2D 成功后就地判定完成, 不再单发一次请求级
+        DONE 往返(见 _req_done_list)。
         """
         path = make_zmq_path("tcp", remote_host, remote_port)
         encoder = msgspec.msgpack.Encoder()
-        # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths)
-        # req_ids 为 external id, 供 D 侧把每批 H2D 归到请求做请求级累计.
-        data_bytes = encoder.encode((LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths))
+        # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths,
+        #           sender_path, done_list)
+        # req_ids 为 external id, 供 D 侧把每批 H2D 归到请求做请求级累计;
+        # sender_path 为 P 侧本 rank 的侧信道标识, D 侧按它做多路径(不等 TP)计数;
+        # done_list 见 _req_done_list, 非空仅出现在含最后层的批.
+        data_bytes = encoder.encode(
+            (
+                LAYER_DONE_SENDING_MSG,
+                req_ids,
+                dst_addrs,
+                lengths,
+                self.sender_path,
+                done_list or [],
+            )
+        )
         try:
             with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
                 timeout_ms = int(LAYER_DONE_TIMEOUT_S * 1000)
@@ -1255,6 +1380,27 @@ class KVCacheRecvingLayerThread(threading.Thread):
             self.task_tracker.pop(req_id, None)
             self.failed_requests.add(req_id)
 
+    def apply_layer_done_meta(self, done_list, sender_path: str) -> None:
+        """就地应用随 LAYER_DONE 下发的请求级完成信息 (替代独立的 DONE/FAILED 往返).
+
+        done_list = [(ext_req_id, is_last, trans_count, failed), ...], 由 P 侧在
+        含最后层的批里填充:
+          - failed=True: 该请求在 P 侧已判失败 → 作废重试(与旧 FAILED 语义一致);
+          - is_last=True: 该请求末轮数据已全部 H2D 完成 → 按 sender_path 累计
+            路径, 收齐 trans_count 条即认为请求完成(不等 TP 时同一请求来自多个
+            P rank, 必须按路径去重计数);
+          - is_last=False(中间 chunk): 不触发完成.
+        """
+        for ext_req, is_last, trans_count, failed in done_list:
+            if failed:
+                # 同批内先到 done 条目、后到 failed 时(多 peer 且后一个 session 写
+                # 失败): 撤回已置的完成标记, 避免 scheduler 抢在作废前接纳.
+                with self.lock:
+                    self.done_requests.discard(ext_req)
+                self.update_failed_task(ext_req)
+            elif is_last:
+                self.update_done_task(ext_req, trans_count, sender_path)
+
     def update_done_task(self, req_id, trans_count, side_channel_path):
         """
         Handle a completed task by adding it to the done_requests set and removing it from the task tracker.
@@ -1320,6 +1466,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.info("Got GET META INFO for request %s", msg[0])
                         sock.send_multipart((identity, b"", encoded_data))
                     elif msg[0] == DONE_SENDING_MSG:
+                        # 兼容旧 P 端(请求级 DONE 已改为随 LAYER_DONE 的 done_list
+                        # 下发, 新 P 不再单发本条; 保留以便灰度/回滚时混部不炸).
                         logger.debug("Got DONE_RECVING_MSG for request %s", msg[1])
                         request_id = msg[1]
                         trans_count = msg[2]
@@ -1335,10 +1483,16 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         # H2H: P 已完成本层推送, 数据落在本节点 CPU staging 中.
                         # 把该层字节区间 H2D 拷回 NPU KV cache 后回 ACK; P 收到
                         # ACK 才推进下一层, 保证请求级 done 严格晚于全层 H2D.
-                        # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths)
+                        # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths,
+                        #           sender_path, done_list)
+                        # done_list = [(ext_req_id, is_last, trans_count, failed), ...]:
+                        # 只有含最后层的批(该请求末轮)非空 —— 请求级完成信息随本批
+                        # 下发, D 侧 H2D 成功后就地判定完成(不再单发请求级 DONE).
                         layer_req_ids = msg[1]
                         layer_dst_addrs = msg[2]
                         layer_lengths = msg[3]
+                        sender_path = msg[4] if len(msg) > 4 else ""
+                        done_list = msg[5] if len(msg) > 5 else ()
                         logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(layer_dst_addrs))
                         t_recv0 = time.perf_counter()
                         layer_reply = b"ACK"
@@ -1354,6 +1508,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             layer_reply = b"NAK"
                             h2d_ms = _perf_ms(t_recv0)
                         sock.send_multipart((identity, b"", layer_reply))
+                        if layer_reply == b"ACK":
+                            # 就地判定请求级完成/失败: 与 H2D 同一处理点, 省掉 P 侧
+                            # 单独一次请求级 DONE/FAILED 往返. 失败时 P 侧不再补发,
+                            # 由这里(NAK 分支)直接作废重试.
+                            self.apply_layer_done_meta(done_list, sender_path)
+                        else:
+                            for ext_req in layer_req_ids:
+                                self.update_failed_task(ext_req)
                         if _PERF_LOG:
                             # total 覆盖 收到消息 → H2D 完成 → ACK 发出 全程;
                             # t0 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC),
@@ -2174,7 +2336,7 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_kv_quant=self.enable_kv_quant,
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
-                callback_func=self.send_done_send_signal,
+                sender_path=f"{self.side_channel_host}:{self.handshake_port}",
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -2772,69 +2934,6 @@ class MooncakeLayerwiseConnectorWorker:
                     logger.error("Mooncake transfer failed to create link. session_id=%s, ret=%d. ", session_id, ret)
         req_meta.peer_layer_metadata[peer] = self.remote_layer_metadata[req_meta.remote_engine_id][remote_port]
         req_meta.peer_te_rpc_port[peer] = self.remote_te_port[req_meta.remote_engine_id][remote_port]
-
-    def send_done_send_signal(self, req_id, req_meta, group_idx, trans_flag: bool = True):
-        external_req_id = get_external_request_id(req_id)
-        send_msg_type = DONE_SENDING_MSG if trans_flag else FAILED_SENDING_MSG
-        side_channel_path = f"{self.side_channel_host}:{self.handshake_port}"
-        msg_encoder = msgspec.msgpack.Encoder()
-        # 每个承载了最后层(group_idx)数据的 peer 各收一份请求级 DONE, 带上该 peer
-        # 自己的期望计数; D 侧按不同 P 侧信道路径累计, 收齐即认为该请求完成.
-        # 只承载了其它层(如 mamba)数据的 peer 不发: 那些层的完整性由逐层
-        # LAYER_DONE 的 ACK 保证(且 TP 集合通信保证各 rank 不会超过一层之差),
-        # 而这类 peer 的 D 侧期望计数本来就是 0.
-        for (remote_host, remote_port), peer_blocks in req_meta.peer_transfer.items():
-            trans_count = peer_blocks["trans_count"][group_idx]
-            if trans_count <= 0:
-                continue
-            logger.info(
-                "Sending transmitting signal %s for request %s to %s:%d",
-                send_msg_type,
-                external_req_id,
-                remote_host,
-                remote_port,
-            )
-            try:
-                path = make_zmq_path("tcp", remote_host, remote_port)
-                encoded_data = msg_encoder.encode(
-                    (send_msg_type, external_req_id, trans_count, side_channel_path)
-                )
-                max_retries = 3
-                for attempt in range(1, max_retries + 1):
-                    try:
-                        with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
-                            sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))
-                            ensure_zmq_send(sock, encoded_data, f"{remote_host}:{remote_port}")
-                            if not sock.poll(int(self.timeout * 1000), zmq.POLLIN):  # type: ignore[attr-defined]
-                                raise TimeoutError(f"Timed out waiting for ACK from {remote_host}:{remote_port}")
-                            ack = sock.recv()
-                            if ack != b"ACK":
-                                raise ValueError(f"Unexpected ACK response: {ack}")
-                            break
-                    except Exception as e:
-                        if attempt < max_retries:
-                            logger.warning(
-                                "Failed to send done sending signal. "
-                                "request_id=%s, destination=%s:%d, attempt=%d/%d, error=%s. ",
-                                external_req_id,
-                                remote_host,
-                                remote_port,
-                                attempt,
-                                max_retries,
-                                e,
-                            )
-                            time.sleep(0.1)
-                        else:
-                            raise RuntimeError(f"Failed to receive ACK after {max_retries} attempts: {e}") from e
-            except Exception as e:
-                logger.error(
-                    "Sending signal fail. signal_type=%s, request_id=%s, destination=%s:%s, error=%s. ",
-                    send_msg_type,
-                    external_req_id,
-                    remote_host,
-                    remote_port,
-                    e,
-                )
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
