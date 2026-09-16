@@ -474,16 +474,22 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
-            # 源块: 非 align(=本部署, mamba_cache_mode=none)下 mamba 状态保存在请求首块;
-            # 目的块恒取 remote_block_ids[0] —— 与源同为首块(参考实现
-            # mooncake_layerwise_prefill_then_decode_connector.py 的取法一致),
-            # 不能用 align 口径的 len(remote)-num_spec-1: 那会把状态写进 D 不读的块.
-            # (align 模式的状态块语义不同, 当前实现未支持, 需另按 vLLM 的
-            #  mamba_state_idx 口径取目的块.)
+            # 状态块下标随 mamba_cache_mode 变:
+            #   * 非 align(如 mamba_cache_mode=none/"all"): 状态恒存在请求首块 [0];
+            #   * align: 每请求块表形如
+            #       [占位 null 块 × (cdiv(tokens, bs) - 1), 运行状态块, 投机块 × num_spec]
+            #     (vLLM MambaManager.allocate_new_blocks: 首轮只分配 1+num_spec 个真块,
+            #      中间用 null 块补齐下标; 运行状态块 = 表格下标 cdiv(tokens,bs)-1,
+            #      preprocess/postprocess_mamba 会把它按块边界向后轮转),
+            #     故状态块 = len-num_spec-1。**源与目的必须同口径**: D 侧列表已被
+            #     _trim_hybrid_remote_block_ids 对齐到与源同长, 取 remote_block_ids[0]
+            #     在跨块 prompt 下会指到 null 占位块(状态丢失 → D 读到未初始化状态 → 乱码).
             if self.mamba_cache_mode == "align":
                 local_transfer_idx = len(local_block_ids) - self.num_speculative_tokens - 1
+                remote_transfer_idx = len(remote_block_ids) - self.num_speculative_tokens - 1
             else:
                 local_transfer_idx = 0
+                remote_transfer_idx = 0
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
@@ -497,8 +503,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 )
                 dst_list.extend(
                     [
-                        remote_conv_addr + remote_block_ids[0] * local_conv_len,
-                        remote_ssm_addr + remote_block_ids[0] * local_ssm_len,
+                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * local_conv_len,
+                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * local_ssm_len,
                     ]
                 )
                 length_list.extend([local_conv_len, local_ssm_len])
@@ -535,7 +541,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         )
                         dst_list.append(
                             remote_conv_addr
-                            + remote_block_ids[0] * remote_conv_len
+                            + remote_block_ids[remote_transfer_idx] * remote_conv_len
                             + remote_addr_offset
                         )
                         length_list.append(local_conv_size * get_dtype_size(conv_dtype))
@@ -543,7 +549,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 remote_addr_offset = (self.tp_rank % tp_ratio) * math.prod(ssm_shape) * get_dtype_size(ssm_dtype)
                 src_list.append(local_ssm_addr + local_block_ids[local_transfer_idx] * local_ssm_len)
                 dst_list.append(
-                    remote_ssm_addr + remote_block_ids[0] * remote_ssm_len + remote_addr_offset
+                    remote_ssm_addr + remote_block_ids[remote_transfer_idx] * remote_ssm_len + remote_addr_offset
                 )
                 length_list.append(local_ssm_len)
         else:
