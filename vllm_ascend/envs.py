@@ -126,7 +126,9 @@ env_variables: dict[str, Callable[[], Any]] = {
     # write 完成后按序发出(与后续批重叠). 关闭时保持单线程原语义.
     "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
-    "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
+    "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
+    "REUSE_PREFILLED_TOKENS": lambda: os.getenv("REUSE_PREFILLED_TOKENS", "0") == "1",
+    "SKIP_DECODE_TOKENIZE": lambda: os.getenv("SKIP_DECODE_TOKENIZER", "0") == "1",
 }
 
 # end-env-vars-definition

@@ -49,6 +49,7 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+from vllm_ascend import envs
 
 
 @dataclass
@@ -138,13 +139,11 @@ class RecomputeScheduler(Scheduler):
     def _update_waiting_for_remote_kv(self, request: Request) -> None:
         """
         KV Connector: update request state after async recv is finished.
-
         The finished_recving_kv_req_ids list is populated
         on the previous steps()'s update_from_output based
         on the worker side connector.
         """
         assert self.connector is not None
-
         if request.request_id in self.failed_recving_kv_req_ids:
             if request.num_computed_tokens:
                 self.kv_cache_manager.cache_blocks(request, request.num_computed_tokens)
@@ -157,7 +156,14 @@ class RecomputeScheduler(Scheduler):
                 num_computed_tokens -= 1
             self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
             request.num_computed_tokens = num_computed_tokens
-
+            # ascend vllm adapt start, reuse prefill token
+            if envs.REUSE_PREFILLED_TOKENS and hasattr(request, 'stream') and request.stream:
+                if (request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params):
+                    prefilled_token = request.kv_transfer_params["prefilled_token"]
+                    request.prompt_token_ids.extend(prefilled_token)
+                    request.append_output_token_ids(prefilled_token)
+                    request.num_computed_tokens += 1
+            # ascend vllm adapt end
             if (
                 self.is_mtp_kv_consumer
                 and request.num_preemptions > 0
@@ -165,7 +171,6 @@ class RecomputeScheduler(Scheduler):
                 and self.max_model_len >= request.num_tokens + self.num_spec_tokens
             ):
                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
-
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
     def schedule(self) -> RecomputeSchedulerOutput:
