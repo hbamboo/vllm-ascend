@@ -128,7 +128,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
     "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
     "REUSE_PREFILLED_TOKENS": lambda: os.getenv("REUSE_PREFILLED_TOKENS", "0") == "1",
-    "SKIP_DECODE_TOKENIZE": lambda: os.getenv("SKIP_DECODE_TOKENIZER", "0") == "1",
+    "SKIP_DECODE_TOKENIZE": lambda: os.getenv("SKIP_DECODE_TOKENIZE", "0") == "1",
+    # p_then_d: proxy 把请求直接发给 P(prefill), P 生成首 token 并在响应里带回,
+    # proxy 再带着这些参数去派发 D(decode). P 是第一跳, 发送时 D 还不存在 ->
+    # D 的参数(块表/侧信道地址)改由 D 通过直连 ZMQ 通道推给 P, P 的发送线程等到
+    # 参数后再逐层推 KV(见 mooncake_layerwise_connector.KVTransferParamsRecvingThread).
+    # 仅在 P 引擎上置 1; 需同时打开 REUSE_PREFILLED_TOKENS(P 侧打包首 token).
+    # 该模式下 producer 的层任务队列改为无界: 发送线程等 D 参数期间模型前向不能被
+    # 队列背压堵死(D 要等 P 的响应才会被派发, 堵住即死锁).
+    "P_THEN_D": lambda: os.getenv("P_THEN_D", "0") == "1",
 }
 
 # end-env-vars-definition

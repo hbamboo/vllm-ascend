@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import io
+import os
 import time
 from collections.abc import AsyncGenerator, AsyncIterator
 from http import HTTPStatus
@@ -16,6 +17,7 @@ from vllm.entrypoints.chat_utils import (
     get_history_tool_calls_cnt,
     make_tool_call_id,
 )
+from vllm.entrypoints.openai import api_server as _api_server_module
 from vllm.entrypoints.openai.chat_completion.protocol import (
     ChatCompletionNamedToolChoiceParam,
     ChatCompletionRequest,
@@ -64,6 +66,44 @@ from vllm.utils.collection_utils import as_list
 from vllm.utils.mistral import is_mistral_tokenizer, is_mistral_tool_parser
 
 from vllm_ascend import envs
+
+
+def _p_then_d_token_reuse(request: object) -> bool:
+    """该请求是否走"提前派发"的首 token 补投路径(见 recompute_scheduler).
+
+    为真时 entrypoint 不做复用/合成首输出: 请求下发时 P 还没出首 token, 这里本来也
+    取不到; 复用由 scheduler 在 KV 到达时从 spool 取, 首 token 文本由 proxy 下发.
+    """
+    params = getattr(request, "kv_transfer_params", None)
+    return bool(params and params.get("p_then_d_token_reuse"))
+
+
+def _package_prefilled_text(tokenizer: TokenizerLike, kv_transfer_params: dict) -> None:
+    """给已打包的 prefilled_token 补上解码后的文本(供 p_then_d 的提前派发用).
+
+    提前派发时 D 的请求是在 P 出首 token 之前下发的, D 侧 entrypoint 读不到
+    prefilled_token, 也就不会用 _wrap_with_prefilled 合成首输出 —— 首 token 改由
+    proxy 直接下发给客户端。proxy 没有 tokenizer, 所以文本在这里(有 tokenizer 的
+    P 引擎)算好带走。
+
+    与 D 侧"放弃复用"的判据保持一致(见 _create_completion 里的同名判断): 文本以
+    替换字符结尾(不完整 UTF-8)或就是 EOS 时, 标记为不可复用, 让 proxy 整条回退到
+    "D 自己生成首 token"。
+    """
+    tokens = kv_transfer_params.get("prefilled_token")
+    if not tokens:
+        return
+    try:
+        # convert_ids_to_tokens 收单个 id; convert_tokens_to_string 收 token 列表.
+        new_token = tokenizer.convert_ids_to_tokens(tokens[0])
+        delta_text = tokenizer.convert_tokens_to_string([new_token])
+        eos_id = getattr(tokenizer, "eos_token_id", None)
+    except Exception as e:  # 分词器异常不该影响响应本身
+        logger.warning("p_then_d: failed to decode prefilled token %s: %s", tokens, e)
+        return
+    kv_transfer_params["prefilled_text"] = delta_text
+    if delta_text.endswith("�") or (eos_id is not None and tokens[0] == eos_id):
+        kv_transfer_params["prefilled_text_reusable"] = False
 
 
 async def _wrap_with_prefilled(
@@ -136,7 +176,10 @@ async def _create_completion(
                 self.default_sampling_params,
             )
         # ascend vllm adapt start, reuse prefill token (streaming only)
-        if envs.REUSE_PREFILLED_TOKENS and request.stream:
+        # p_then_d 提前派发: 请求下发时 P 还没出首 token, 这里拿不到 prefilled_token,
+        # 复用交给 scheduler 在 KV 到达时从 spool 取(recompute_scheduler 里注入) ——
+        # 且因为此处没有合成首输出的 wrapper, 首 token 由 proxy 直接下发给客户端.
+        if envs.REUSE_PREFILLED_TOKENS and request.stream and not _p_then_d_token_reuse(request):
             tokenizer = self.renderer.tokenizer
             if request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params:
                 new_tokens = tokenizer.convert_ids_to_tokens(request.kv_transfer_params["prefilled_token"][0])
@@ -271,9 +314,7 @@ async def _create_completion(
     raw_request: Request | None = None,
 ) -> AsyncGenerator[str, None] | CompletionResponse | ErrorResponse:
     if request.stream and request.use_beam_search:
-        return self.create_error_response(
-            "Streaming is not currently supported with beam search"
-        )
+        return self.create_error_response("Streaming is not currently supported with beam search")
 
     result = await self.render_completion_request(request)
     if isinstance(result, ErrorResponse):
@@ -310,9 +351,7 @@ async def _create_completion(
 
         sampling_params: SamplingParams | BeamSearchParams
         if request.use_beam_search:
-            sampling_params = request.to_beam_search_params(
-                max_tokens, self.default_sampling_params
-            )
+            sampling_params = request.to_beam_search_params(max_tokens, self.default_sampling_params)
         else:
             sampling_params = request.to_sampling_params(
                 max_tokens,
@@ -320,20 +359,24 @@ async def _create_completion(
             )
 
         # ascend vllm adapt start, reuse prefill token
-        if envs.REUSE_PREFILLED_TOKENS and request.kv_transfer_params \
-                and "prefilled_token" in request.kv_transfer_params:
+        if (
+            envs.REUSE_PREFILLED_TOKENS
+            and request.kv_transfer_params
+            and "prefilled_token" in request.kv_transfer_params
+        ):
             tokenizer = self.renderer.tokenizer
-            new_tokens = tokenizer.convert_ids_to_tokens(
-                request.kv_transfer_params["prefilled_token"][0])
+            new_tokens = tokenizer.convert_ids_to_tokens(request.kv_transfer_params["prefilled_token"][0])
             delta_text = tokenizer.convert_tokens_to_string([new_tokens])
             # If the decoded text ends with the replacement char, it
             # indicates an incomplete UTF-8 sequence — abandon reuse.
             # If the prefilled side already triggered a stop reason, fall
             # back to normal generation.
-            if min(max_tokens, max_model_len - len(prompt_token_ids)) == 1 \
-                    or delta_text.endswith("�") \
-                    or any(s is not None for s in request.kv_transfer_params["stop_reasons"]) \
-                    or request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id:
+            if (
+                min(max_tokens, max_model_len - len(prompt_token_ids)) == 1
+                or delta_text.endswith("�")
+                or any(s is not None for s in request.kv_transfer_params["stop_reasons"])
+                or request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id
+            ):
                 request.kv_transfer_params.pop("prefilled_token", None)
             else:
                 request.kv_transfer_params["prefilled_texts"] = delta_text
@@ -348,11 +391,7 @@ async def _create_completion(
             lora_request=lora_request,
         )
 
-        trace_headers = (
-            None
-            if raw_request is None
-            else await self._get_trace_headers(raw_request.headers)
-        )
+        trace_headers = None if raw_request is None else await self._get_trace_headers(raw_request.headers)
 
         if isinstance(sampling_params, BeamSearchParams):
             generator = self.beam_search(
@@ -375,13 +414,16 @@ async def _create_completion(
 
             # ascend vllm adapt start, reuse prefill token (streaming only)
             if envs.REUSE_PREFILLED_TOKENS and request.stream:
-                if request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params \
-                        and "prefilled_texts" in request.kv_transfer_params:
+                if (
+                    request.kv_transfer_params
+                    and "prefilled_token" in request.kv_transfer_params
+                    and "prefilled_texts" in request.kv_transfer_params
+                ):
                     prefilled_text = request.kv_transfer_params["prefilled_texts"]
                     prefilled_tokens = request.kv_transfer_params["prefilled_token"]
                     generator = _wrap_with_prefilled(
-                        generator, request_id_item, prompt_token_ids,
-                        prefilled_text, prefilled_tokens)
+                        generator, request_id_item, prompt_token_ids, prefilled_text, prefilled_tokens
+                    )
             # ascend vllm adapt end
 
         generators.append(generator)
@@ -428,32 +470,21 @@ async def _create_completion(
             for final_res in final_res_batch:
                 if final_res and final_res.kv_transfer_params:
                     # Prefill side: package first generated token for D.
-                    final_res.kv_transfer_params["prefilled_token"] = [
-                        final_res.outputs[0].token_ids[0]
-                    ]
-                    final_res.kv_transfer_params["stop_reasons"] = [
-                        output.stop_reason for output in final_res.outputs
-                    ]
+                    final_res.kv_transfer_params["prefilled_token"] = [final_res.outputs[0].token_ids[0]]
+                    final_res.kv_transfer_params["stop_reasons"] = [output.stop_reason for output in final_res.outputs]
+                    # p_then_d 提前派发: 首 token 的文本由 proxy 直接下发(见 _package_prefilled_text).
+                    _package_prefilled_text(self.renderer.tokenizer, final_res.kv_transfer_params)
                 elif request.kv_transfer_params and request.kv_transfer_params.get("prefilled_token"):
                     # Decode side (non-streaming): prepend the prefilled token
                     # reused from Prefill side into the output token_ids/text.
                     prefilled = request.kv_transfer_params.get("prefilled_token")
                     for output in final_res.outputs:
-                        output.token_ids = list(prefilled) + list(
-                            output.token_ids
-                        )
-                        output.text = (
-                            request.kv_transfer_params.get(
-                                "prefilled_texts", ""
-                            )
-                            + output.text
-                        )
+                        output.token_ids = list(prefilled) + list(output.token_ids)
+                        output.text = request.kv_transfer_params.get("prefilled_texts", "") + output.text
         if envs.SKIP_DECODE_TOKENIZE:
             for final_res in final_res_batch:
                 if final_res and final_res.kv_transfer_params:
-                    final_res.kv_transfer_params["prompt_token_ids"] = (
-                        final_res.prompt_token_ids
-                    )
+                    final_res.kv_transfer_params["prompt_token_ids"] = final_res.prompt_token_ids
         # ascend vllm adapt end
 
         final_res_batch_checked = cast(list[RequestOutput], final_res_batch)
@@ -482,6 +513,7 @@ async def _create_completion(
         return fake_stream_generator()
 
     return response
+
 
 async def preprocess_completion(
     self,
@@ -531,22 +563,19 @@ async def chat_completion_full_generator(
             err_type="InternalServerError",
             status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
         )
-        
+
     # ascend vllm adapt start, reuse prefill token and decode skip tokenizer
     if envs.REUSE_PREFILLED_TOKENS:
         if final_res.kv_transfer_params:
             # Prefill side: package first generated token for D.
-            final_res.kv_transfer_params["prefilled_token"] = [
-                final_res.outputs[0].token_ids[0]
-            ]
+            final_res.kv_transfer_params["prefilled_token"] = [final_res.outputs[0].token_ids[0]]
+            # p_then_d 提前派发: 首 token 的文本由 proxy 直接下发(见 _package_prefilled_text).
+            _package_prefilled_text(self.renderer.tokenizer, final_res.kv_transfer_params)
         elif request.kv_transfer_params and request.kv_transfer_params.get("prefilled_token"):
             prefilled = request.kv_transfer_params.get("prefilled_token")
             for output in final_res.outputs:
                 output.token_ids = list(prefilled) + list(output.token_ids)
-                output.text = (
-                    request.kv_transfer_params.get("prefilled_texts", "")
-                    + output.text
-                )
+                output.text = request.kv_transfer_params.get("prefilled_texts", "") + output.text
     ## In prefill, the response will carry prompt_token_ids with kv_transfer_params
     if envs.SKIP_DECODE_TOKENIZE and final_res.kv_transfer_params:
         final_res.kv_transfer_params["prompt_token_ids"] = final_res.prompt_token_ids
@@ -586,9 +615,7 @@ async def chat_completion_full_generator(
 
             if self.tool_parser is not None:
                 if tokenizer is None:
-                    raise ValueError(
-                        "Tokenizer not available when `skip_tokenizer_init=True`"
-                    )
+                    raise ValueError("Tokenizer not available when `skip_tokenizer_init=True`")
 
                 tool_parser = self.tool_parser(tokenizer, request.tools)
                 # NOTE: We use token_ids for openai tool parser
@@ -619,9 +646,7 @@ async def chat_completion_full_generator(
             if output.routed_experts is not None:
                 buf = io.BytesIO()
                 np.save(buf, output.routed_experts)
-                routed_experts_b64 = base64.b64encode(buf.getvalue()).decode(
-                    "ascii"
-                )
+                routed_experts_b64 = base64.b64encode(buf.getvalue()).decode("ascii")
 
             choice_data = ChatCompletionResponseChoice(
                 index=output.index,
@@ -635,9 +660,7 @@ async def chat_completion_full_generator(
                     else "stop"
                 ),
                 stop_reason=output.stop_reason,
-                token_ids=(
-                    as_list(output.token_ids) if request.return_token_ids else None
-                ),
+                token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
                 routed_experts=routed_experts_b64,
             )
             choices.append(choice_data)
@@ -668,13 +691,9 @@ async def chat_completion_full_generator(
         if use_mistral_tool_parser:
             from vllm.tool_parsers.mistral_tool_parser import MistralToolParser
 
-            tool_call_items = MistralToolParser.build_non_streaming_tool_calls(
-                tool_calls
-            )
+            tool_call_items = MistralToolParser.build_non_streaming_tool_calls(tool_calls)
             if tool_call_items:
-                auto_tools_called = (
-                    request.tool_choice is None or request.tool_choice == "auto"
-                )
+                auto_tools_called = request.tool_choice is None or request.tool_choice == "auto"
             message = ChatMessage(
                 role=role,
                 reasoning=reasoning,
@@ -688,19 +707,14 @@ async def chat_completion_full_generator(
         ):
             message = ChatMessage(role=role, reasoning=reasoning, content=content)
 
-        elif (
-            request.tool_choice
-            and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam
-        ):
+        elif request.tool_choice and type(request.tool_choice) is ChatCompletionNamedToolChoiceParam:
             tool_call_class_items = []
             tool_calls = tool_calls or []
             for idx, tc in enumerate(tool_calls):
                 # Use native ID if available (e.g., Kimi K2),
                 # otherwise generate ID with correct id_type
                 if tc.id:
-                    tool_call_class_items.append(
-                        tool_call_class(id=tc.id, function=tc)
-                    )
+                    tool_call_class_items.append(tool_call_class(id=tc.id, function=tc))
                 else:
                     # Generate ID using the correct format (kimi_k2 or random),
                     # but leave it to the class if it's Mistral to preserve
@@ -713,9 +727,7 @@ async def chat_completion_full_generator(
                             func_name=tc.name,
                             idx=history_tool_call_cnt,
                         )
-                        tool_call_class_items.append(
-                            tool_call_class(id=generated_id, function=tc)
-                        )
+                        tool_call_class_items.append(tool_call_class(id=generated_id, function=tc))
                 history_tool_call_cnt += 1
             message = ChatMessage(
                 role=role,
@@ -731,26 +743,20 @@ async def chat_completion_full_generator(
                 # Use native ID if available,
                 # otherwise generate ID with correct id_type
                 if tool_call.id:
-                    tool_call_class_items.append(
-                        tool_call_class(id=tool_call.id, function=tool_call)
-                    )
+                    tool_call_class_items.append(tool_call_class(id=tool_call.id, function=tool_call))
                 else:
                     # Generate ID using the correct format (kimi_k2 or random),
                     # but leave it to the class if it's Mistral to preserve
                     # 9-char IDs
                     if is_mistral_tokenizer(tokenizer):
-                        tool_call_class_items.append(
-                            tool_call_class(function=tool_call)
-                        )
+                        tool_call_class_items.append(tool_call_class(function=tool_call))
                     else:
                         generated_id = make_tool_call_id(
                             id_type=self.tool_call_id_type,
                             func_name=tool_call.name,
                             idx=history_tool_call_cnt,
                         )
-                        tool_call_class_items.append(
-                            tool_call_class(id=generated_id, function=tool_call)
-                        )
+                        tool_call_class_items.append(tool_call_class(id=generated_id, function=tool_call))
                 history_tool_call_cnt += 1
             message = ChatMessage(
                 role=role,
@@ -781,9 +787,7 @@ async def chat_completion_full_generator(
                     # Use native ID if available (e.g., Kimi K2),
                     # otherwise generate ID with correct id_type
                     if tc.id:
-                        tool_call_items.append(
-                            tool_call_class(id=tc.id, function=tc)
-                        )
+                        tool_call_items.append(tool_call_class(id=tc.id, function=tc))
                     else:
                         # Generate ID using the correct format (kimi_k2 or random),
                         # but leave it to the class if it's Mistral to preserve
@@ -796,9 +800,7 @@ async def chat_completion_full_generator(
                                 func_name=tc.name,
                                 idx=history_tool_call_cnt,
                             )
-                            tool_call_items.append(
-                                tool_call_class(id=generated_id, function=tc)
-                            )
+                            tool_call_items.append(tool_call_class(id=generated_id, function=tc))
                     history_tool_call_cnt += 1
                 message = ChatMessage(
                     role=role,
@@ -834,9 +836,7 @@ async def chat_completion_full_generator(
         # "tool_calls" for "auto" or "required" tool calls,
         # and "stop" for named tool calls.
         is_finish_reason_tool_calls = auto_tools_called or (
-            request.tool_choice
-            and request.tool_choice == "required"
-            and output.finish_reason == "stop"
+            request.tool_choice and request.tool_choice == "required" and output.finish_reason == "stop"
         )
 
         # Encode routed_experts for transport. JSON can't carry raw
@@ -859,9 +859,7 @@ async def chat_completion_full_generator(
             if output.finish_reason
             else "stop",
             stop_reason=output.stop_reason,
-            token_ids=(
-                as_list(output.token_ids) if request.return_token_ids else None
-            ),
+            token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
             routed_experts=routed_experts_b64,
         )
         choice_data = maybe_filter_parallel_tool_calls(choice_data, request)
@@ -870,11 +868,7 @@ async def chat_completion_full_generator(
 
     if request.echo:
         last_msg_content: str | list[dict[str, str]] = ""
-        if (
-            conversation
-            and "content" in conversation[-1]
-            and conversation[-1].get("role") == role
-        ):
+        if conversation and "content" in conversation[-1] and conversation[-1].get("role") == role:
             last_msg_content = conversation[-1]["content"] or ""
         if isinstance(last_msg_content, list):
             last_msg_content = "\n".join(msg["text"] for msg in last_msg_content)
@@ -887,15 +881,11 @@ async def chat_completion_full_generator(
     num_prompt_tokens = len(final_res.prompt_token_ids)
     if final_res.encoder_prompt_token_ids is not None:
         num_prompt_tokens += len(final_res.encoder_prompt_token_ids)
-    num_generated_tokens = sum(
-        len(output.token_ids) for output in final_res.outputs
-    )
+    num_generated_tokens = sum(len(output.token_ids) for output in final_res.outputs)
 
     # ascend vllm adapt start, reuse prefill token
     if envs.REUSE_PREFILLED_TOKENS and final_res.kv_transfer_params:
-        final_res.kv_transfer_params["stop_reasons"] = [
-            output.stop_reason for output in final_res.outputs
-        ]
+        final_res.kv_transfer_params["stop_reasons"] = [output.stop_reason for output in final_res.outputs]
     # ascend vllm adapt end
 
     usage = UsageInfo(
@@ -904,9 +894,7 @@ async def chat_completion_full_generator(
         total_tokens=num_prompt_tokens + num_generated_tokens,
     )
     if self.enable_prompt_tokens_details and final_res.num_cached_tokens:
-        usage.prompt_tokens_details = PromptTokenUsageInfo(
-            cached_tokens=final_res.num_cached_tokens
-        )
+        usage.prompt_tokens_details = PromptTokenUsageInfo(cached_tokens=final_res.num_cached_tokens)
 
     request_metadata.final_usage_info = usage
 
@@ -921,9 +909,7 @@ async def chat_completion_full_generator(
         usage=usage,
         system_fingerprint=self.system_fingerprint,
         prompt_logprobs=clamp_prompt_logprobs(final_res.prompt_logprobs),
-        prompt_token_ids=(
-            final_res.prompt_token_ids if request.return_token_ids else None
-        ),
+        prompt_token_ids=(final_res.prompt_token_ids if request.return_token_ids else None),
         prompt_text=prompt_text,
         kv_transfer_params=final_res.kv_transfer_params,
     )
@@ -939,9 +925,7 @@ async def chat_completion_full_generator(
                 tool_call_descriptions = []
                 for tc in choice.message.tool_calls:  # type: ignore
                     function_call: FunctionCall = tc.function  # type: ignore
-                    tool_call_descriptions.append(
-                        f"{function_call.name}({function_call.arguments})"
-                    )
+                    tool_call_descriptions.append(f"{function_call.name}({function_call.arguments})")
                 tool_calls_str = ", ".join(tool_call_descriptions)
                 output_text = f"[tool_calls: {tool_calls_str}]"
 
@@ -961,6 +945,7 @@ async def chat_completion_full_generator(
                 )
 
     return response
+
 
 async def preprocess_chat(
     self,
@@ -1038,6 +1023,7 @@ async def preprocess_chat(
             request = tool_parser(tokenizer, request.tools).adjust_request(request=request)
     return conversation, [engine_input]
 
+
 async def _create_chat_completion(
     self,
     request: ChatCompletionRequest,
@@ -1059,9 +1045,7 @@ async def _create_chat_completion(
 
     conversation, engine_inputs = result
 
-    request_id = (
-        f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
-    )
+    request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
     request_metadata = RequestResponseMetadata(request_id=request_id)
     if raw_request:
@@ -1082,15 +1066,11 @@ async def _create_chat_completion(
 
         # If we are creating sub requests for multiple prompts, ensure that they
         # have unique request ids.
-        sub_request_id = (
-            request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
-        )
+        sub_request_id = request_id if len(engine_inputs) == 1 else f"{request_id}_{i}"
 
         max_tokens = get_max_tokens(
             max_model_len,
-            request.max_completion_tokens
-            if request.max_completion_tokens is not None
-            else request.max_tokens,
+            request.max_completion_tokens if request.max_completion_tokens is not None else request.max_tokens,
             self._extract_prompt_len(engine_input),
             self.default_sampling_params,
             self.override_max_tokens,
@@ -1099,27 +1079,31 @@ async def _create_chat_completion(
 
         sampling_params: SamplingParams | BeamSearchParams
         if request.use_beam_search:
-            sampling_params = request.to_beam_search_params(
-                max_tokens, self.default_sampling_params
-            )
+            sampling_params = request.to_beam_search_params(max_tokens, self.default_sampling_params)
         else:
             sampling_params = request.to_sampling_params(
                 max_tokens,
                 self.default_sampling_params,
             )
-            
+
         # ascend vllm adapt start, reuse prefill token
-        if envs.REUSE_PREFILLED_TOKENS and request.kv_transfer_params \
-                and "prefilled_token" in request.kv_transfer_params:
-            new_tokens = tokenizer.convert_ids_to_tokens(
-                request.kv_transfer_params["prefilled_token"][0])
+        # 提前派发(p_then_d)时这里取不到 token, 见 _p_then_d_token_reuse.
+        if (
+            envs.REUSE_PREFILLED_TOKENS
+            and not _p_then_d_token_reuse(request)
+            and request.kv_transfer_params
+            and "prefilled_token" in request.kv_transfer_params
+        ):
+            new_tokens = tokenizer.convert_ids_to_tokens(request.kv_transfer_params["prefilled_token"][0])
             delta_text = tokenizer.convert_tokens_to_string([new_tokens])
             # If the decoded text ends with '�', it indicates an incomplete UTF-8 — abandon reuse.
             # If the prefilled side has already triggered a stop reason, fall back to normal generation.
-            if min(max_tokens, max_model_len - len(prompt_token_ids)) == 1 \
-                    or delta_text.endswith("�") \
-                    or any(s is not None for s in request.kv_transfer_params["stop_reasons"]) \
-                    or request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id:
+            if (
+                min(max_tokens, max_model_len - len(prompt_token_ids)) == 1
+                or delta_text.endswith("�")
+                or any(s is not None for s in request.kv_transfer_params["stop_reasons"])
+                or request.kv_transfer_params["prefilled_token"][0] == tokenizer.eos_token_id
+            ):
                 request.kv_transfer_params.pop("prefilled_token", None)
             else:
                 request.kv_transfer_params["prefilled_texts"] = delta_text
@@ -1132,11 +1116,7 @@ async def _create_chat_completion(
             lora_request=lora_request,
         )
 
-        trace_headers = (
-            None
-            if raw_request is None
-            else await self._get_trace_headers(raw_request.headers)
-        )
+        trace_headers = None if raw_request is None else await self._get_trace_headers(raw_request.headers)
 
         if isinstance(sampling_params, BeamSearchParams):
             generator = self.beam_search(
@@ -1155,9 +1135,7 @@ async def _create_chat_completion(
                 # non-reasoning outputs.
                 reasoning_ended = True
             elif reasoning_parser:
-                reasoning_ended = reasoning_parser.is_reasoning_end(
-                    prompt_token_ids or []
-                )
+                reasoning_ended = reasoning_parser.is_reasoning_end(prompt_token_ids or [])
             else:
                 reasoning_ended = None
 
@@ -1176,16 +1154,19 @@ async def _create_chat_completion(
                 if reasoning_parser
                 else None,
             )
-            
+
             # ascend vllm adapt start, reuse prefill token (streaming only;
             if envs.REUSE_PREFILLED_TOKENS and request.stream:
-                if request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params \
-                        and "prefilled_texts" in request.kv_transfer_params:
+                if (
+                    request.kv_transfer_params
+                    and "prefilled_token" in request.kv_transfer_params
+                    and "prefilled_texts" in request.kv_transfer_params
+                ):
                     prefilled_text = request.kv_transfer_params["prefilled_texts"]
                     prefilled_tokens = request.kv_transfer_params["prefilled_token"]
                     generator = _wrap_with_prefilled(
-                        generator, sub_request_id, prompt_token_ids,
-                        prefilled_text, prefilled_tokens)
+                        generator, sub_request_id, prompt_token_ids, prefilled_text, prefilled_tokens
+                    )
             # ascend vllm adapt end
 
         generators.append(generator)
@@ -1224,6 +1205,57 @@ async def _create_chat_completion(
         request_metadata,
         parser,
     )
+
+
+def _install_p_then_d_token_route(app) -> None:
+    """p_then_d: 注册接收"首 token 补投"的端点(见 PrefilledTokenSpool).
+
+    proxy 提前派发 D 时, 请求体里没有 prefilled_token; 拿到 P 的首 token 后它 POST
+    到这里, 由本进程把记录原子写进 spool, 供同机 EngineCore 在 KV 接收完成的转型点
+    认领(recompute_scheduler._update_waiting_for_remote_kv).
+    """
+    from fastapi import Body
+
+    from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector import (
+        PTD_TOKEN_SPOOL_ROOT,
+        PrefilledTokenSpool,
+    )
+
+    @app.post("/v1/p_then_d_token")
+    async def _p_then_d_token(raw_request: Request, payload: dict = Body(...)) -> dict:  # noqa: B008
+        # X-Request-Id 与派发 D 时用的一致(见 proxy 的 deliver_prefiller_token).
+        request_id = raw_request.headers.get("X-Request-Id") or ""
+        kv_port = payload.get("kv_port")
+        if not request_id or kv_port is None:
+            return {"ok": False, "error": "X-Request-Id header and kv_port are required"}
+        spool_dir = os.path.join(PTD_TOKEN_SPOOL_ROOT, str(kv_port))
+        try:
+            PrefilledTokenSpool.write_entry(
+                spool_dir,
+                request_id,
+                {
+                    "prefilled_token": payload.get("prefilled_token"),
+                    "stop_reasons": payload.get("stop_reasons"),
+                    "reuse": bool(payload.get("reuse", True)),
+                },
+            )
+        except OSError as e:
+            logger.error("p_then_d: failed to store token for request %s: %s", request_id, e)
+            return {"ok": False, "error": str(e)}
+        return {"ok": True}
+
+
+def _build_app_with_p_then_d_token_route(*args, **kwargs):
+    # api_server 内部是 `app = build_app(...)`(模块全局名解析), 所以替换模块属性即可生效.
+    app = _original_build_app(*args, **kwargs)
+    if envs.REUSE_PREFILLED_TOKENS:
+        # 只有解码侧(复用 P 首 token)才需要这条路由.
+        _install_p_then_d_token_route(app)
+    return app
+
+
+_original_build_app = _api_server_module.build_app  # noqa: F811
+_api_server_module.build_app = _build_app_with_p_then_d_token_route
 
 OpenAIServingChat._create_chat_completion = _create_chat_completion
 OpenAIServingChat.chat_completion_full_generator = chat_completion_full_generator

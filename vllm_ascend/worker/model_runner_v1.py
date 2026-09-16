@@ -2322,10 +2322,10 @@ class NPUModelRunner(GPUModelRunner):
             hidden_states = self._model_forward(
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
-            torch.npu.synchronize()
-            model_exec_end_time = time.perf_counter()
 
             if ascend_envs.ENABLE_PERF_DEBUG and torch.distributed.get_rank() == 0:
+                torch.npu.synchronize()
+                model_exec_end_time = time.perf_counter()
                 # reqs 为该批 external request id (如 chatcmpl-xxx), P/D 两侧
                 # 同 id 便于时间线对应.
                 reqs = ",".join(self.input_batch.req_ids)

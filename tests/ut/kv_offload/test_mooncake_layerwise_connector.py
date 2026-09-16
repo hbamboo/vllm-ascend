@@ -2,9 +2,12 @@ import contextlib
 import importlib.util
 import os
 import sys
+import tempfile
 import threading
+import time
 import types
 import unittest
+from collections import defaultdict
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -50,21 +53,27 @@ from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector imp
     KVCacheRecvingLayerThread,
     KVCacheSendingLayerThread,
     KVConnectorRole,
+    KVTransferParamsRecvingThread,
     LayerMetadata,
     MooncakeAgentMetadata,
     MooncakeLayerwiseConnector,
     MooncakeLayerwiseConnectorMetadata,
     MooncakeLayerwiseConnectorScheduler,
     MooncakeLayerwiseConnectorWorker,
+    PTD_TOKEN_SPOOL_MAX_ENTRIES,
+    PrefilledTokenSpool,
     ReqMeta,
     SendReqInfo,
     SendTask,
     TransferMeta,
     ensure_zmq_recv,
     ensure_zmq_send,
+    get_external_request_id,
     group_concurrent_contiguous,
+    kv_transfer_params_zmq_port_base,
     string_to_int64_hash,
     zmq_ctx,
+    _spool_key,
 )
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import global_te  # noqa: E402
 
@@ -171,6 +180,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             pd_head_ratio=1,
             num_head_replica=1,
             layer_metadata=self.layer_metadata,
+            group_max_layer_idx={0: 2},
             use_mla=True,
             use_attn_mamba_hybrid=False,
             k_buffer=self.fake_k_buffer,
@@ -253,6 +263,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             pd_head_ratio=2,
             num_head_replica=1,
             layer_metadata=layer_metadata,
+            group_max_layer_idx={0: 1},
             use_mla=False,
             use_attn_mamba_hybrid=False,
             k_buffer=self.fake_k_buffer,
@@ -591,6 +602,7 @@ class TestKVCacheSendingLayerThread(unittest.TestCase):
             pd_head_ratio=1,
             num_head_replica=1,
             layer_metadata=self.layer_metadata,
+            group_max_layer_idx={0: 2},
             use_mla=True,
             use_attn_mamba_hybrid=False,
             k_buffer=self.fake_k_buffer,
@@ -770,6 +782,14 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
             self.assertNotIn("reqB", th.done_requests)
             self.assertIn("reqC", th.failed_requests)
 
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.bind_current_thread_to_idle_cpu",
+        return_value=False,
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_world_group",
+        return_value=SimpleNamespace(local_rank=0),
+    )
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.make_zmq_socket")
@@ -781,7 +801,16 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.msgspec.msgpack.Encoder")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx")
     def test_run_loop_handles_meta_done_invalid_unexpected_and_ack(
-        self, mock_zmq_ctx, mock_Encoder, mock_Decoder, _mock_make_path, _mock_make_sock, _mock_get_ip, mock_logger
+        self,
+        mock_zmq_ctx,
+        mock_Encoder,
+        mock_Decoder,
+        _mock_make_path,
+        _mock_make_sock,
+        _mock_get_ip,
+        mock_logger,
+        _mock_world_group,
+        _mock_cpu_bind,
     ):
         enc_inst = MagicMock()
         enc_inst.encode.return_value = b"ENCODED_META"
@@ -846,13 +875,28 @@ class TestKVCacheRecvingLayerThread(unittest.TestCase):
         finished = th.get_and_clear_done_requests()
         self.assertIn("reqA", finished)
 
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.bind_current_thread_to_idle_cpu",
+        return_value=False,
+    )
+    @patch(
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_world_group",
+        return_value=SimpleNamespace(local_rank=0),
+    )
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.get_ip", return_value="127.0.0.1")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.msgspec.msgpack.Decoder")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.msgspec.msgpack.Encoder")
     @patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.zmq_ctx")
     def test_run_loop_pd_head_ratio_gt1_requires_multiple_done(
-        self, mock_zmq_ctx, mock_Encoder, mock_Decoder, _mock_get_ip, _mock_logger
+        self,
+        mock_zmq_ctx,
+        mock_Encoder,
+        mock_Decoder,
+        _mock_get_ip,
+        _mock_logger,
+        _mock_world_group,
+        _mock_cpu_bind,
     ):
         enc_inst = MagicMock()
         enc_inst.encode.return_value = b"ENC"
@@ -1224,6 +1268,60 @@ class TestMooncakeLayerwiseConnectorScheduler_More(unittest.TestCase):
         self.assertIsNone(params)
 
 
+class TestPrefilledTokenSpool(unittest.TestCase):
+    """p_then_d: 首 token 的 spool 通道(写入→认领→消费)."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.spool_dir = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_write_then_wait_roundtrip(self):
+        spool = PrefilledTokenSpool(self.spool_dir)
+        PrefilledTokenSpool.write_entry(self.spool_dir, "cmpl-abc-1", {"prefilled_token": [42]})
+
+        entry = spool.wait_for_prefilled_token("cmpl-abc-1", timeout=2.0)
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["prefilled_token"], [42])
+
+    def test_engine_core_suffix_normalized_to_same_key(self):
+        """API 侧的 header 与 EngineCore 的 request_id 后缀不同, 必须归一到同一个 key."""
+        spool = PrefilledTokenSpool(self.spool_dir)
+        PrefilledTokenSpool.write_entry(self.spool_dir, "cmpl-abc", {"prefilled_token": [1]})
+
+        # EngineCore 侧拿到的是 "cmpl-abc-00012" 这种带序号后缀的形式.
+        entry = spool.wait_for_prefilled_token("cmpl-abc-00012", timeout=2.0)
+
+        self.assertIsNotNone(entry)
+        self.assertEqual(entry["prefilled_token"], [1])
+        self.assertEqual(_spool_key("cmpl-abc-00012"), "cmpl-abc")
+
+    def test_wait_times_out_and_returns_none(self):
+        spool = PrefilledTokenSpool(self.spool_dir)
+
+        self.assertIsNone(spool.wait_for_prefilled_token("cmpl-missing", timeout=0.05))
+
+    def test_entry_consumed_once(self):
+        spool = PrefilledTokenSpool(self.spool_dir)
+        PrefilledTokenSpool.write_entry(self.spool_dir, "cmpl-dup", {"prefilled_token": [9]})
+
+        self.assertIsNotNone(spool.wait_for_prefilled_token("cmpl-dup", timeout=2.0))
+        self.assertIsNone(spool.wait_for_prefilled_token("cmpl-dup", timeout=0.05))
+
+    def test_cache_evicts_oldest_beyond_limit(self):
+        spool = PrefilledTokenSpool(self.spool_dir)
+        for i in range(PTD_TOKEN_SPOOL_MAX_ENTRIES + 5):
+            PrefilledTokenSpool.write_entry(self.spool_dir, f"cmpl-{i}", {"prefilled_token": [i]})
+        spool.wait_for_prefilled_token("cmpl-none", timeout=0.05)  # 触发一次轮询/缓存
+
+        with spool._lock:
+            cached = len(spool._entries)
+        self.assertLessEqual(cached, PTD_TOKEN_SPOOL_MAX_ENTRIES + 5)
+
+
 class TestHelperFunctions(unittest.TestCase):
     def test_group_concurrent_contiguous(self):
         src: list[int] = [1, 2, 3, 5, 6]
@@ -1421,6 +1519,10 @@ class TestMooncakeLayerwiseConnectorWorker(unittest.TestCase):
                 "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.KVCacheRecvingLayerThread",
                 MagicMock(),
             ),
+            patch(
+                "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.KVTransferParamsRecvingThread",
+                MagicMock(),
+            ),
             patch("vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.logger", MagicMock()),
             patch(
                 "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.threading.Event", MagicMock()
@@ -1583,3 +1685,550 @@ class TestGlobalTEStagingExtras(unittest.TestCase):
         te.submit_dma_copy_ptrs = MagicMock()
         te.sync_npu_to_cpu_for_npu_addrs([0x200000], [8192])
         self.assertEqual(te.submit_dma_copy_ptrs.call_args[0][2], [8192])
+
+
+def _make_sending_thread(**overrides):
+    """KVCacheSendingLayerThread 的最小构造(其余参数 MagicMock)."""
+    vllm_config = MagicMock()
+    vllm_config.speculative_config = None
+    vllm_config.cache_config.mamba_cache_mode = None
+    kwargs = dict(
+        engine=MagicMock(),
+        vllm_config=vllm_config,
+        kv_cache_config=_make_mock_kv_cache_config(),
+        kv_cache_specs=[MagicMock(block_size=16)],
+        attn_resharding_group_idx=set(),
+        total_layers=3,
+        ready_event=threading.Event(),
+        tp_size=1,
+        tp_rank=0,
+        pd_head_ratio=1,
+        num_head_replica=1,
+        layer_metadata={"layer0": _make_layer_metadata()},
+        group_max_layer_idx={0: 2},
+        use_mla=True,
+        use_attn_mamba_hybrid=False,
+        k_buffer=MagicMock(),
+        v_buffer=MagicMock(),
+        enable_kv_quant=False,
+        enable_c8_quant=False,
+        resharding_stream=MagicMock(),
+        sender_path="127.0.0.1:9999",
+    )
+    kwargs.update(overrides)
+    return KVCacheSendingLayerThread(**kwargs)
+
+
+def _make_req_meta(**overrides):
+    defaults = dict(
+        local_block_ids=[[5, 8]],
+        token_ids=[1, 2, 3],
+        remote_block_ids=[[10, 20]],
+        remote_block_size=[[16]],
+        remote_engine_id="remote_engine",
+        remote_host="127.0.0.1",
+        remote_port=7777,
+        remote_te_rpc_port=6000,
+        remote_layer_metadata=None,
+        metaserver=None,
+        remote_tp_size=2,
+        remote_pcp_size=1,
+        remote_dcp_size=1,
+    )
+    defaults.update(overrides)
+    return ReqMeta(**defaults)
+
+
+class TestKVTransferParamsRecvingThread(unittest.TestCase):
+    """p_then_d: D→P 参数直连通道的存取/超时/过期."""
+
+    def _make_thread(self, wait_sec=5.0, expire_sec=300.0):
+        return KVTransferParamsRecvingThread(
+            kv_transfer_params_zmq_port=6000,
+            ready_event=threading.Event(),
+            timeout=1.0,
+            wait_transfer_params_timeout_sec=wait_sec,
+            prefill_transfer_params_expire_sec=expire_sec,
+        )
+
+    def test_wait_returns_stored_params(self):
+        thread = self._make_thread()
+        params = {"remote_host": "10.0.0.1", "remote_block_ids": [[1, 2]]}
+        thread.set_kv_transfer_params(get_external_request_id("cmpl-req1-0"), params)
+
+        self.assertIs(thread.wait_for_kv_transfer_params("cmpl-req1-0"), params)
+
+    def test_wait_times_out_for_unknown_request(self):
+        thread = self._make_thread(wait_sec=0.05)
+
+        start = time.perf_counter()
+        got = thread.wait_for_kv_transfer_params("cmpl-missing-0")
+
+        self.assertIsNone(got)
+        self.assertGreaterEqual(time.perf_counter() - start, 0.05)
+
+    def test_expired_params_are_dropped(self):
+        thread = self._make_thread(wait_sec=0.05, expire_sec=0.0)
+        thread.set_kv_transfer_params(get_external_request_id("cmpl-req2-0"), {"remote_host": "h"})
+
+        self.assertIsNone(thread.wait_for_kv_transfer_params("cmpl-req2-0"))
+
+    def test_pop_removes_params(self):
+        thread = self._make_thread(wait_sec=0.05)
+        req_id = "cmpl-req3-0"
+        thread.set_kv_transfer_params(get_external_request_id(req_id), {"remote_host": "h"})
+
+        thread.pop_kv_transfer_params(req_id)
+
+        self.assertIsNone(thread.wait_for_kv_transfer_params(req_id))
+
+
+class TestPThenDSendingPath(unittest.TestCase):
+    """p_then_d: 发送线程侧的延迟解析与延迟释放块."""
+
+    def test_resolve_pending_requests_resolves_once_per_req_meta(self):
+        resolve = MagicMock(return_value=True)
+        thread = _make_sending_thread(resolve_pending_req=resolve)
+        req_meta = _make_req_meta(awaiting_params=True)
+        tasks = []
+        for layer_idx in (0, 1):
+            task = SendTask(layer_idx=layer_idx, layer_name="layer0")
+            task.send_request["req1"] = req_meta
+            tasks.append(task)
+
+        thread._resolve_pending_requests(tasks)
+
+        self.assertEqual(resolve.call_count, 1)
+        self.assertFalse(req_meta.awaiting_params)
+        self.assertEqual(thread.failed_reqs, set())
+
+    def test_resolve_pending_requests_failure_clears_peers_and_releases(self):
+        released = []
+        thread = _make_sending_thread(
+            resolve_pending_req=MagicMock(return_value=False),
+            add_done_sending_request=released.append,
+        )
+        req_meta = _make_req_meta(awaiting_params=True, delayed_free=True)
+        req_meta.peer_transfer[("127.0.0.1", 7777)] = {
+            "local_block_ids": [[5]],
+            "remote_block_ids": [[10]],
+            "trans_count": [1],
+        }
+        task = SendTask(layer_idx=0, layer_name="layer0")
+        task.send_request["req1"] = req_meta
+
+        thread._resolve_pending_requests([task])
+
+        # 解析失败: peer 映射清空(后续批不再产出传输段), 等待标记清除, 块立即上报释放.
+        self.assertEqual(req_meta.peer_transfer, {})
+        self.assertFalse(req_meta.awaiting_params)
+        self.assertIn("req1", thread.failed_reqs)
+        self.assertEqual(released, ["req1"])
+
+    def test_release_delayed_requests_waits_for_last_group_layer(self):
+        released = []
+        thread = _make_sending_thread(add_done_sending_request=released.append)
+        req_meta = _make_req_meta(delayed_free=True, chunk_finish=True)
+        _set_single_peer(req_meta)
+
+        early = SendTask(layer_idx=1, layer_name="layer0")
+        early.send_request["req1"] = req_meta
+        thread._release_delayed_requests([early], {"req1"})
+        self.assertEqual(released, [])
+
+        last = SendTask(layer_idx=2, layer_name="layer0")
+        last.send_request["req1"] = req_meta
+        thread._release_delayed_requests([last], {"req1"})
+        self.assertEqual(released, ["req1"])
+
+    def test_release_delayed_requests_skips_non_delayed_and_untransferred(self):
+        released = []
+        thread = _make_sending_thread(add_done_sending_request=released.append)
+        task = SendTask(layer_idx=2, layer_name="layer0")
+
+        # 非延迟释放请求(普通 layerwise 流程): 不碰块释放通道.
+        task.send_request["plain"] = _make_req_meta(delayed_free=False, chunk_finish=True)
+        # 延迟释放但本请求本批没有产出传输段: 不能释放.
+        untransferred = _make_req_meta(delayed_free=True, chunk_finish=True)
+        untransferred.peer_transfer[("127.0.0.1", 7777)] = {
+            "local_block_ids": [[5]],
+            "remote_block_ids": [[10]],
+            "trans_count": [1],
+        }
+        task.send_request["pending"] = untransferred
+
+        thread._release_delayed_requests([task], {"plain"})
+
+        self.assertEqual(released, [])
+
+    def test_release_delayed_requests_skips_mid_chunk(self):
+        released = []
+        thread = _make_sending_thread(add_done_sending_request=released.append)
+        req_meta = _make_req_meta(delayed_free=True, chunk_finish=False)
+        _set_single_peer(req_meta)
+        task = SendTask(layer_idx=2, layer_name="layer0")
+        task.send_request["req1"] = req_meta
+
+        thread._release_delayed_requests([task], {"req1"})
+
+        self.assertEqual(released, [])
+
+    def test_send_queue_unbounded_when_p_then_d(self):
+        """不等分 TP(reshard)下队列必须有界以外的形态: p_then_d 下无界, 否则
+        发送线程等 D 参数期间 put 会堵死模型前向 -> 死锁."""
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.envs.P_THEN_D",
+            False,
+        ):
+            bounded = _make_sending_thread(pd_head_ratio=2, use_attn_mamba_hybrid=False)
+        self.assertEqual(bounded.send_queue.maxsize, 1)
+
+        with patch(
+            "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector.envs.P_THEN_D",
+            True,
+        ):
+            unbounded = _make_sending_thread(pd_head_ratio=2, use_attn_mamba_hybrid=False)
+        self.assertEqual(unbounded.send_queue.maxsize, 0)
+
+
+class TestPThenDWorkerResolution(unittest.TestCase):
+    """p_then_d: worker 侧把 D 参数合并成逐 peer 传输映射."""
+
+    def _make_worker_stub(self, split_metadata=None, align_side_effect=None):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.num_kv_cache_groups = 1
+        worker.kv_cache_specs = [MagicMock(block_size=16)]
+        worker._align_remote_block_ids = MagicMock(side_effect=align_side_effect)
+        worker._get_kv_split_metadata = MagicMock(
+            return_value=split_metadata
+            if split_metadata is not None
+            else {
+                ("10.0.0.2", 7000): {
+                    "local_block_ids": [1, 2],
+                    "remote_block_ids": [7, 8],
+                    "trans_count": 1,
+                }
+            }
+        )
+        worker._get_kernel_block_ids = MagicMock(side_effect=lambda ids: ids)
+        return worker
+
+    def test_resolve_send_mapping_swaps_peer_transfer_and_sets_compat_fields(self):
+        worker = self._make_worker_stub()
+        req_meta = _make_req_meta(req_idx=3)
+        old_peer_transfer = req_meta.peer_transfer
+
+        worker._resolve_send_mapping("req1", req_meta)
+
+        self.assertEqual(req_meta.req_idx, 3)
+        self.assertIsNot(req_meta.peer_transfer, old_peer_transfer)
+        self.assertEqual(old_peer_transfer, {})
+        self.assertEqual(req_meta.peer_transfer[("10.0.0.2", 7000)]["local_block_ids"], [[1, 2]])
+        self.assertEqual(req_meta.peer_transfer[("10.0.0.2", 7000)]["remote_block_ids"], [[7, 8]])
+        self.assertEqual((req_meta.remote_host, req_meta.remote_port), ("10.0.0.2", 7000))
+        self.assertEqual(req_meta.remote_te_rpc_port, 6000)
+
+    def test_add_done_sending_request_is_idempotent(self):
+        """重复上报会让 scheduler 的 assert req_id in self.requests 炸掉引擎."""
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.done_sending = set()
+        worker._reported_done_sending = {}
+        worker.done_sending_lock = threading.Lock()
+        worker.params_recv_thread = None
+
+        worker.add_done_sending_request("req1")
+        worker.add_done_sending_request("req1")
+
+        self.assertEqual(worker.get_and_clear_done_sending(), {"req1"})
+        self.assertEqual(worker.get_and_clear_done_sending(), set())
+
+    def test_merge_decoder_params_overwrites_pending_placeholders(self):
+        worker = self._make_worker_stub()
+        req_meta = _make_req_meta(remote_cache_tokens=None, remote_host=None, remote_port=None, remote_tp_size=None)
+
+        worker._merge_decoder_params(
+            req_meta,
+            {
+                "remote_block_ids": [[9, 10]],
+                "remote_block_size": [[16]],
+                "remote_engine_id": "decoder",
+                "remote_host": "10.0.0.3",
+                "remote_port": 8000,
+                "remote_tp_size": 2,
+                "remote_pcp_size": 1,
+                "remote_dcp_size": 1,
+                "remote_cached_tokens": 128,
+            },
+        )
+
+        self.assertEqual(req_meta.remote_block_ids, [[9, 10]])
+        self.assertEqual(req_meta.remote_host, "10.0.0.3")
+        self.assertEqual(req_meta.remote_port, 8000)
+        self.assertEqual(req_meta.remote_tp_size, 2)
+        self.assertEqual(req_meta.remote_cache_tokens, 128)
+
+
+class TestEnsurePeerMetadata(unittest.TestCase):
+    """GET_META: 本次调用的 socket 必须注册进本次调用的 poller.
+
+    不注册时 zmq.Poller.poll() 永远超时 -> "Failed to receive data from ... after
+    3 retries"(真机 p_then_d 首请求踩到过: D 明明在监听, P 却收不到层元数据).
+    """
+
+    MOD = "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_connector"
+
+    def _make_worker(self, sock):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        worker.remote_meta_lock = threading.Lock()
+        worker.remote_layer_metadata = defaultdict(dict)
+        worker.remote_te_port = defaultdict(dict)
+        worker.local_engine_id = "local_engine"
+        worker.engine_id = "local_engine"
+        worker.pd_head_ratio = 1
+        worker.layer_metadata = {"layer0": _make_layer_metadata()}
+        worker.encoder = MagicMock()
+        worker.encoder.encode.return_value = b"GET_META"
+        worker.decoder = MagicMock()
+        worker.decoder.decode.return_value = MooncakeAgentMetadata(
+            te_rpc_port=6000, layer_metadata={"layer0": _make_layer_metadata()}
+        )
+        worker.engine = MagicMock()
+        worker._get_remote_socket = MagicMock(return_value=sock)
+        return worker
+
+    def test_get_meta_registers_socket_on_private_poller(self):
+        sock = MagicMock()
+        worker = self._make_worker(sock)
+        seen = {}
+
+        def fake_recv(s, poller, path, *args, **kwargs):
+            seen["poller"] = poller
+            seen["sock"] = s
+            return b"meta"
+
+        req_meta = _make_req_meta(remote_engine_id="decoder_engine")
+        with (
+            patch(f"{self.MOD}.ensure_zmq_send"),
+            patch(f"{self.MOD}.ensure_zmq_recv", side_effect=fake_recv),
+        ):
+            worker._ensure_peer_metadata("req1", req_meta, "10.0.0.2", 7000)
+
+        self.assertIs(seen["sock"], sock)
+        registered = [s for s, _ in seen["poller"].sockets]
+        self.assertIn(sock, registered, "GET_META 的 poller 必须注册本次 socket, 否则 poll 必超时")
+        # 元数据缓存与 peer 字段都写上了(等待方不会因空映射再报错)
+        self.assertIn(("10.0.0.2", 7000), req_meta.peer_layer_metadata)
+        self.assertEqual(req_meta.peer_te_rpc_port[("10.0.0.2", 7000)], 6000)
+
+
+class TestPThenDStartLoadKVPending(unittest.TestCase):
+    """p_then_d: start_load_kv 对等待参数的请求不做 peer 映射, 但块必须进 reshard 块表.
+
+    漏块会让 get_transfer_meta 的 rearrange_block_dict[local_block_id] KeyError(不等分 TP)。
+    """
+
+    def _make_worker_stub(self):
+        worker = MooncakeLayerwiseConnectorWorker.__new__(MooncakeLayerwiseConnectorWorker)
+        config = MockVllmConfig()
+        config.kv_transfer_config.is_kv_producer = True
+        config.kv_transfer_config.is_kv_consumer = False
+        worker.vllm_config = config
+        worker.num_kv_cache_groups = 1
+        worker.kv_cache_specs = [MagicMock(block_size=16)]
+        worker.block_size = [16]
+        worker.kernel_block_size_scale = [1]
+        worker.pd_head_ratio = 2
+        worker.enable_kv_quant = False
+        worker.enable_c8_quant = False
+        worker.attn_resharding_group_idx = {0}
+        worker.pcp_size = 1
+        worker.dcp_size = 1
+        worker.k_buffer = MagicMock()
+        worker.k_buffer.device = "cpu"
+        worker._check_pending_params_supported = MagicMock()
+        worker._resolve_send_mapping = MagicMock()
+        worker._get_kernel_block_ids = MagicMock(side_effect=lambda ids: ids)
+        return worker
+
+    def test_pending_request_skips_mapping_but_joins_reshard_block_table(self):
+        worker = self._make_worker_stub()
+        meta = MooncakeLayerwiseConnectorMetadata()
+        meta.requests["req1"] = _make_req_meta(awaiting_params=True, local_block_ids=[[5, 8]])
+
+        worker.start_load_kv(meta)
+
+        req_meta = meta.requests["req1"]
+        self.assertTrue(req_meta.awaiting_params)
+        self.assertEqual(req_meta.peer_transfer, {})
+        self.assertFalse(worker._resolve_send_mapping.called)
+        worker._check_pending_params_supported.assert_called_once()
+        send_task = meta.send_task
+        self.assertEqual(send_task.group_rearrange_block_ids[0], [5, 8])
+        self.assertEqual(send_task.group_num_blocks[0], 2)
+        self.assertEqual(send_task.group_num_tokens[0], 32)
+        self.assertIsNotNone(send_task.group_block_table[0])
+
+    def test_resolved_request_still_goes_through_mapping(self):
+        worker = self._make_worker_stub()
+        meta = MooncakeLayerwiseConnectorMetadata()
+        meta.requests["req1"] = _make_req_meta(awaiting_params=False)
+
+        worker.start_load_kv(meta)
+
+        worker._resolve_send_mapping.assert_called_once()
+        self.assertTrue(meta.requests["req1"].delayed_free is False)
+
+
+class TestPThenDScheduler(unittest.TestCase):
+    """p_then_d: P 侧标记/响应参数, D 侧直连推送."""
+
+    def setUp(self):
+        self.scheduler = MooncakeLayerwiseConnectorScheduler(MockVllmConfig(), MockKVCacheConfig(), "test_engine")
+
+    def test_update_state_after_alloc_marks_pending_prefill_request(self):
+        """P 侧: 请求没带 D 参数时标记 _p_then_d(否则 remote_cached_tokens 缺键直接 KeyError)."""
+        request = MockRequest("req1", kv_transfer_params={"do_remote_decode": True})
+        blocks = _MockBlocks(unhashed=[], block_ids_tuple=([4, 5],))
+
+        self.scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+        self.assertTrue(request.kv_transfer_params["_p_then_d"])
+        self.assertIn("req1", self.scheduler._reqs_need_send_layerwise)
+
+    def test_update_state_after_alloc_keeps_standard_prefill_request(self):
+        request = MockRequest(
+            "req1",
+            kv_transfer_params={
+                "do_remote_decode": True,
+                "remote_block_ids": [[1]],
+                "remote_cached_tokens": 16,
+            },
+        )
+        blocks = _MockBlocks(unhashed=[], block_ids_tuple=([4, 5],))
+
+        self.scheduler.update_state_after_alloc(request, blocks, num_external_tokens=0)
+
+        self.assertNotIn("_p_then_d", request.kv_transfer_params)
+        self.assertEqual(self.scheduler._reqs_need_send_layerwise["req1"].local_transferred_tokens, 16)
+
+    def test_request_finished_all_groups_returns_prefill_params(self):
+        request = MockRequest("req1", kv_transfer_params={"do_remote_decode": True, "_p_then_d": True})
+
+        delay_free, params = self.scheduler.request_finished_all_groups(request, ([],))
+
+        # 块不延迟释放(否则 finished_sending 上报丢了 => 请求永久留在 scheduler),
+        # 但 P 的身份参数仍要回给 proxy.
+        self.assertFalse(delay_free)
+        self.assertIn("kv_transfer_params_zmq_port", params)
+        self.assertEqual(
+            params["kv_transfer_params_zmq_port"], kv_transfer_params_zmq_port_base(self.scheduler.vllm_config)
+        )
+        self.assertEqual(params["remote_host"], self.scheduler.side_channel_host)
+        self.assertEqual(params["remote_tp_size"], self.scheduler.vllm_config.parallel_config.tensor_parallel_size)
+        self.assertTrue(params)
+
+    def test_request_finished_all_groups_standard_request_keeps_immediate_free(self):
+        request = MockRequest("req1", kv_transfer_params={"do_remote_decode": True})
+
+        delay_free, params = self.scheduler.request_finished_all_groups(request, ([],))
+
+        self.assertFalse(delay_free)
+        self.assertIsNone(params)
+
+    def test_build_connector_meta_carries_pending_flag_and_zero_cache_tokens(self):
+        scheduler = self.scheduler
+        scheduler.vllm_config.kv_transfer_config.is_kv_consumer = False
+        request = MockRequest("req1", kv_transfer_params={"do_remote_decode": True, "_p_then_d": True})
+        request.all_token_ids = list(request.prompt_token_ids)
+        scheduler._reqs_need_send_layerwise["req1"] = SendReqInfo(
+            local_block_ids=[[4, 5]], local_transferred_tokens=0, local_computed_tokens=0, request=request
+        )
+        scheduler_output = _MockSchedulerOutput(cached_req_ids=[], cached_new_block_ids=[], num_sched={"req1": 4})
+
+        meta = scheduler.build_connector_meta(scheduler_output)
+
+        req_meta = meta.requests["req1"]
+        self.assertTrue(req_meta.awaiting_params)
+        # p_then_d 不再延迟释放块: D 由 proxy 提前派发, 发送线程不长时间等参数.
+        self.assertFalse(req_meta.delayed_free)
+        self.assertEqual(req_meta.remote_cache_tokens, 0)
+
+    def test_update_state_after_alloc_pushes_params_to_prefill_channel(self):
+        """D 侧: 请求带 kv_transfer_params_zmq_port 时走直连, 不碰 metaserver."""
+        scheduler = self.scheduler
+        scheduler.vllm_config.kv_transfer_config.is_kv_consumer = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(17)),
+            kv_transfer_params={
+                "do_remote_prefill": True,
+                "remote_host": "10.0.0.9",
+                "remote_pcp_size": 1,
+                "remote_tp_size": 2,
+                "kv_transfer_params_zmq_port": 6100,
+            },
+        )
+        blocks = _MockBlocks(unhashed=[], block_ids_tuple=([4, 5],))
+        scheduler.executor.submit = MagicMock()
+
+        scheduler.update_state_after_alloc(request, blocks, num_external_tokens=17)
+
+        submitted = [
+            call
+            for call in scheduler.executor.submit.call_args_list
+            if call.args[0].__name__ == "_push_kv_transfer_params"
+        ]
+        self.assertEqual(len(submitted), 2)
+        self.assertEqual([call.kwargs["remote_port"] for call in submitted], [6100, 6101])
+        self.assertEqual(submitted[0].kwargs["remote_host"], "10.0.0.9")
+        self.assertEqual(submitted[0].kwargs["message"]["remote_block_ids"], ([4, 5],))
+        self.assertEqual(request.kv_transfer_params["do_remote_prefill"], False)
+
+    def test_update_state_after_alloc_keeps_metaserver_path_without_channel(self):
+        scheduler = self.scheduler
+        scheduler.vllm_config.kv_transfer_config.is_kv_consumer = True
+        request = MockRequest(
+            "req1",
+            prompt_token_ids=list(range(17)),
+            kv_transfer_params={"do_remote_prefill": True, "metaserver": "http://meta"},
+        )
+        blocks = _MockBlocks(unhashed=[], block_ids_tuple=([4, 5],))
+        scheduler.executor.submit = MagicMock()
+
+        scheduler.update_state_after_alloc(request, blocks, num_external_tokens=17)
+
+        submitted = [
+            call for call in scheduler.executor.submit.call_args_list if call.args[0].__name__ == "_access_metaserver"
+        ]
+        self.assertEqual(len(submitted), 1)
+        self.assertEqual(submitted[0].kwargs["url"], "http://meta")
+
+    def test_prefilled_token_spool_dir_keyed_by_kv_port(self):
+        """D 侧 spool 目录按 P 的 kv_port 分: 同机多实例互不干扰."""
+        request = MockRequest("req1", kv_transfer_params={"kv_port": 16579})
+
+        spool_dir = self.scheduler.prefilled_token_spool_dir(request)
+
+        self.assertTrue(spool_dir.endswith("16579"))
+
+    def test_prefilled_token_spool_dir_absent_without_kv_port(self):
+        """没声明 kv_port(老时序/未开提前派发)时不该去等 token."""
+        request = MockRequest("req1", kv_transfer_params={"do_remote_prefill": True})
+
+        self.assertIsNone(self.scheduler.prefilled_token_spool_dir(request))
+        self.assertIsNone(self.scheduler.deliver_prefilled_token(request, timeout=0.01))
+
+    def test_deliver_prefilled_token_reads_spool(self):
+        """proxy 投递后, D 的等待点能取到(且只被消费一次)."""
+        request = MockRequest("req1", kv_transfer_params={"kv_port": 16579})
+        spool_dir = self.scheduler.prefilled_token_spool_dir(request)
+        PrefilledTokenSpool.write_entry(
+            spool_dir, request.request_id, {"prefilled_token": [7], "stop_reasons": [None], "reuse": True}
+        )
+
+        delivered = self.scheduler.deliver_prefilled_token(request, timeout=2.0)
+
+        self.assertIsNotNone(delivered)
+        self.assertEqual(delivered["prefilled_token"], [7])
+        # 认领即消费: 再来一次等同一个请求应超时(而不是重复注入).
+        self.assertIsNone(self.scheduler.deliver_prefilled_token(request, timeout=0.05))

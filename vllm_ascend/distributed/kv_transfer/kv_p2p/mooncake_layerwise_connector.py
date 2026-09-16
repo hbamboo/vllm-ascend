@@ -3,15 +3,17 @@
 import contextlib
 import copy
 import hashlib
+import json
 import logging
 import math
 import os
 import queue
+import re
 import struct
 import threading
 import time
 from collections import OrderedDict, defaultdict, deque
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -53,6 +55,7 @@ from vllm.v1.kv_cache_interface import (
 )
 from vllm.v1.worker.utils import extract_layer_index
 
+from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
@@ -86,9 +89,43 @@ if TYPE_CHECKING:
 DONE_SENDING_MSG = b"done_sending_msg"
 FAILED_SENDING_MSG = b"failed_sending_msg"
 LAYER_DONE_SENDING_MSG = b"layer_done_sending_msg"
+# D→P 参数直连通道(p_then_d): 载荷 (KV_TRANSFER_PARAMS_MSG, external_req_id, params).
+KV_TRANSFER_PARAMS_MSG = b"kv_transfer_params_msg"
 
 # 逐层 LAYER_DONE 握手使用独立连接, 需覆盖 D 侧 H2D 时间.
 LAYER_DONE_TIMEOUT_S = 30.0
+
+# p_then_d (envs.P_THEN_D): P 侧等 D 参数的超时与参数缓存过期时间(秒).
+# 与参考实现(预填充后解码版 connector)的 prefill extra config 同名, 但等待超时
+# 取更小的默认值: 发送线程是串行的, 等一个请求的参数会阻塞其他请求的传输, 正常
+# 情况下参数在 P 响应回 proxy → D 派发后毫秒级就到.
+DEFAULT_WAIT_TRANSFER_PARAMS_TIMEOUT_SEC = 30
+DEFAULT_PREFILL_TRANSFER_PARAMS_EXPIRE_SEC = 300
+# 发送线程轮询等待 D 参数的检查间隔: 比一次长等待更容易打点/观测, 也便于在
+# 超时前先处理已完成 write 的收尾(pipe 路径).
+WAIT_TRANSFER_PARAMS_POLL_S = 0.005
+
+# p_then_d: 首 token 注入通道(spool 文件). proxy 提前派发 D 后, P 的首 token 由它
+# 经由 D 的 API server 写入本机 spool, D 的 EngineCore 在 KV 接收完成的转型点取用
+# (见 recompute_scheduler._update_waiting_for_remote_kv). 用文件而不是 socket 的原因:
+# D 可能是 dp>1, 请求落在哪个 dp 组由 D 内部路由决定, proxy 无法按端口寻址到持有
+# 该请求的引擎; 而 spool 是共享的, 每个 rank 只认领自己等待的 req_id, 天然免疫错投.
+PTD_TOKEN_SPOOL_ROOT = os.getenv("PTD_TOKEN_SPOOL_ROOT", "/tmp/vllm_ptd_tokens")
+# 认领/清理的轮询间隔与条目过期时间.
+PTD_TOKEN_SPOOL_POLL_S = 0.005
+PTD_TOKEN_SPOOL_EXPIRE_S = 300.0
+# 缓存条目上限(按插入顺序淘汰, 长跑不涨内存).
+PTD_TOKEN_SPOOL_MAX_ENTRIES = 4096
+# vLLM 给 EngineCore request_id 追加的序号后缀形如 "-123456"(长度为 9), 见
+# get_external_request_id. 写侧(API server 的 header)与读侧(scheduler)用同一套
+# 规范化, 保证文件名一致.
+_ENGINE_CORE_SUFFIX_RE = re.compile(r"-\d{5}$")
+
+
+def _spool_key(request_id: str) -> str:
+    """把 API 侧或 EngineCore 侧的 request_id 规范化成同一个 spool 文件名."""
+    return _ENGINE_CORE_SUFFIX_RE.sub("", request_id)
+
 
 # 攒批层数: 模型完成 N 层任务后才统一做 D2H flush + 一次传输 + 一次
 # LAYER_DONE, 摊薄逐层传输的固定开销(批量 DMA / write 调用 / 控制消息).
@@ -105,6 +142,25 @@ _PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
 _PIPE_WRITER = os.getenv("MC_TCP_PIPE_WRITER", "0") == "1"
 # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
 _PIPE_DEPTH = int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
+
+
+def kv_transfer_params_zmq_port_base(vllm_config: VllmConfig) -> int:
+    """参数直连通道端口基址(p_then_d).
+
+    取 side-channel 端口段之后的整段(每 dp/pcp 分组 pcp_size*tp_size 个端口),
+    与 handshake 端口段(kv_port .. kv_port+dp*pcp*tp-1)不重叠. 这里只用
+    vllm_config 里的并行规模(不依赖分布式 group), 保证 Scheduler 侧(EngineCore)
+    也能算出同一个值; 每个 rank 实际绑的端口 = base + pcp_rank*tp_size + tp_rank,
+    见 MooncakeLayerwiseConnectorWorker 里的绑定.
+    """
+    parallel_config = vllm_config.parallel_config
+    pcp_size = parallel_config.prefill_context_parallel_size
+    tp_size = parallel_config.tensor_parallel_size
+    return (
+        vllm_config.kv_transfer_config.kv_port
+        + parallel_config.data_parallel_size * pcp_size * tp_size
+        + parallel_config.data_parallel_rank * pcp_size * tp_size
+    )
 
 
 def _perf_ms(t0: float) -> float:
@@ -156,6 +212,20 @@ class ReqMeta:
     # (host, port) -> 对端各层元数据 / TE rpc 端口
     peer_layer_metadata: dict[tuple[str, int], dict[str, LayerMetadata]] = field(default_factory=dict)
     peer_te_rpc_port: dict[tuple[str, int], int] = field(default_factory=dict)
+    # p_then_d: 请求在 P 侧先于 D 派发, 到达时请求里没有 D 参数(块表/侧信道地址),
+    # D 会通过直连参数通道事后推来 -> 本 ReqMeta 的 peer 解析推迟到发送线程.
+    # 注意 "peer_transfer 为空" 不等于 pending(cp 分组外的 rank 正常就是空),
+    # 必须用本显式标记.
+    awaiting_params: bool = False
+    # 延迟释放标记. **p_then_d 下恒为 False**: D 由 proxy 提前派发, 发送线程不再
+    # 长时间等参数, request_finished 也不再延迟释放块 —— 于是发送完成的收尾
+    # (add_done_sending_request → finished_sending)整条路径不再启用, 那正是
+    # worker.get_finished 里被丢弃、从来没能真正释放过块的那条路(块泄漏的根因).
+    # 保留字段是因为完成判据与发送路径共用它, 置 False 即可整体停用.
+    delayed_free: bool = False
+    # 该请求在本 step metadata 里的序号: cp 分组选择(cp_ratio>1)会用到, 延迟解析
+    # 时无法从迭代顺序重新推得, 故随 ReqMeta 携带.
+    req_idx: int = 0
 
 
 @dataclass
@@ -255,6 +325,7 @@ class _PipeJob:
     write 计时/失败信息并入完成队列; 发送线程在 drain 阶段按序发 LAYER_DONE
     (含请求级完成信息)并做 perf 收尾.
     """
+
     batch_id: int
     tasks: list[Any]
     sessions: list[tuple[str, "TransferMeta"]]
@@ -272,6 +343,144 @@ class _PipeJob:
     write_win1: float | None = None
     # session_id -> 该 session 写失败涉及的 req ids (与单线程版 ret<0 语义一致).
     failed: dict[str, list[str]] = field(default_factory=dict)
+
+
+class KVTransferParamsRecvingThread(threading.Thread):
+    """D→P 参数直连通道 (p_then_d): 接收 D 侧推来的 kv_transfer_params.
+
+    P 是第一跳(proxy 先发 P, P 生成首 token 后 proxy 才派发 D), P 前向时 D 还
+    不存在, 逐层传输所需的 D 参数(块表/侧信道地址/TP 规模/远端缓存命中数)只能
+    由 D 事后推给 P. 本线程每个 TP rank 一个, 绑
+    ``kv_port + dp_size*pcp_size*tp_size + dp_rank*pcp_size*tp_size
+    + pcp_rank*tp_size + tp_rank``(紧邻 side-channel 端口段之后, 不重叠);
+    D 侧按响应里的基址 + rank 序号逐个推.
+
+    收到即回 ACK(D 侧按 ACK 判达; 失败要当请求级失败, 否则没收到的 rank 会一直
+    等参数 —— D 侧没有请求级超时). 参数按 external request id 缓存, 发送线程在
+    需要时取(见 KVCacheSendingLayerThread.resolve_pending_req), 请求发送完成后
+    由 worker 弹出; 超期未用则丢弃, 避免长时间挂死请求把参数/内存留下.
+    """
+
+    def __init__(
+        self,
+        kv_transfer_params_zmq_port: int,
+        ready_event: threading.Event,
+        timeout: float,
+        wait_transfer_params_timeout_sec: float,
+        prefill_transfer_params_expire_sec: float,
+    ):
+        super().__init__(daemon=True, name="KVTransferParamsRecvingThread")
+        self.side_channel_host = get_ip()
+        self.kv_transfer_params_zmq_port = kv_transfer_params_zmq_port
+        self.lock = threading.Lock()
+        self.ready_event = ready_event
+        self.timeout = timeout
+        self.wait_transfer_params_timeout_sec = wait_transfer_params_timeout_sec
+        self.prefill_transfer_params_expire_sec = prefill_transfer_params_expire_sec
+        # external req id -> (params, expire_time)
+        self.kv_transfer_params: dict[str, tuple[dict[str, Any], float]] = {}
+        self._min_expire_time = 0.0
+
+    def run(self):
+        path = make_zmq_path("tcp", self.side_channel_host, self.kv_transfer_params_zmq_port)
+        logger.info("KVTransferParamsRecvingThread listening on %s", path)
+        decoder = msgspec.msgpack.Decoder(type=tuple)
+        with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
+            self.ready_event.set()
+            sock.setsockopt(zmq.SNDTIMEO, int(self.timeout * 1000))  # type: ignore
+            while True:
+                frames = None
+                try:
+                    frames = sock.recv_multipart()
+                    if len(frames) < 2:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+                    identity = frames[0]
+                    payload = [f for f in frames[1:] if f != b""]
+                    if len(payload) != 1:
+                        logger.error("Invalid message format: %s", frames)
+                        continue
+                    msg = decoder.decode(payload[0])
+                    if msg[0] != KV_TRANSFER_PARAMS_MSG:
+                        logger.error("KV transfer params thread got unexpected message %s", msg[0])
+                        continue
+                    external_req_id = msg[1]
+                    params = msg[2]
+                    logger.info(
+                        "Received decode transfer params for request %s: remote_host=%s remote_port=%s "
+                        "remote_tp_size=%s remote_block_ids=%s remote_cached_tokens=%s",
+                        external_req_id,
+                        params.get("remote_host"),
+                        params.get("remote_port"),
+                        params.get("remote_tp_size"),
+                        params.get("remote_block_ids"),
+                        params.get("remote_cached_tokens"),
+                    )
+                    self.set_kv_transfer_params(external_req_id, params)
+                    sock.send_multipart((identity, b"", b"ACK"))
+                except Exception as e:
+                    logger.error("Failed to handle kv transfer params message: %s. frames=%s", e, frames)
+
+    def set_kv_transfer_params(self, req_id: str, params: dict[str, Any]) -> None:
+        current_time = time.time()
+        expire_time = current_time + self.prefill_transfer_params_expire_sec
+        with self.lock:
+            self.kv_transfer_params[req_id] = (params, expire_time)
+            if self._min_expire_time == 0.0 or self._min_expire_time > expire_time:
+                self._min_expire_time = expire_time
+            self._clear_expired_locked(current_time)
+
+    def _clear_expired_locked(self, current_time: float) -> None:
+        """清扫过期参数(仅在持锁时调用, 用 min_expire_time 减少扫描次数)."""
+        if current_time < self._min_expire_time:
+            return
+        min_expire_time = 0.0
+        for req_id, (_params, expire_time) in list(self.kv_transfer_params.items()):
+            if current_time >= expire_time:
+                logger.warning(
+                    "KV transfer params for request %s expired after %ss",
+                    req_id,
+                    self.prefill_transfer_params_expire_sec,
+                )
+                self.kv_transfer_params.pop(req_id, None)
+                continue
+            if min_expire_time == 0.0 or min_expire_time > expire_time:
+                min_expire_time = expire_time
+        self._min_expire_time = min_expire_time
+
+    def wait_for_kv_transfer_params(self, req_id: str, timeout: float | None = None) -> dict[str, Any] | None:
+        """等某个请求的 D 参数; 超时返回 None(调用方决定失败语义).
+
+        只在发送线程调用(会阻塞). 返回的是缓存里的同一份 dict 引用, 调用方
+        合并进 ReqMeta 时不要再改它.
+        """
+        external_req_id = get_external_request_id(req_id)
+        deadline = time.perf_counter() + (self.wait_transfer_params_timeout_sec if timeout is None else timeout)
+        logged = False
+        while True:
+            current_time = time.time()
+            with self.lock:
+                self._clear_expired_locked(current_time)
+                entry = self.kv_transfer_params.get(external_req_id)
+            if entry is not None:
+                return entry[0]
+            now = time.perf_counter()
+            if now >= deadline:
+                return None
+            if not logged:
+                logged = True
+                logger.info(
+                    "Waiting for decode transfer params of request %s (timeout=%.1fs); "
+                    "D has not been dispatched yet (p_then_d flow).",
+                    external_req_id,
+                    deadline - now,
+                )
+            time.sleep(WAIT_TRANSFER_PARAMS_POLL_S)
+
+    def pop_kv_transfer_params(self, req_id: str) -> None:
+        external_req_id = get_external_request_id(req_id)
+        with self.lock:
+            self.kv_transfer_params.pop(external_req_id, None)
 
 
 class KVCacheSendingLayerThread(threading.Thread):
@@ -298,6 +507,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         enable_c8_quant: bool,
         resharding_stream: torch.npu.Stream,
         sender_path: str,
+        resolve_pending_req: Callable[[str, Any], bool] | None = None,
+        add_done_sending_request: Callable[[str], None] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         self.engine = engine
@@ -322,13 +533,22 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
         self.resharding_stream = resharding_stream
         self.current_layer = -1
+        # p_then_d: 发送线程在真正推送前解析等待中的 D 参数(worker.resolve_pending_req);
+        # 返回 False 表示该请求本批不可发(超时/解析失败).
+        self.resolve_pending_req = resolve_pending_req
+        # 上面回调判失败后, 由这里上报请求级发送完成(释放延迟释放的块).
+        self.add_done_sending_request = add_done_sending_request
 
         send_queue_size = 0
-        if self.pd_head_ratio != 1:
+        if self.pd_head_ratio != 1 and not envs.P_THEN_D:
             if self.use_attn_mamba_hybrid:
                 send_queue_size = len(self.kv_cache_specs)
             else:
                 send_queue_size = 1
+        # p_then_d + reshard/量化路径: 队列必须无界 —— 发送线程要等 D 参数(可能要
+        # 等整个 prefill 结束 + proxy 派发 D), 而有界队列的 put 会阻塞模型前向,
+        # 前向发不出响应 -> D 永远不会被派发 -> 死锁. 代价: 等待期间整个 prefill 的
+        # 逐层 reshard 结果(keys/values)留在显存里(见 save_kv_layer).
         self.send_queue = queue.Queue[SendTask](maxsize=send_queue_size)
         self.failed_reqs: set[str] = set()
         self.k_buffer = k_buffer
@@ -371,9 +591,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             # 启动独立写线程; 队列在 __init__ 已按 _PIPE_WRITER 创建.
             self._write_queue = queue.Queue(maxsize=_PIPE_DEPTH)  # type: ignore[assignment]
             self._done_queue = queue.Queue()  # type: ignore[assignment]
-            self._pipe_writer = threading.Thread(
-                target=self._pipe_writer_loop, daemon=True, name="KVCachePipeWriter"
-            )
+            self._pipe_writer = threading.Thread(target=self._pipe_writer_loop, daemon=True, name="KVCachePipeWriter")
             self._pipe_writer.start()
             logger.info("[mooncake][pipe] pipe writer thread started (depth=%d)", _PIPE_DEPTH)
         # 攒批: 攒满 _LAYER_BATCH 层、遇到最后层或层序号断裂(跨步/新任务)
@@ -407,6 +625,7 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _handle_batch(self, tasks: list[SendTask]):
         try:
+            self._resolve_pending_requests(tasks)
             if self.use_pipe_writer:
                 self._transfer_kv_cache_batch_pipe(tasks)
             else:
@@ -419,6 +638,66 @@ class KVCacheSendingLayerThread(threading.Thread):
             )
         if _PERF_LOG and not self.use_pipe_writer:
             self._last_batch_end_at = time.perf_counter()
+
+    def _resolve_pending_requests(self, tasks: list[SendTask]) -> None:
+        """p_then_d: 推送前解析本批里仍在等 D 参数的请求(每个 ReqMeta 只解析一次).
+
+        解析必须在本线程做: 模型线程要先把 P 的响应发出去 D 才会被派发, 所以它
+        不能等; 块的延迟释放(delayed_free)保证等待期间 KV 仍有效. 解析失败的请求
+        清空 peer 映射 —— 后续批的聚合自然跳过它, 不会再产出传输段 —— 并立即上报
+        请求级完成, 把块还给 scheduler(否则请求永远留在 Scheduler.requests 里).
+        """
+        if self.resolve_pending_req is None:
+            return
+        for send_task in tasks:
+            for req_id, req_meta in send_task.send_request.items():
+                if not req_meta.awaiting_params:
+                    continue
+                if self.resolve_pending_req(req_id, req_meta):
+                    # 解析成功即置位, 保证同一 ReqMeta 只解析一次(对齐缩放/兼容字段
+                    # 改写都不幂等); worker 侧也会置, 这里兜底.
+                    req_meta.awaiting_params = False
+                    continue
+                req_meta.peer_transfer = {}
+                req_meta.awaiting_params = False
+                self.failed_reqs.add(req_id)
+                if req_meta.delayed_free and self.add_done_sending_request is not None:
+                    self.add_done_sending_request(req_id)
+
+    def _release_delayed_requests(self, tasks: list[SendTask], transferred_reqs: set[str]) -> None:
+        """p_then_d: 本 rank 上逐层数据已发完的请求 -> 上报请求级发送完成.
+
+        只在「本批的 LAYER_DONE 已 ACK(或写失败已判定)」之后调用, 保证块不会在
+        数据面写出前被 scheduler 回收复用.
+
+        判据: 请求是延迟释放的、且是末轮(chunk_finish), 且本 rank 有数据的每个
+        group 的末层(group_max_layer_idx)都已处理过 —— 比只看最后一层更准: 本 rank
+        在末层所属 group 上没有数据的请求不会出现在末层任务里. 参数解析失败/无
+        peer 映射时退回"末层"判据 —— 失败请求同样要上报, 否则块永久泄漏.
+        """
+        if self.add_done_sending_request is None:
+            return
+        batch_max_layer = max((t.layer_idx for t in tasks), default=-1)
+        for send_task in tasks:
+            for req_id, req_meta in send_task.send_request.items():
+                if not req_meta.delayed_free or not req_meta.chunk_finish:
+                    continue
+                if req_id not in transferred_reqs:
+                    continue
+                groups = {
+                    group_idx
+                    for group_idx in range(len(self.kv_cache_specs))
+                    if any(blocks["local_block_ids"][group_idx] for blocks in req_meta.peer_transfer.values())
+                }
+                if groups:
+                    required_layer = max(
+                        self.group_max_layer_idx.get(group_idx, self.total_layers - 1) for group_idx in groups
+                    )
+                else:
+                    required_layer = self.total_layers - 1
+                if batch_max_layer < required_layer:
+                    continue
+                self.add_done_sending_request(req_id)
 
     def _group_end_of_task(self, send_task: SendTask) -> tuple[bool, int]:
         """本 rank 是否发完了该请求在本层所属 group 上的全部数据, 以及该 group 序号.
@@ -976,6 +1255,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                             # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
                             # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
                             self._send_done_signal(req_id, req_meta, layer_group_idx)
+        # p_then_d: 数据面已同步写出(LAYER_DONE ACK 后), 可以把延迟释放的块还给
+        # scheduler 了.
+        self._release_delayed_requests(tasks, transferred_reqs)
 
     # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, protocol=tcp 且非 reshard/量化) ----
     # 阶段归属: 发送线程 = 等事件 + D2H flush + 攒批; 写线程 = TCP write(数据面
@@ -1185,9 +1467,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             batch_ext_reqs = [get_external_request_id(r) for r in job.transferred_reqs]
             # 本批实际写出的 payload 字节(排除写失败的 session).
             batch_bytes = sum(
-                sum(meta.length)
-                for sid, meta in job.sessions
-                if len(meta.src) > 0 and sid not in job.failed
+                sum(meta.length) for sid, meta in job.sessions if len(meta.src) > 0 and sid not in job.failed
             )
 
             def _win_str(a: float | None, b: float | None) -> str:
@@ -1216,8 +1496,15 @@ class KVCacheSendingLayerThread(threading.Thread):
             for ext_req in batch_ext_reqs:
                 acc = self._perf_req.get(ext_req)
                 if acc is None:
-                    acc = {"t0": job.t_batch0, "batches": 0.0, "event": 0.0, "flush": 0.0,
-                           "write": 0.0, "layerdone": 0.0, "wait": 0.0}
+                    acc = {
+                        "t0": job.t_batch0,
+                        "batches": 0.0,
+                        "event": 0.0,
+                        "flush": 0.0,
+                        "write": 0.0,
+                        "layerdone": 0.0,
+                        "wait": 0.0,
+                    }
                     self._perf_req[ext_req] = acc
                 acc["batches"] += 1
                 acc["event"] += job.event_ms
@@ -1264,6 +1551,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                             # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
                             # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
                             self._send_done_signal(req_id, req_meta, layer_group_idx)
+        # p_then_d: 本批的 write 与 LAYER_DONE 都已完成(含最后层时是阻塞 drain 到
+        # 这里的), 可以释放延迟释放的块.
+        self._release_delayed_requests(job.tasks, job.transferred_reqs)
         if _PERF_LOG:
             # 批"处理结束"以 LAYER_DONE 全部发出计(与单线程版语义对齐).
             self._last_batch_end_at = time.perf_counter()
@@ -1589,8 +1879,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             # write/layerdone 窗口在同机时间线上对齐. H2D 单独
                             # 计时, 不计入 P 侧 H2H(write)统计.
                             logger.info(
-                                "[mooncake][perf] D batch layerdone reqs=%s ranges=%d h2d=%.1f "
-                                "total=%.1f ms t0=%.6f",
+                                "[mooncake][perf] D batch layerdone reqs=%s ranges=%d h2d=%.1f total=%.1f ms t0=%.6f",
                                 layer_req_ids,
                                 len(layer_dst_addrs),
                                 h2d_ms,
@@ -1635,10 +1924,14 @@ class MooncakeLayerwiseConnectorMetadata(KVConnectorMetadata):
         remote_cache_tokens: int = 0,
         local_computed_tokens: int = 0,
         local_transed_tokens: int = 0,
+        awaiting_params: bool = False,
+        delayed_free: bool = False,
     ):
         self.requests[request_id] = ReqMeta(
             token_ids=token_ids or [],
             local_block_ids=local_block_ids,
+            awaiting_params=awaiting_params,
+            delayed_free=delayed_free,
             remote_block_ids=kv_transfer_params.get("remote_block_ids", []),
             remote_block_size=kv_transfer_params.get("remote_block_size", []),
             remote_engine_id=kv_transfer_params.get("remote_engine_id"),
@@ -1892,6 +2185,9 @@ class MooncakeLayerwiseConnectorScheduler:
         return 0, False
 
     def update_state_after_alloc(self, request: "Request", blocks: "KVCacheBlocks", num_external_tokens: int):
+        # p_then_d 诊断: 从"请求被调度"到"块表推给 P"这一段是提前派发能否与前向重叠的
+        # 关键路径, 用 epoch 秒打点便于与 P 侧 "Waiting for decode transfer params" 对齐.
+        t_perf = time.perf_counter()
         params = request.kv_transfer_params
         logger.debug(
             "MooncakeLayerwiseConnector update_state_after_alloc: num_external_tokens=%s, kv_transfer_params=%s",
@@ -1937,15 +2233,45 @@ class MooncakeLayerwiseConnectorScheduler:
                 remote_cached_tokens=remote_cached_tokens,
             )
             if not do_virtual:
-                future = self.executor.submit(
-                    self._access_metaserver, url=params.get("metaserver", None), message=kv_transfer_params
-                )
+                p_params_zmq_port = params.get("kv_transfer_params_zmq_port")
+                remote_host = params.get("remote_host")
+                if p_params_zmq_port is not None and remote_host is None:
+                    logger.error(
+                        "Request %s carries kv_transfer_params_zmq_port but no remote_host; the prefill "
+                        "engine address is required to push decode params (p_then_d).",
+                        request.request_id,
+                    )
+                if p_params_zmq_port is not None and remote_host is not None:
+                    # p_then_d: 不经过 proxy metaserver, 直接把 D 的参数推给 P 的直连
+                    # 参数通道(每个 P rank 一份). P 是先被派发的一跳, 正等着这些参数
+                    # 才能开始逐层推送(见 KVTransferParamsRecvingThread).
+                    remote_pcp_size = params.get("remote_pcp_size", 1) or 1
+                    remote_tp_size = params.get("remote_tp_size", 1) or 1
+                    logger.debug(
+                        "[p_then_d] D push block table for %s: alloc->push=%.1f ms",
+                        request.request_id,
+                        (time.perf_counter() - t_perf) * 1e3,
+                    )
+                    for rank_idx in range(remote_pcp_size * remote_tp_size):
+                        # 每个 P rank 一份; 失败由 _push_kv_transfer_params 内部重试
+                        # 并打 error(它自己吞异常, 不往外抛).
+                        self.executor.submit(
+                            self._push_kv_transfer_params,
+                            remote_host=remote_host,
+                            remote_port=p_params_zmq_port + rank_idx,
+                            message=kv_transfer_params,
+                            req_id=request.request_id,
+                        )
+                else:
+                    future = self.executor.submit(
+                        self._access_metaserver, url=params.get("metaserver", None), message=kv_transfer_params
+                    )
 
-                def handle_exception(future):
-                    if future.exception():
-                        logger.error("Access metaserver fail. error=%s. ", future.exception())
+                    def handle_exception(future):
+                        if future.exception():
+                            logger.error("Access metaserver fail. error=%s. ", future.exception())
 
-                future.add_done_callback(handle_exception)
+                    future.add_done_callback(handle_exception)
 
         # Layerwise prefiller add request need send
         if params is not None and params.get("do_remote_decode"):
@@ -1953,7 +2279,20 @@ class MooncakeLayerwiseConnectorScheduler:
             logger.debug(
                 "MooncakeLayerwiseConnector update_state_after_alloc: add %s to need send queue", request.request_id
             )
-            remote_cache_tokens = params["remote_cached_tokens"]
+            # p_then_d: 请求里没有 D 的参数(块表/侧信道地址), 由 D 事后直连推来 ->
+            # 打标记, 逐层映射推迟到发送线程解析(worker.resolve_pending_req).
+            # 不变式: 标记与 _reqs_need_send_layerwise 在同一处设置, 所以打了标记的
+            # 请求一定会有 ReqMeta 进入 worker, 发送线程总有机会解析/超时后释放块.
+            pending_params = params.get("remote_block_ids") is None
+            if pending_params and not envs.P_THEN_D:
+                logger.error(
+                    "Request %s arrived without decoder kv_transfer_params but P_THEN_D is disabled; "
+                    "enable P_THEN_D on prefill engines for the p_then_d flow.",
+                    request.request_id,
+                )
+            if pending_params:
+                params["_p_then_d"] = True
+            remote_cache_tokens = params.get("remote_cached_tokens", 0) or 0
             local_transferred_tokens = remote_cache_tokens
             local_computed_tokens = 0
             self._reqs_need_send_layerwise[request.request_id] = SendReqInfo(
@@ -2018,16 +2357,23 @@ class MooncakeLayerwiseConnectorScheduler:
                             local_computed_tokens,
                             request,
                         ) = send_req_info.unpack()
+                        # remote_cached_tokens: p_then_d 下请求里还没有 D 的参数
+                        # (D 事后直连推来), 这里只能是 0; 真正的值在发送线程解析时
+                        # 合并进去(否则 None 会进 max()/除法直接 TypeError).
                         meta.add_new_req(
                             request_id=req_id,
                             local_block_ids=local_block_ids,
                             kv_transfer_params=request.kv_transfer_params,
                             token_ids=[],
                             chunk_finish=chunk_finish,
-                            remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens"),
+                            remote_cache_tokens=request.kv_transfer_params.get("remote_cached_tokens") or 0,
                             prompt_len=len(request.all_token_ids),
                             local_computed_tokens=local_computed_tokens,
                             local_transed_tokens=local_transed_tokens,
+                            awaiting_params=bool(request.kv_transfer_params.get("_p_then_d")),
+                            # delayed_free 恒为 False: p_then_d 由 proxy 提前派发 D,
+                            # 发送线程不再长时间等参数(request_finished 已不延迟释放).
+                            delayed_free=False,
                         )
                         if logger.isEnabledFor(logging.DEBUG):
                             logger.debug(
@@ -2065,6 +2411,84 @@ class MooncakeLayerwiseConnectorScheduler:
                 if retry == 3:
                     raise e
 
+    def _push_kv_transfer_params(self, remote_host: str, remote_port: int, message: dict, req_id: str) -> None:
+        """p_then_d: 把本 D 的参数推给某个 P rank 的直连参数通道(REQ→ROUTER + ACK).
+
+        P 是先派发的一跳, 正等这些参数(块表/侧信道地址)才能开始逐层推 KV;
+        每个 P rank 都要推一份 —— 某一 rank 收不到就不会回 LAYER_DONE, 而 D 侧
+        没有请求级超时, 该请求会一直停在 WAITING_FOR_REMOTE_KVS(只能等客户端
+        abort), 所以这里失败要重试并打 error, 让问题可见.
+        """
+        external_req_id = get_external_request_id(req_id)
+        path = make_zmq_path("tcp", remote_host, remote_port)
+        encoded_data = msgspec.msgpack.Encoder().encode((KV_TRANSFER_PARAMS_MSG, external_req_id, message))
+        timeout_sec = self.vllm_config.kv_transfer_config.get_from_extra_config("zmq_timeout_sec", 10)
+        max_retries = 3
+        for attempt in range(1, max_retries + 1):
+            try:
+                logger.info(
+                    "Sending decode transfer params for request %s to prefill %s:%d (attempt %d/%d)",
+                    external_req_id,
+                    remote_host,
+                    remote_port,
+                    attempt,
+                    max_retries,
+                )
+                with zmq_ctx(zmq.REQ, path) as sock:  # type: ignore
+                    timeout_ms = int(timeout_sec * 1000)
+                    sock.setsockopt(zmq.SNDTIMEO, timeout_ms)  # type: ignore
+                    sock.setsockopt(zmq.RCVTIMEO, timeout_ms)  # type: ignore
+                    sock.send(encoded_data)
+                    ack = sock.recv()
+                    if ack != b"ACK":
+                        raise RuntimeError(f"Unexpected ACK response: {ack}")
+                return
+            except Exception as e:
+                if attempt < max_retries:
+                    logger.warning(
+                        "Failed to send decode transfer params for request %s to %s:%d on attempt %d/%d: %s. "
+                        "Retrying...",
+                        external_req_id,
+                        remote_host,
+                        remote_port,
+                        attempt,
+                        max_retries,
+                        e,
+                    )
+                    time.sleep(0.1)
+                else:
+                    logger.error(
+                        "Failed to send decode transfer params for request %s to prefill %s:%d after %d attempts: %s. "
+                        "The request will stay in WAITING_FOR_REMOTE_KVS until the client aborts.",
+                        external_req_id,
+                        remote_host,
+                        remote_port,
+                        max_retries,
+                        e,
+                    )
+
+    def _p_then_d_send_params(self, request: "Request") -> dict[str, Any]:
+        """p_then_d: P 在自己响应里回给 proxy 的参数(proxy 再转给 D).
+
+        除了 entrypoint 补丁追加的 prefilled_token/stop_reasons/prompt_token_ids
+        (REUSE_PREFILLED_TOKENS/SKIP_DECODE_TOKENIZE), 这里要给出 D 找到本 P 并
+        把 D 自己参数推过来所需的信息: 主机、TP/PCP 规模、参数直连通道基址
+        (D 按 base+rank_idx 逐个推, 见 KVTransferParamsRecvingThread)、引擎 id.
+        必须非空: entrypoint 补丁用 ``if final_res.kv_transfer_params:`` 区分 P/D
+        分支, 空 dict 会让 P 侧走进"复用 D 首 token"的分支.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        return dict(
+            do_remote_prefill=False,
+            do_remote_decode=True,
+            remote_engine_id=self.engine_id,
+            remote_host=self.side_channel_host,
+            remote_tp_size=parallel_config.tensor_parallel_size,
+            remote_pcp_size=parallel_config.prefill_context_parallel_size,
+            remote_dcp_size=parallel_config.decode_context_parallel_size,
+            kv_transfer_params_zmq_port=kv_transfer_params_zmq_port_base(self.vllm_config),
+        )
+
     def request_finished(
         self,
         request: "Request",
@@ -2074,6 +2498,16 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        params = request.kv_transfer_params
+        if params is not None and params.get("_p_then_d"):
+            # p_then_d: 参数要回给 proxy 转发(proxy 用它派发 D / 兜底发现 P 的身份),
+            # 但**块不再延迟释放**: D 由 proxy 提前派发(块表在 P 前向期间就推来),
+            # 发送线程不再长时间阻塞, 滞后回到 D-first 的量级; 而数据面读的是
+            # CPU staging, 一旦 D2H flush 落地, NPU 块被复用不影响已发出的数据.
+            # 延迟释放的前提(等参数期间块必须有效)已不成立, 而它依赖的
+            # finished_sending 上报路径在 worker.get_finished 里被丢弃 —— 继续延迟
+            # 只会让请求永久留在 Scheduler.requests 里(块泄漏).
+            return False, self._p_then_d_send_params(request)
         # layer_wise push, not need delay_free_blocks
         return False, None
 
@@ -2086,8 +2520,36 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
+        params = request.kv_transfer_params
+        if params is not None and params.get("_p_then_d"):
+            # 同 request_finished: HMA 路径(本连接器实现 SupportsHMA)走这里.
+            return False, self._p_then_d_send_params(request)
         # layer_wise push, not need delay_free_blocks
         return False, None
+
+    def prefilled_token_spool_dir(self, request: "Request") -> str | None:
+        """p_then_d: 首 token 的 spool 目录(请求没带 kv_port 时返回 None).
+
+        目录按 P 的 kv_port 分: 同机多实例各自一份; 写侧(API server)与读侧
+        (EngineCore)都用请求里同一份 kv_port 推出来, 不需要额外的环境约定。
+        """
+        params = request.kv_transfer_params
+        kv_port = params.get("kv_port") if params else None
+        if kv_port is None:
+            return None
+        return os.path.join(PTD_TOKEN_SPOOL_ROOT, str(kv_port))
+
+    def deliver_prefilled_token(self, request: "Request", timeout: float) -> dict[str, Any] | None:
+        """p_then_d: 等 proxy 把首 token 投递到 spool(超时返回 None).
+
+        只在 D 的 scheduler 线程调用, 且只在 KV 接收完成、请求即将离开
+        WAITING_FOR_REMOTE_KVS 时 —— 此时 P 早已出首 token, 正常情况下 spool 里
+        已经有记录(proxy 在拿到首 token 后、驱动 D 的响应流之前就投递了)。
+        """
+        spool_dir = self.prefilled_token_spool_dir(request)
+        if spool_dir is None:
+            return None
+        return get_prefilled_token_spool(spool_dir).wait_for_prefilled_token(request.request_id, timeout)
 
 
 class MooncakeLayerwiseConnectorWorker:
@@ -2142,6 +2604,30 @@ class MooncakeLayerwiseConnectorWorker:
         self.kv_recv_layer_thread: KVCacheRecvingLayerThread | None = None
         self.kv_send_layer_thread: KVCacheSendingLayerThread | None = None
 
+        # p_then_d: D→P 参数直连通道(P 侧监听; D 派发后把块表/侧信道地址推过来).
+        self.params_recv_thread: KVTransferParamsRecvingThread | None = None
+        self.wait_transfer_params_timeout_sec = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "prefill", {"wait_transfer_params_timeout_sec": DEFAULT_WAIT_TRANSFER_PARAMS_TIMEOUT_SEC}
+            ).get("wait_transfer_params_timeout_sec", DEFAULT_WAIT_TRANSFER_PARAMS_TIMEOUT_SEC)
+        )
+        self.prefill_transfer_params_expire_sec = float(
+            vllm_config.kv_transfer_config.get_from_extra_config(
+                "prefill", {"prefill_transfer_params_expire_sec": DEFAULT_PREFILL_TRANSFER_PARAMS_EXPIRE_SEC}
+            ).get("prefill_transfer_params_expire_sec", DEFAULT_PREFILL_TRANSFER_PARAMS_EXPIRE_SEC)
+        )
+        # 延迟释放块的上报集合(delayed_free 请求): get_finished 报给 scheduler,
+        # 由它走 finished_sending 释放(见 _free_blocks).
+        self.done_sending: set[str] = set()
+        # 已上报过的请求(去重): 一个请求可能在多个 step 满足"末轮 + group 末层"判据
+        # (prefill 步与随后的 decode 步都会), 重复上报会让 scheduler 的
+        # ``assert req_id in self.requests`` 直接炸掉引擎. 有界(长跑不涨内存).
+        self._reported_done_sending: dict[str, bool] = SizedDict(max_size=16000)
+        self.done_sending_lock = threading.Lock()
+        # 对端元数据/GET_META 的互斥: p_then_d 下发送线程也会拉远端元数据,
+        # 与模型线程(save_kv_layer->update_decoder_info)共享 socket/缓存.
+        self.remote_meta_lock = threading.Lock()
+
         self.block_size: list[int] = [spec.block_size for spec in self.kv_cache_specs]
         self.kernel_block_size_scale: list[int] = [1 for _ in range(self.num_kv_cache_groups)]
         self.layer_metadata: dict[str, LayerMetadata] = {}
@@ -2159,7 +2645,6 @@ class MooncakeLayerwiseConnectorWorker:
         if self.pd_head_ratio > 1 or self.enable_kv_quant or self.enable_c8_quant:
             self.resharding_stream = torch.npu.Stream()
 
-        self.remote_poller = zmq.Poller()  # type: ignore
         self.decoder = msgspec.msgpack.Decoder(MooncakeAgentMetadata)
         self.encoder = msgspec.msgpack.Encoder()
 
@@ -2172,7 +2657,6 @@ class MooncakeLayerwiseConnectorWorker:
         ] = defaultdict(  # type: ignore
             deque
         )
-        self.remote_poller = zmq.Poller()  # type: ignore
         self.timeout = 1.0  # seconds
         self.k_buffer: torch.Tensor | None = None
         self.v_buffer: torch.Tensor | None = None
@@ -2392,6 +2876,21 @@ class MooncakeLayerwiseConnectorWorker:
             layer_metadata=self.layer_metadata,
         )
         if self.vllm_config.kv_transfer_config.is_kv_producer:
+            # p_then_d: 参数直连通道线程(D 派发后把块表/侧信道地址推过来). 无论是否
+            # 用 p_then_d 都起(端口固定, 不占资源); 只有"请求里没有 D 参数"的请求会
+            # 真的用到它.
+            params_recv_ready = threading.Event()
+            self.params_recv_thread = KVTransferParamsRecvingThread(
+                kv_transfer_params_zmq_port=kv_transfer_params_zmq_port_base(self.vllm_config)
+                + self.pcp_rank * self.tp_size
+                + self.tp_rank,
+                ready_event=params_recv_ready,
+                timeout=self.timeout,
+                wait_transfer_params_timeout_sec=self.wait_transfer_params_timeout_sec,
+                prefill_transfer_params_expire_sec=self.prefill_transfer_params_expire_sec,
+            )
+            self.params_recv_thread.start()
+            params_recv_ready.wait()
             ready_event = threading.Event()
             self.kv_send_layer_thread = KVCacheSendingLayerThread(
                 engine=self.engine,
@@ -2415,6 +2914,8 @@ class MooncakeLayerwiseConnectorWorker:
                 enable_c8_quant=self.enable_c8_quant,
                 resharding_stream=self.resharding_stream,
                 sender_path=f"{self.side_channel_host}:{self.handshake_port}",
+                resolve_pending_req=self.resolve_pending_req,
+                add_done_sending_request=self.add_done_sending_request,
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -2433,7 +2934,36 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
+    def add_done_sending_request(self, req_id: str) -> None:
+        """上报"本 rank 已发完该请求" -> scheduler 走 finished_sending 释放块.
+
+        只对 delayed_free 的请求调用; p_then_d 下 delayed_free 恒为 False(块由
+        request_finished 直接释放), 因此本函数当前无调用者, 保留是为了将来若某条
+        路径需要延迟释放时能直接用. 注意: **报一个没有延迟释放的请求 ID 会让
+        scheduler 的 ``assert req_id in self.requests`` 直接炸掉引擎**, 而
+        worker.get_finished 目前也并未把 done_sending 返回给 scheduler.
+        """
+        with self.done_sending_lock:
+            if req_id in self._reported_done_sending:
+                return
+            self._reported_done_sending[req_id] = True
+            self.done_sending.add(req_id)
+        if self.params_recv_thread is not None:
+            # 请求发完, 参数缓存不再需要(防长时间挂着的内存/状态).
+            self.params_recv_thread.pop_kv_transfer_params(req_id)
+
+    def get_and_clear_done_sending(self) -> set[str]:
+        with self.done_sending_lock:
+            done_sending = self.done_sending
+            self.done_sending = set()
+        return done_sending
+
     def get_finished(self) -> tuple[set[str], set[str]]:
+        done_sending = (
+            self.get_and_clear_done_sending() if self.vllm_config.kv_transfer_config.is_kv_producer else set()
+        )
+        if len(done_sending) > 0:
+            logger.info("Number of completed KV cache send requests: %s", done_sending)
         done_recving = (
             self.kv_recv_layer_thread.get_and_clear_done_requests(  # type: ignore[union-attr]
             )
@@ -2461,6 +2991,10 @@ class MooncakeLayerwiseConnectorWorker:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
             )
+        # 注意: done_sending 只用于日志, **不返回给 scheduler**. scheduler 的
+        # finished_sending 分支有 assert req_id in self.requests, 而无主上报
+        # (请求早已释放)会直接把 EngineCore 打挂; layerwise push 的块不延迟释放,
+        # 也就不需要这条上报. p_then_d 下 delayed_free 同样恒为 False, 无调用者.
         return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -2636,6 +3170,136 @@ class MooncakeLayerwiseConnectorWorker:
                 ]
         return block_ids
 
+    def _check_pending_params_supported(self, req_id: str) -> None:
+        """p_then_d 延迟解析的支持范围检查(只对等待参数的请求).
+
+        cp 开启时本 rank 在请求上的块只是全量块表的一个子集, 兜底块表(见
+        start_load_kv 的 reshard 部分)会多算 —— 未验证组合, 直接报错.
+        """
+        if self.pcp_size > 1 or self.dcp_size > 1:
+            logger.error(
+                "p_then_d with prefill/decode context parallel is not supported (request %s); "
+                "use pcp_size=dcp_size=1 for the deferred send path.",
+                req_id,
+            )
+
+    def _resolve_send_mapping(self, req_id: str, req_meta: ReqMeta) -> None:
+        """按 ReqMeta 里的 D 参数算出逐 peer 传输映射(peer_transfer).
+
+        抽自 start_load_kv 的生产者分支: p_then_d 下 D 参数后到, 同一段逻辑要由发送
+        线程在参数到达后调用(见 resolve_pending_req), 因此不能再依赖 start_load_kv
+        的局部变量.
+
+        注意(每个 ReqMeta 只能解析一次):
+        * ``_align_remote_block_ids`` 就地缩放 remote_block_ids 且不幂等;
+        * 末尾的兼容字段会把 remote_host/remote_port 改写成第一个 peer, 二次解析
+          会让 mamba 分支(取 remote_port + tp_rank//tp_ratio)指到错误的侧信道端口.
+        peer_transfer 整体换入(不就地改), 避免模型线程迭代到半成品 dict.
+        """
+        transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
+        self._align_remote_block_ids(req_meta)
+        for i, kv_cache_spec in enumerate(self.kv_cache_specs):
+            if isinstance(kv_cache_spec, MambaSpec):
+                single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
+                    req_meta, req_meta.req_idx, req_id, i
+                )
+            else:
+                single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_meta.req_idx, req_id, i)
+            for (host, port), block_dict in single_group_transfer_mappings.items():
+                if (host, port) not in transfer_mappings:
+                    transfer_mappings[(host, port)] = {
+                        "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                        "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
+                        "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
+                    }
+                transfer_mappings[(host, port)]["local_block_ids"][i].extend(
+                    single_group_transfer_mappings[(host, port)]["local_block_ids"]
+                )
+                transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
+                    single_group_transfer_mappings[(host, port)]["remote_block_ids"]
+                )
+                transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[(host, port)][
+                    "trans_count"
+                ]
+        # 一个请求的 KV 可能按 group 落到多个 D rank(见 ReqMeta.peer_transfer 注释),
+        # 这里全部记下来, 发送线程按 (peer, group) 分别推送.
+        peer_transfer: dict[tuple[str, int], dict[str, Any]] = {}
+        for (host, port), block_dict in transfer_mappings.items():
+            peer_transfer[(host, port)] = {
+                "local_block_ids": self._get_kernel_block_ids(block_dict["local_block_ids"]),
+                "remote_block_ids": self._get_kernel_block_ids(block_dict["remote_block_ids"]),
+                "trans_count": block_dict["trans_count"],
+            }
+        req_meta.peer_transfer = peer_transfer
+        # 兼容字段(日志/旧路径): 指向第一个 peer.
+        first_peer = next(iter(peer_transfer), None)
+        if first_peer is not None:
+            req_meta.remote_host, req_meta.remote_port = first_peer
+            req_meta.local_block_ids = peer_transfer[first_peer]["local_block_ids"]
+            req_meta.remote_block_ids = peer_transfer[first_peer]["remote_block_ids"]
+            req_meta.trans_count = peer_transfer[first_peer]["trans_count"]
+
+    def _merge_decoder_params(self, req_meta: ReqMeta, params: dict[str, Any]) -> None:
+        """把 D 直连推来的参数合并进 ReqMeta(p_then_d).
+
+        键名与"proxy 转发 D 参数"路径完全一致(见 scheduler.update_state_after_alloc
+        里构造的 kv_transfer_params), 因此后续映射逻辑无需区分来源.
+        """
+        req_meta.remote_block_ids = list(params.get("remote_block_ids", []) or [])
+        req_meta.remote_block_size = params.get("remote_block_size", [])
+        req_meta.remote_engine_id = params.get("remote_engine_id")
+        req_meta.remote_host = params.get("remote_host")
+        req_meta.remote_port = params.get("remote_port")
+        req_meta.remote_te_rpc_port = params.get("remote_te_rpc_port")
+        # 层元数据/te 端口通常不在参数里(D 侧 GET_META 现取), 但允许内联.
+        if params.get("remote_layer_metadata"):
+            req_meta.remote_layer_metadata = params["remote_layer_metadata"]
+        req_meta.metaserver = params.get("metaserver")
+        req_meta.remote_tp_size = params.get("remote_tp_size")
+        req_meta.remote_pcp_size = params.get("remote_pcp_size")
+        req_meta.remote_dcp_size = params.get("remote_dcp_size")
+        req_meta.do_virtual = params.get("do_virtual")
+        req_meta.remote_cache_tokens = params.get("remote_cached_tokens", 0) or 0
+
+    def resolve_pending_req(self, req_id: str, req_meta: ReqMeta) -> bool:
+        """p_then_d: 发送线程在推送前解析等待中的 D 参数. 返回是否解析成功.
+
+        失败语义(调用方负责把该请求的层任务丢弃 + 上报请求级完成): 只 log 不抛,
+        否则异常会冒到 _handle_batch 的兜底 catch, 把整批所有请求的层任务一起丢掉,
+        而 D 侧可能凭 group-end 的完成信息提前放行 —— 静默乱码.
+        """
+        assert self.params_recv_thread is not None
+        start_time = time.perf_counter()
+        params = self.params_recv_thread.wait_for_kv_transfer_params(req_id)
+        if params is None:
+            logger.error(
+                "Timeout waiting %ss for decode transfer params of request %s; drop its KV transfer. "
+                "The decode engine was never dispatched (or failed to push params).",
+                self.wait_transfer_params_timeout_sec,
+                get_external_request_id(req_id),
+            )
+            return False
+        try:
+            self._merge_decoder_params(req_meta, params)
+            self._resolve_send_mapping(req_id, req_meta)
+            # GET_META: 取 D 的 CPU staging 层元数据与 TE 端口(按 engine+port 缓存).
+            self.update_decoder_info(req_id, req_meta)
+        except Exception as e:
+            logger.error(
+                "Failed to resolve decode transfer params for request %s: %s", get_external_request_id(req_id), e
+            )
+            req_meta.peer_transfer = {}
+            return False
+        # 换入完成后再清等待标记: 模型线程以该标记决定是否跳过 peer 判断.
+        req_meta.awaiting_params = False
+        logger.info(
+            "Resolved decode transfer params for request %s in %.1f ms (peers=%s)",
+            get_external_request_id(req_id),
+            _perf_ms(start_time),
+            list(req_meta.peer_transfer.keys()),
+        )
+        return True
+
     def start_load_kv(self, metadata: MooncakeLayerwiseConnectorMetadata):
         """Start loading KV blocks from remote engine."""
         self.current_layer = 0
@@ -2652,51 +3316,20 @@ class MooncakeLayerwiseConnectorWorker:
             # update trans info
             update_metadata = {}
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
-                transfer_mappings: dict[tuple[str, int], dict[str, Any]] = {}
-                self._align_remote_block_ids(req_meta)
-                for i, kv_cache_spec in enumerate(self.kv_cache_specs):
-                    if isinstance(kv_cache_spec, MambaSpec):
-                        single_group_transfer_mappings = self._get_kv_split_metadata_for_mamba(
-                            req_meta, req_idx, req_id, i
-                        )
-                    else:
-                        single_group_transfer_mappings = self._get_kv_split_metadata(req_meta, req_idx, req_id, i)
-                    for (host, port), block_dict in single_group_transfer_mappings.items():
-                        if (host, port) not in transfer_mappings:
-                            transfer_mappings[(host, port)] = {
-                                "local_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
-                                "remote_block_ids": [[] for _ in range(self.num_kv_cache_groups)],
-                                "trans_count": [0 for _ in range(self.num_kv_cache_groups)],
-                            }
-                        transfer_mappings[(host, port)]["local_block_ids"][i].extend(
-                            single_group_transfer_mappings[(host, port)]["local_block_ids"]
-                        )
-                        transfer_mappings[(host, port)]["remote_block_ids"][i].extend(
-                            single_group_transfer_mappings[(host, port)]["remote_block_ids"]
-                        )
-                        transfer_mappings[(host, port)]["trans_count"][i] = single_group_transfer_mappings[
-                            (host, port)
-                        ]["trans_count"]
-                # 一个请求的 KV 可能按 group 落到多个 D rank(见 ReqMeta.peer_transfer
-                # 注释), 这里全部记下来, 发送线程按 (peer, group) 分别推送.
+                # 冻结本 step 的块表快照: ReqMeta.local_block_ids 在 scheduler 侧是
+                # SendReqInfo 的引用且会随 step 增长, 而逐层任务与(延迟)解析都要用
+                # 本 step 当时的口径 —— align 模式下 mamba 状态块下标
+                # (len-num_spec-1) 与 D 侧固定长度的块表必须严格对齐.
                 update_req_meta = copy.deepcopy(req_meta)
-                for (host, port), block_dict in transfer_mappings.items():
-                    update_req_meta.peer_transfer[(host, port)] = {
-                        "local_block_ids": self._get_kernel_block_ids(block_dict["local_block_ids"]),
-                        "remote_block_ids": self._get_kernel_block_ids(block_dict["remote_block_ids"]),
-                        "trans_count": block_dict["trans_count"],
-                    }
-                # 兼容字段(日志/旧路径): 指向第一个 peer.
-                first_peer = next(iter(update_req_meta.peer_transfer), None)
-                if first_peer is not None:
-                    update_req_meta.remote_host, update_req_meta.remote_port = first_peer
-                    update_req_meta.local_block_ids = update_req_meta.peer_transfer[first_peer]["local_block_ids"]
-                    update_req_meta.remote_block_ids = update_req_meta.peer_transfer[first_peer]["remote_block_ids"]
-                    update_req_meta.trans_count = update_req_meta.peer_transfer[first_peer]["trans_count"]
+                update_req_meta.req_idx = req_idx
+                if req_meta.awaiting_params:
+                    # p_then_d: D 参数还没到(P 先于 D 派发), peer 解析推迟到发送线程
+                    # (见 resolve_pending_req).
+                    self._check_pending_params_supported(req_id)
+                else:
+                    self._resolve_send_mapping(req_id, update_req_meta)
                 update_metadata[req_id] = update_req_meta
-            metadata.requests = {}
-            for req_id, req_meta in update_metadata.items():
-                metadata.requests[req_id] = update_metadata[req_id]
+            metadata.requests = update_metadata
 
             # update send task trans block info
             if self.pd_head_ratio != 1 or self.enable_kv_quant or self.enable_c8_quant:
@@ -2711,16 +3344,24 @@ class MooncakeLayerwiseConnectorWorker:
                 for i in self.attn_resharding_group_idx:
                     # 多 peer 下同一 group 的 block 可能记在不同 peer 名下(兼容字段
                     # local_block_ids 只指向第一个 peer), 这里取所有 peer 的并集.
-                    send_task.group_rearrange_block_ids[i].extend(
-                        sorted(
-                            {
-                                block_id
-                                for req_meta in metadata.requests.values()
-                                for peer_blocks in req_meta.peer_transfer.values()
-                                for block_id in peer_blocks["local_block_ids"][i]
-                            }
+                    rearrange_block_ids: set[int] = set()
+                    for req_meta in metadata.requests.values():
+                        if req_meta.awaiting_params:
+                            # p_then_d: peer 还没解析, 但 reshard 必须在模型前向里
+                            # 当场做完(gather + alltoall, 结果落在本层任务自己的
+                            # keys/values 张量上) —— 于是用本请求自己的本地块(kernel
+                            # 口径)兜底: 本 rank 在该 group 要发的块必是它的子集,
+                            # 多算只是白做 reshard, 索引与张量同源仍自洽, 传输侧由
+                            # 映射(peer_transfer)过滤.
+                            local_block_ids = self._get_kernel_block_ids(copy.deepcopy(req_meta.local_block_ids))
+                            rearrange_block_ids.update(local_block_ids[i])
+                            continue
+                        rearrange_block_ids.update(
+                            block_id
+                            for peer_blocks in req_meta.peer_transfer.values()
+                            for block_id in peer_blocks["local_block_ids"][i]
                         )
-                    )
+                    send_task.group_rearrange_block_ids[i].extend(sorted(rearrange_block_ids))
                     flat_block_ids = send_task.group_rearrange_block_ids[i]
                     block_ids_tensor = torch.tensor(flat_block_ids, dtype=torch.int32, device=device)
                     send_task.group_num_blocks[i] = len(flat_block_ids)
@@ -2816,9 +3457,7 @@ class MooncakeLayerwiseConnectorWorker:
                 if self.pd_head_ratio != 1:
                     # sort kv caches for each block
                     keys = (
-                        keys.view(
-                            send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:]
-                        )
+                        keys.view(send_task.group_num_blocks[layer_group_idx], self.pd_head_ratio, -1, *keys.shape[1:])
                         .transpose(0, 1)
                         .reshape_as(keys)
                     )
@@ -2848,10 +3487,7 @@ class MooncakeLayerwiseConnectorWorker:
                     ).to(torch.int8)
                     quant_keys = self.get_nz_cache(quant_keys, layer_group_idx)
                     quant_values = self.get_nz_cache(quant_values, layer_group_idx)
-                if (
-                    self.enable_kv_quant
-                    and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers
-                ):
+                if self.enable_kv_quant and self.current_layer in self.vllm_config.quant_config.kvcache_quant_layers:
                     layer = self.vllm_config.compilation_config.static_forward_context[layer_name]
                     keys = torch.ops.vllm.quantize(
                         keys, layer.fak_descale, layer.fak_descale_reciprocal, layer.fak_offset
@@ -2879,10 +3515,14 @@ class MooncakeLayerwiseConnectorWorker:
                 group_rearrange_block_ids=send_task.group_rearrange_block_ids,
             )
             for req_id, req_meta in connector_metadata.requests.items():
+                if req_meta.awaiting_params:
+                    # p_then_d: D 参数还没到, peer_transfer 还是空的 —— 只挂任务,
+                    # 不判断 group/不 GET_META(发送线程解析后再按映射过滤本层).
+                    # 这里刻意不迭代 peer_transfer: 发送线程稍后会整体换入新 dict.
+                    layer_send_task.send_request[req_id] = req_meta
+                    continue
                 # 多 peer 下本层的 group 可能只落在其中某个 peer 上, 要按所有 peer 判断.
-                if not any(
-                    blocks["local_block_ids"][layer_group_idx] for blocks in req_meta.peer_transfer.values()
-                ):
+                if not any(blocks["local_block_ids"][layer_group_idx] for blocks in req_meta.peer_transfer.values()):
                     continue
                 try:
                     req_meta_update = self.update_decoder_info(req_id, req_meta)
@@ -2937,7 +3577,8 @@ class MooncakeLayerwiseConnectorWorker:
                 zmq.SNDTIMEO,  # type: ignore
                 int(self.timeout * 1000),
             )
-            self.remote_poller.register(sock, zmq.POLLIN)  # type: ignore
+            # 不再注册到共享 poller: GET_META 的收包用调用方自己的 poller
+            # (zmq.Poller 非线程安全), 共享 poller 只会在每次建连时白记一项.
             return sock
 
     def update_decoder_info(self, req_id, req_meta: ReqMeta):
@@ -2953,65 +3594,76 @@ class MooncakeLayerwiseConnectorWorker:
         return req_meta
 
     def _ensure_peer_metadata(self, req_id, req_meta: ReqMeta, remote_host: str, remote_port: int):
-        """拉取某个对端(host, port)的 KV 元信息(带缓存), 不等 TP 时预建链路."""
+        """拉取某个对端(host, port)的 KV 元信息(带缓存), 不等 TP 时预建链路.
+
+        整段(查缓存 → GET_META → 写缓存 → 预建链路)持 remote_meta_lock: p_then_d
+        下发送线程也会走这里, 与模型线程共享 remote_layer_metadata(SizedDict 会
+        插入/淘汰)与 socket. GET_META 用本次调用私有的 poller(并把本次的 socket
+        注册进去)—— zmq.Poller 的 register/poll 不是线程安全的, 不能共享.
+        """
         peer = (remote_host, remote_port)
-        if remote_port not in self.remote_layer_metadata[req_meta.remote_engine_id]:
-            try:
-                encoded_data = self.encoder.encode((GET_META_MSG, req_id))
-                sock = self._get_remote_socket(remote_host, remote_port)
-                path = f"{remote_host}:{remote_port}"
-                ensure_zmq_send(sock, encoded_data, path)
-                metadata_bytes = ensure_zmq_recv(sock, self.remote_poller, path)
-                agent_meta: MooncakeAgentMetadata = self.decoder.decode(metadata_bytes)
-            except Exception as e:
-                logger.error(
-                    "Query to port and kv base addr for request fail. req_id=%s, source=%s:%s, error=%s. ",
+        with self.remote_meta_lock:
+            if remote_port not in self.remote_layer_metadata[req_meta.remote_engine_id]:
+                try:
+                    encoded_data = self.encoder.encode((GET_META_MSG, req_id))
+                    sock = self._get_remote_socket(remote_host, remote_port)
+                    path = f"{remote_host}:{remote_port}"
+                    ensure_zmq_send(sock, encoded_data, path)
+                    poller: zmq.Poller = zmq.Poller()  # type: ignore
+                    poller.register(sock, zmq.POLLIN)  # type: ignore
+                    metadata_bytes = ensure_zmq_recv(sock, poller, path)
+                    agent_meta: MooncakeAgentMetadata = self.decoder.decode(metadata_bytes)
+                except Exception as e:
+                    logger.error(
+                        "Query to port and kv base addr for request fail. req_id=%s, source=%s:%s, error=%s. ",
+                        req_id,
+                        remote_host,
+                        remote_port,
+                        e,
+                    )
+                    raise e
+                assert req_meta.remote_engine_id != self.engine_id, (
+                    f"Conflict engine id {req_meta.remote_engine_id} with local engine id {self.local_engine_id}."
+                )
+                self.remote_layer_metadata[req_meta.remote_engine_id][remote_port] = agent_meta.layer_metadata
+                self.remote_te_port[req_meta.remote_engine_id][remote_port] = agent_meta.te_rpc_port
+                logger.debug(
+                    "Query to port and kv base addr for request %s from %s:%s success "
+                    "agent_meta.layer_metadata=%r agent_meta.te_rpc_port=%r",
                     req_id,
                     remote_host,
                     remote_port,
-                    e,
+                    agent_meta.layer_metadata,
+                    agent_meta.te_rpc_port,
                 )
-                raise e
-            assert req_meta.remote_engine_id != self.engine_id, (
-                f"Conflict engine id {req_meta.remote_engine_id} with local engine id {self.local_engine_id}."
-            )
-            self.remote_layer_metadata[req_meta.remote_engine_id][remote_port] = agent_meta.layer_metadata
-            self.remote_te_port[req_meta.remote_engine_id][remote_port] = agent_meta.te_rpc_port
-            logger.debug(
-                "Query to port and kv base addr for request %s from %s:%s success "
-                "agent_meta.layer_metadata=%r agent_meta.te_rpc_port=%r",
-                req_id,
-                remote_host,
-                remote_port,
-                agent_meta.layer_metadata,
-                agent_meta.te_rpc_port,
-            )
-            if self.pd_head_ratio > 1:
-                # for tp inequal, pre-create link to prevent alltoall out of memory
-                session_id = f"{remote_host}:{agent_meta.te_rpc_port}"
-                first_layer_name = next(iter(self.layer_metadata.keys()))
-                local_base_addr = self.layer_metadata[first_layer_name].kv_caches_base_addr[0]
-                if global_te.use_tcp:
-                    # TCP 数据面只能读注册过的 host 内存: 先把这 128B flush 到
-                    # CPU staging, 再用 staging 地址做 src(与逐层传输的 src
-                    # 替换语义一致). 目的地址是 consumer 发布的 staging 地址.
-                    global_te.sync_npu_to_cpu_for_npu_addrs([local_base_addr], [128])
-                    staging_base_addr = global_te.npu_addr_to_cpu_addr(local_base_addr)
-                    if staging_base_addr is None:
-                        raise RuntimeError(
-                            f"H2H layerwise: pre-create link src 0x{local_base_addr:x} not found in TCP staging map."
+                if self.pd_head_ratio > 1:
+                    # for tp inequal, pre-create link to prevent alltoall out of memory
+                    session_id = f"{remote_host}:{agent_meta.te_rpc_port}"
+                    first_layer_name = next(iter(self.layer_metadata.keys()))
+                    local_base_addr = self.layer_metadata[first_layer_name].kv_caches_base_addr[0]
+                    if global_te.use_tcp:
+                        # TCP 数据面只能读注册过的 host 内存: 先把这 128B flush 到
+                        # CPU staging, 再用 staging 地址做 src(与逐层传输的 src
+                        # 替换语义一致). 目的地址是 consumer 发布的 staging 地址.
+                        global_te.sync_npu_to_cpu_for_npu_addrs([local_base_addr], [128])
+                        staging_base_addr = global_te.npu_addr_to_cpu_addr(local_base_addr)
+                        if staging_base_addr is None:
+                            raise RuntimeError(
+                                f"H2H layerwise: pre-create link src 0x{local_base_addr:x} not in TCP staging map."
+                            )
+                        local_base_addr = staging_base_addr
+                    ret = self.engine.batch_transfer_sync_write(
+                        session_id,
+                        [local_base_addr],
+                        [agent_meta.layer_metadata[first_layer_name].kv_caches_base_addr[0]],
+                        [128],
+                    )
+                    if ret < 0:
+                        logger.error(
+                            "Mooncake transfer failed to create link. session_id=%s, ret=%d. ", session_id, ret
                         )
-                    local_base_addr = staging_base_addr
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id,
-                    [local_base_addr],
-                    [agent_meta.layer_metadata[first_layer_name].kv_caches_base_addr[0]],
-                    [128],
-                )
-                if ret < 0:
-                    logger.error("Mooncake transfer failed to create link. session_id=%s, ret=%d. ", session_id, ret)
-        req_meta.peer_layer_metadata[peer] = self.remote_layer_metadata[req_meta.remote_engine_id][remote_port]
-        req_meta.peer_te_rpc_port[peer] = self.remote_te_port[req_meta.remote_engine_id][remote_port]
+            req_meta.peer_layer_metadata[peer] = self.remote_layer_metadata[req_meta.remote_engine_id][remote_port]
+            req_meta.peer_te_rpc_port[peer] = self.remote_te_port[req_meta.remote_engine_id][remote_port]
 
     def wait_for_layer_load(self, layer_name: str) -> None:
         pass
@@ -3128,3 +3780,135 @@ def get_external_request_id(request_id: str):
     # NOTE(zxr): vLLM PR #27987 add additional suffix
     # to EngineCore request_id with len(suffix) == 9
     return request_id[:-9]
+
+
+class PrefilledTokenSpool:
+    """p_then_d: 首 token 的落盘通道(写侧在 API server 进程, 读侧在 EngineCore).
+
+    背景: proxy 提前派发 D(不等 P 的响应), 于是 D 的请求体里没有 `prefilled_token`
+    —— 而 entrypoint 所有"复用 P 首 token"的分支都在请求构造时读它, 中途补不进去。
+    首 token 改由 proxy 在拿到后 POST 到 D 的 API server, 落到本机 spool; D 侧在
+    KV 接收完成的转型点取用(recompute_scheduler._update_waiting_for_remote_kv)。
+
+    为什么不用 socket: D 可能 dp>1, 请求落在哪个 dp 组由 D 内部路由决定, proxy 无法
+    按端口寻址; spool 是共享目录, 每个 rank 只认领自己等待的 req_id, 错投也不会丢。
+
+    文件协议: 文件名 = 规范化后的 external request id, 内容 = JSON
+    ``{"prefilled_token": [...], "stop_reasons": [...], "ts": <写入时刻>}``;
+    写入用 ``.tmp`` + ``os.rename`` 原子发布, 读侧 ``os.unlink`` 认领(只有一个 rank
+    能成功删除, 于是只有它消费)。
+    """
+
+    def __init__(self, spool_dir: str):
+        self.spool_dir = spool_dir
+        self._entries: dict[str, tuple[float, dict[str, Any]]] = {}
+        self._lock = threading.Lock()
+        self._poller: threading.Thread | None = None
+        self._poller_started = False
+
+    # ---- 读侧(EngineCore) ------------------------------------------------
+    def _start_poller(self) -> None:
+        if self._poller_started:
+            return
+        self._poller_started = True
+        os.makedirs(self.spool_dir, exist_ok=True)
+        self._poller = threading.Thread(target=self._poll_loop, daemon=True, name="p-then-d-token-spool")
+        self._poller.start()
+        logger.info("[p_then_d] prefilled-token spool polling %s", self.spool_dir)
+
+    def _poll_loop(self) -> None:
+        while True:
+            try:
+                names = os.listdir(self.spool_dir)
+            except FileNotFoundError:
+                # 目录被清掉了(进程收尾/测试清理): 本线程是 daemon, 直接退出.
+                return
+            except OSError as e:
+                logger.warning("[p_then_d] token spool poll failed on %s: %s", self.spool_dir, e)
+                time.sleep(PTD_TOKEN_SPOOL_POLL_S)
+                continue
+            try:
+                for name in names:
+                    if name.endswith(".tmp"):
+                        continue
+                    path = os.path.join(self.spool_dir, name)
+                    try:
+                        with open(path, encoding="utf-8") as f:
+                            payload = json.load(f)
+                    except (OSError, json.JSONDecodeError):
+                        # 半截文件(理论上 rename 已保证原子)或已被别的 rank 认领.
+                        continue
+                    try:
+                        os.unlink(path)
+                    except OSError:
+                        # 已被别的 rank 认领: 本次不缓存, 让认领者消费.
+                        continue
+                    with self._lock:
+                        self._entries[name] = (time.time(), payload)
+                        self._evict_locked()
+                self._sweep_expired()
+            except OSError as e:
+                logger.warning("[p_then_d] token spool poll failed on %s: %s", self.spool_dir, e)
+            time.sleep(PTD_TOKEN_SPOOL_POLL_S)
+
+    def _evict_locked(self) -> None:
+        while len(self._entries) > PTD_TOKEN_SPOOL_MAX_ENTRIES:
+            self._entries.pop(next(iter(self._entries)), None)
+
+    def _sweep_expired(self) -> None:
+        now = time.time()
+        with self._lock:
+            for key in [k for k, (ts, _) in self._entries.items() if now - ts > PTD_TOKEN_SPOOL_EXPIRE_S]:
+                self._entries.pop(key, None)
+        # 停写/崩溃留下的孤儿文件也要清, 否则目录会一直涨.
+        try:
+            for name in os.listdir(self.spool_dir):
+                path = os.path.join(self.spool_dir, name)
+                if now - os.path.getmtime(path) > PTD_TOKEN_SPOOL_EXPIRE_S:
+                    os.unlink(path)
+        except OSError:
+            pass
+
+    def wait_for_prefilled_token(self, request_id: str, timeout: float) -> dict[str, Any] | None:
+        """等某个请求的首 token; 超时返回 None(调用方落回普通生成路径).
+
+        只在 D 的 scheduler 线程调用(KV 接收完成、请求即将离开
+        WAITING_FOR_REMOTE_KVS 时)。
+        """
+        self._start_poller()
+        key = _spool_key(request_id)
+        deadline = time.perf_counter() + timeout
+        while True:
+            with self._lock:
+                entry = self._entries.pop(key, None)
+            if entry is not None:
+                return entry[1]
+            if time.perf_counter() >= deadline:
+                return None
+            time.sleep(PTD_TOKEN_SPOOL_POLL_S)
+
+    # ---- 写侧(API server) ------------------------------------------------
+    @classmethod
+    def write_entry(cls, spool_dir: str, request_id: str, payload: dict[str, Any]) -> None:
+        """原子发布一条首 token 记录(写侧进程调用)."""
+        os.makedirs(spool_dir, exist_ok=True)
+        key = _spool_key(request_id)
+        tmp_path = os.path.join(spool_dir, f"{key}.tmp")
+        payload = {**payload, "ts": time.time()}
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f)
+        os.rename(tmp_path, os.path.join(spool_dir, key))
+
+
+# 单例: 同一个进程里 API server 与 EngineCore 共享(见 PrefilledTokenSpool 的说明).
+_TOKEN_SPOOLS: dict[str, PrefilledTokenSpool] = {}
+_TOKEN_SPOOLS_LOCK = threading.Lock()
+
+
+def get_prefilled_token_spool(spool_dir: str) -> PrefilledTokenSpool:
+    with _TOKEN_SPOOLS_LOCK:
+        spool = _TOKEN_SPOOLS.get(spool_dir)
+        if spool is None:
+            spool = PrefilledTokenSpool(spool_dir)
+            _TOKEN_SPOOLS[spool_dir] = spool
+        return spool

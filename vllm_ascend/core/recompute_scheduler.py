@@ -49,7 +49,13 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+
 from vllm_ascend import envs
+
+# p_then_d: 等 proxy 补投首 token 的上限. 只在 KV 接收完成、请求即将离开
+# WAITING_FOR_REMOTE_KVS 时等一次; proxy 在驱动 D 的响应流之前就投递, 正常毫秒级命中,
+# 超时则落回普通生成路径(首 token 与 P 的重复, 不阻塞引擎).
+PTD_TOKEN_WAIT_TIMEOUT_S = 10.0
 
 
 @dataclass
@@ -157,9 +163,37 @@ class RecomputeScheduler(Scheduler):
             self.kv_cache_manager.cache_blocks(request, num_computed_tokens)
             request.num_computed_tokens = num_computed_tokens
             # ascend vllm adapt start, reuse prefill token
-            if envs.REUSE_PREFILLED_TOKENS and hasattr(request, 'stream') and request.stream:
-                if (request.kv_transfer_params and "prefilled_token" in request.kv_transfer_params):
-                    prefilled_token = request.kv_transfer_params["prefilled_token"]
+            if envs.REUSE_PREFILLED_TOKENS and hasattr(request, "stream") and request.stream:
+                params = request.kv_transfer_params
+                if params and "prefilled_token" not in params and params.get("p_then_d_token_reuse"):
+                    # p_then_d 提前派发: D 的请求是在 P 出首 token **之前**下发的, 请求体
+                    # 里没有 prefilled_token(entrypoint 的复用分支读不到它), 首 token 由
+                    # proxy 经 spool 异步补投。这里等它到位 —— 此刻 KV 已接收完成, 而
+                    # proxy 在驱动 D 的响应流之前就投递, 正常是毫秒级命中。
+                    #
+                    # 注意这里的意义与老路径不同: 老路径的 entrypoint 会用 _wrap_with_prefilled
+                    # 替 D 合成首输出(客户端因此看到首 token); 提前派发下没有 wrapper, 首 token
+                    # 由 proxy 自己下发。这里只负责**记账** —— 把 token 记进
+                    # prompt_token_ids/output_token_ids, D 的第一步就只采样第 2 个 token,
+                    # 不会与 P 已下发的首 token 重复。
+                    deliver_token = getattr(self.connector, "deliver_prefilled_token", None)
+                    delivered = deliver_token(request, PTD_TOKEN_WAIT_TIMEOUT_S) if deliver_token else None
+                    if delivered and delivered.get("prefilled_token"):
+                        params["prefilled_token"] = delivered["prefilled_token"]
+                        if delivered.get("stop_reasons") is not None:
+                            params["stop_reasons"] = delivered["stop_reasons"]
+                    else:
+                        # 超时: 落回普通生成路径 —— D 会自己采样首 token, 与 P 已下发的那个
+                        # 重复(客户端流里会看到重复首 token), 但不影响后续 token 的正确性。
+                        logger.error(
+                            "p_then_d: timed out waiting %.1fs for the prefilled token of request %s; "
+                            "falling back to normal generation (the first token will duplicate the "
+                            "prefiller's).",
+                            PTD_TOKEN_WAIT_TIMEOUT_S,
+                            request.request_id,
+                        )
+                if params and "prefilled_token" in params:
+                    prefilled_token = params["prefilled_token"]
                     request.prompt_token_ids.extend(prefilled_token)
                     request.append_output_token_ids(prefilled_token)
                     request.num_computed_tokens += 1
