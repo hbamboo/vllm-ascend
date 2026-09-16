@@ -707,6 +707,9 @@ class GlobalTE:
     def _sync_cpu_to_npu_regions(self, cpu_addrs: list[int], lengths: list[int]) -> None:
         """Region-mode H2D: map staging addrs back to NPU ranges and batch-copy."""
         t0 = time.perf_counter()
+        # H2D 写入的是 D 端 KV cache 的块, 必须与计算流排序 —— 该排序已由拷贝提交处
+        # 的 stream.wait_stream(default_stream) 精确保证(见 submit_dma_copy_ptrs),
+        # 不再需要整设备同步.
         total_bytes = 0
         src_ptrs: list[int] = []
         dst_ptrs: list[int] = []
@@ -777,9 +780,8 @@ class GlobalTE:
         synced: set[int] = set()
         total_bytes = 0
         items: list[tuple[torch.Tensor, int, torch.Tensor, int]] = []
-        # 前置同步: H2D 写 NPU cache 前确保计算流不再读写这些块; 拷贝本身
-        # 在专用 DMA 流上批量执行, 不占用计算流.
-        # torch.npu.synchronize()
+        # 与计算流的排序由拷贝提交处的 stream.wait_stream(default_stream) 保证
+        # (见 submit_dma_copy), 拷贝本身仍在专用 DMA 流上执行、不占用计算流.
         for cpu_addr, byte_size in zip(src_addrs, lengths):
             cpu_offset = cpu_addr - cpu_base
             if cpu_offset < 0:
@@ -857,6 +859,11 @@ class GlobalTE:
         if _HAS_SWAP_BLOCKS_BATCH:
             try:
                 stream = self._get_copy_stream(direction)
+                # 排序: 拷贝流先等待计算流(默认流)当前已入队的全部工作 —— 拷贝会写入
+                # KV cache 的块, 异步调度下上一个请求的 decode 可能仍在飞, 不排序会与
+                # 在飞计算相互覆盖(表现为新请求首 token 就错/随批大小时序随机复现);
+                # 只等"当前点", 后续层计算仍可与拷贝并行, 不牺牲流水.
+                stream.wait_stream(torch.npu.default_stream())
                 sizes = np.asarray([n for _, _, _, n in items], dtype=np.int64)
                 if direction == _DIRECTION_D2H:
                     # D2H: NPU 为源, CPU staging 为目的.
@@ -922,6 +929,11 @@ class GlobalTE:
                 "custom op for batch DMA; it is unavailable in this environment."
             )
         stream = self._get_copy_stream(direction)
+        # 排序: 拷贝流先等待计算流(默认流)当前已入队的全部工作 —— 拷贝会写入
+        # KV cache 的块, 异步调度下上一个请求的 decode 可能仍在飞, 不排序会与
+        # 在飞计算相互覆盖(表现为新请求首 token 就错/随批大小时序随机复现);
+        # 只等"当前点", 后续层计算仍可与拷贝并行, 不牺牲流水.
+        stream.wait_stream(torch.npu.default_stream())
         src_t = torch.from_numpy(np.asarray(src_ptrs, dtype=np.int64))
         dst_t = torch.from_numpy(np.asarray(dst_ptrs, dtype=np.int64))
         size_t = torch.from_numpy(np.asarray(sizes, dtype=np.int64))

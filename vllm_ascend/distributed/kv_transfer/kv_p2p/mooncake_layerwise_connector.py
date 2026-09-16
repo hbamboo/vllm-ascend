@@ -289,6 +289,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         pd_head_ratio: int,
         num_head_replica: int,
         layer_metadata: dict[str, LayerMetadata],
+        group_max_layer_idx: dict[int, int],
         use_mla: bool,
         use_attn_mamba_hybrid: bool,
         k_buffer: torch.Tensor,
@@ -315,6 +316,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.pd_head_ratio = pd_head_ratio
         self.num_head_replica = num_head_replica
         self.layer_metadata = layer_metadata
+        self.group_max_layer_idx = group_max_layer_idx
         self.total_layers = total_layers
         self.use_mla = use_mla
         self.use_attn_mamba_hybrid = use_attn_mamba_hybrid
@@ -418,6 +420,35 @@ class KVCacheSendingLayerThread(threading.Thread):
         if _PERF_LOG and not self.use_pipe_writer:
             self._last_batch_end_at = time.perf_counter()
 
+    def _group_end_of_task(self, send_task: SendTask) -> tuple[bool, int]:
+        """本 rank 是否发完了该请求在本层所属 group 上的全部数据, 以及该 group 序号.
+
+        返回 (is_group_end, layer_group_idx): is_group_end 表示本任务是该 group 上
+        本 rank 最后一个带数据的层 —— 此刻它要发给各 peer 的该 group 数据已在
+        之前各批(同步 LAYER_DONE 握手)写达, 可以下发/触发请求级完成信息.
+        """
+        layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
+        return send_task.layer_idx == self.group_max_layer_idx.get(layer_group_idx, self.total_layers - 1), (
+            layer_group_idx
+        )
+
+    def _request_sender_path_count(self, peer_blocks: dict) -> int:
+        """本请求在该 peer 上期望的 P 侧发送方路径总数(各 group 取并集).
+
+        沿用各组自己的 trans_count 口径(attention 组乘过 pd_head_ratio, mamba 组
+        即 rank 数), 不做换算 —— 保证等分/reshard 场景的期望值与改动前逐字一致;
+        不等分 + hybrid 场景下 mamba 组的 2 个发送方包含 attention 组的那 1 个,
+        取 max 即精确并集. 取 max 永不高估(高估 => D 永远等不齐 => 死锁).
+        """
+        return max(
+            (
+                peer_blocks["trans_count"][g]
+                for g in range(len(self.kv_cache_specs))
+                if peer_blocks["local_block_ids"][g]
+            ),
+            default=0,
+        )
+
     def get_transfer_meta(
         self,
         send_task: SendTask,
@@ -443,11 +474,16 @@ class KVCacheSendingLayerThread(threading.Thread):
 
         if isinstance(layer_kv_cache_spec, MambaSpec):
             # only support one block transfer for mamba
+            # 源块: 非 align(=本部署, mamba_cache_mode=none)下 mamba 状态保存在请求首块;
+            # 目的块恒取 remote_block_ids[0] —— 与源同为首块(参考实现
+            # mooncake_layerwise_prefill_then_decode_connector.py 的取法一致),
+            # 不能用 align 口径的 len(remote)-num_spec-1: 那会把状态写进 D 不读的块.
+            # (align 模式的状态块语义不同, 当前实现未支持, 需另按 vLLM 的
+            #  mamba_state_idx 口径取目的块.)
             if self.mamba_cache_mode == "align":
                 local_transfer_idx = len(local_block_ids) - self.num_speculative_tokens - 1
             else:
                 local_transfer_idx = 0
-            remote_transfer_idx = len(remote_block_ids) - self.num_speculative_tokens - 1
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
@@ -461,8 +497,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 )
                 dst_list.extend(
                     [
-                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * local_conv_len,
-                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * local_ssm_len,
+                        remote_conv_addr + remote_block_ids[0] * local_conv_len,
+                        remote_ssm_addr + remote_block_ids[0] * local_ssm_len,
                     ]
                 )
                 length_list.extend([local_conv_len, local_ssm_len])
@@ -499,7 +535,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         )
                         dst_list.append(
                             remote_conv_addr
-                            + remote_block_ids[remote_transfer_idx] * remote_conv_len
+                            + remote_block_ids[0] * remote_conv_len
                             + remote_addr_offset
                         )
                         length_list.append(local_conv_size * get_dtype_size(conv_dtype))
@@ -507,7 +543,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 remote_addr_offset = (self.tp_rank % tp_ratio) * math.prod(ssm_shape) * get_dtype_size(ssm_dtype)
                 src_list.append(local_ssm_addr + local_block_ids[local_transfer_idx] * local_ssm_len)
                 dst_list.append(
-                    remote_ssm_addr + remote_block_ids[remote_transfer_idx] * remote_ssm_len + remote_addr_offset
+                    remote_ssm_addr + remote_block_ids[0] * remote_ssm_len + remote_addr_offset
                 )
                 length_list.append(local_ssm_len)
         else:
@@ -651,9 +687,9 @@ class KVCacheSendingLayerThread(threading.Thread):
         #    pd==1 无量化路径等 reshape 事件. 两者都只依赖本任务, 不能用整条
         #    resharding_stream.synchronize() —— 那会连带等待主线程为后续层
         #    enqueue 的 reshard 工作, 与对端进度成环(2026-09-09 定位的死锁).
-        last_task = tasks[-1]
         if self.uses_reshard_buffers:
-            self._wait_task_ready(last_task)
+            for send_task in tasks:
+                self._wait_task_ready(send_task)
         elif self.pd_head_ratio == 1:
             """
             Note: Due to a bug in ADXL, calling current_event.synchronize() may occasionally hang.
@@ -661,7 +697,13 @@ class KVCacheSendingLayerThread(threading.Thread):
             You can manually build the master branch of the project at https://gitcode.com/cann/hixl
             to resolve this issue before the 8.5.RC1 release.
             """
-            last_task.wait_event.synchronize()  # type:ignore
+            # 逐层等待: 攒批把多层合并成一次 D2H flush, 但批内各层的 KV / GDN 状态
+            # 写入不保证都排在同一个流上(自定义 op / 侧流), 只等批内最后一层的 event
+            # 会把尚未写定的层一起 flush 出去 —— 参考实现(预填充后解码版 connector)
+            # 是"一层一个 task, 各自 wait_event.synchronize()", 攒批必须保留这个不变式.
+            for send_task in tasks:
+                if send_task.wait_event is not None:
+                    send_task.wait_event.synchronize()  # type:ignore
 
         # 2) reshard/量化结果拷进单槽 k/v buffer(逐任务; 发送线程串行执行,
         #    与随后的 flush 互斥). 拷贝提交在侧流上, 侧流此后只承载本线程
@@ -712,13 +754,18 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
-                    if send_task.layer_idx == (self.total_layers - 1):
-                        # 本任务含最后层: 记录该 peer 在该请求末轮的完成信息
-                        # (is_last=chunk_finish; trans_count=最后层所属 group 上
-                        # 该 peer 期望收到的 P 侧路径数), 随本批 LAYER_DONE 下发.
+                    is_group_end, _ = self._group_end_of_task(send_task)
+                    if is_group_end:
+                        # 本 rank 在该 group 上对该请求的最后一个带数据层: 它此前各批
+                        # 的 LAYER_DONE 握手已完成, 数据全部写达. 记录该 peer 在该请求
+                        # 末轮的完成信息(is_last=chunk_finish; trans_count=该请求在该
+                        # peer 上的发送方路径总数), 随本批 LAYER_DONE 下发.
+                        # 每个参与发送的 rank 各自下发一次, D 侧按 sender_path 计数
+                        # 收齐 —— 只由最后一层(MTP, 属 attention 组)那批下发时, mamba
+                        # 组另一个发送方的数据可能尚未落地, D 会提前开始解码.
                         meta.req_done[(peer_host, peer_port, req_id)] = (
                             req_meta.chunk_finish,
-                            req_meta.peer_transfer[peer]["trans_count"][layer_group_idx],
+                            self._request_sender_path_count(req_meta.peer_transfer[peer]),
                         )
 
         # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
@@ -880,13 +927,16 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += batch_wait_ms
         for send_task in tasks:
-            if send_task.layer_idx == (self.total_layers - 1):
-                layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
+            is_group_end, layer_group_idx = self._group_end_of_task(send_task)
+            if is_group_end:
+                # 每个参与发送的 rank 都在自己的 group 末层处理请求级信号: D2D 的
+                # 显式 DONE, 以及写失败的作废通知(失败可能发生在任一发送方).
+                is_last_layer = send_task.layer_idx == (self.total_layers - 1)
                 for req_id, req_meta in send_task.send_request.items():
                     if req_id not in transferred_reqs:
                         continue
                     if req_meta.chunk_finish:
-                        if _PERF_LOG:
+                        if _PERF_LOG and is_last_layer:
                             ext_req = get_external_request_id(req_id)
                             acc = self._perf_req.pop(ext_req, None)
                             if acc is not None:
@@ -944,12 +994,14 @@ class KVCacheSendingLayerThread(threading.Thread):
         flush_ms = 0.0
         flush_win0 = flush_win1 = None
 
-        # 数据就绪: 只需等最后一个任务的事件(层序提交, 事件同流递增).
-        last_task = tasks[-1]
-        if last_task.k_quant_cache is not None:
+        # 数据就绪: 逐层等各自的事件 —— 批内各层的写入不保证同流, 只等最后一层
+        # 会把未写定的层一起 flush(详见单线程路径同名注释).
+        if any(t.k_quant_cache is not None for t in tasks):
             self.resharding_stream.synchronize()
         elif self.pd_head_ratio == 1:
-            last_task.wait_event.synchronize()  # type:ignore
+            for send_task in tasks:
+                if send_task.wait_event is not None:
+                    send_task.wait_event.synchronize()  # type:ignore
         t_event1 = time.perf_counter()
         event_ms = (t_event1 - t_batch0) * 1e3
 
@@ -978,13 +1030,18 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
-                    if send_task.layer_idx == (self.total_layers - 1):
-                        # 本任务含最后层: 记录该 peer 在该请求末轮的完成信息
-                        # (is_last=chunk_finish; trans_count=最后层所属 group 上
-                        # 该 peer 期望收到的 P 侧路径数), 随本批 LAYER_DONE 下发.
+                    is_group_end, _ = self._group_end_of_task(send_task)
+                    if is_group_end:
+                        # 本 rank 在该 group 上对该请求的最后一个带数据层: 它此前各批
+                        # 的 LAYER_DONE 握手已完成, 数据全部写达. 记录该 peer 在该请求
+                        # 末轮的完成信息(is_last=chunk_finish; trans_count=该请求在该
+                        # peer 上的发送方路径总数), 随本批 LAYER_DONE 下发.
+                        # 每个参与发送的 rank 各自下发一次, D 侧按 sender_path 计数
+                        # 收齐 —— 只由最后一层(MTP, 属 attention 组)那批下发时, mamba
+                        # 组另一个发送方的数据可能尚未落地, D 会提前开始解码.
                         meta.req_done[(peer_host, peer_port, req_id)] = (
                             req_meta.chunk_finish,
-                            req_meta.peer_transfer[peer]["trans_count"][layer_group_idx],
+                            self._request_sender_path_count(req_meta.peer_transfer[peer]),
                         )
 
         # 每 session: D2H flush 进本端 staging 并把 src 换成 staging 地址.
@@ -1231,7 +1288,10 @@ class KVCacheSendingLayerThread(threading.Thread):
         external_req_id = get_external_request_id(req_id)
         encoder = msgspec.msgpack.Encoder()
         for (remote_host, remote_port), peer_blocks in req_meta.peer_transfer.items():
-            trans_count = peer_blocks["trans_count"][layer_group_idx]
+            # 请求级发送方路径总数(各 group 并集口径): 与 LAYER_DONE done_list 里的
+            # trans_count 保持一致 —— D 侧按 sender_path 去重计数, 收齐才算完成.
+            # (layer_group_idx 参数保留以兼容调用方, 不再用于取计数.)
+            trans_count = self._request_sender_path_count(peer_blocks)
             if trans_count <= 0:
                 continue
             try:
@@ -2309,6 +2369,17 @@ class MooncakeLayerwiseConnectorWorker:
         if self.total_layers < len(self.layer_metadata.keys()):
             self.total_layers = len(self.layer_metadata.keys())
 
+        # 每个 kv cache group 的"末层"序号: 某 rank 发到该层时, 它在这个 group 上
+        # 要发的数据已全部发完. 不等分 P/D 切分下 mamba(linear-attn) 组每个 D rank
+        # 有多个 P 发送方, 且这些层永远不是 total_layers-1 —— 只有让每个发送方在
+        # 自己的 group 末层下发请求级完成信息, D 侧才可能等到全部发送方的数据落地
+        # (否则 D 会只凭最后一层那批(MTP 层, 属 attention 组)就放行解码).
+        self.group_max_layer_idx: dict[int, int] = {}
+        for layer_idx, layer_names in self.index_to_name.items():
+            for layer_name in layer_names:
+                group_idx = self.layer_metadata[layer_name].tensor_group_idx[0]
+                self.group_max_layer_idx[group_idx] = max(self.group_max_layer_idx.get(group_idx, -1), layer_idx)
+
         # After KV Caches registered, start the sending or receiving thread.
         metadata = MooncakeAgentMetadata(
             te_rpc_port=self.te_rpc_port,
@@ -2329,6 +2400,7 @@ class MooncakeLayerwiseConnectorWorker:
                 pd_head_ratio=self.pd_head_ratio,
                 num_head_replica=self.num_head_replica,
                 layer_metadata=self.layer_metadata,
+                group_max_layer_idx=self.group_max_layer_idx,
                 use_mla=self.use_mla,
                 use_attn_mamba_hybrid=self.use_attn_mamba_hybrid,
                 k_buffer=self.k_buffer,
