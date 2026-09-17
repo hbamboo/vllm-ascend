@@ -2083,8 +2083,15 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
             has_mamba = has_mamba or isinstance(kv_cache_spec, MambaSpec)
         return has_attn and has_mamba
 
-    def _hybrid_prefill_token_count(self, num_prompt_tokens: int) -> int:
-        if self.need_truncate and num_prompt_tokens > 1:
+    def _hybrid_prefill_token_count(self, num_prompt_tokens: int, reuse_first_token: bool) -> int:
+        """本次预填充由 P 负责的 token 数。
+
+        hybrid 下 P 会砍掉最后一格交给 D 重算, 但**只在首 token 不复用的时候**才需要这么做
+        (见 _truncate_request_for_hybrid_prefill): 复用首 token 时 D 会跳过"重算末格"这一步,
+        mamba 状态因此不会被重复推进, P 直接算满整段反而才是对的。两边必须同判, 否则
+        传输的 token 数与对端预期对不上(少一格 = KV 空洞, 多一格 = 状态多走一步)。
+        """
+        if self.need_truncate and not reuse_first_token and num_prompt_tokens > 1:
             return num_prompt_tokens - 1
         return num_prompt_tokens
 
@@ -2093,6 +2100,11 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         if (
             params is None
             or not self.need_truncate
+            # 复用首 token 的请求不能砍: 砍掉的那格正是 P 要采样的位置, 采出来的是它的重采样
+            # (属于 prompt 内容), D 把它当新 token 追加就会让 prompt 尾重复一格、mamba 状态
+            # 漏走一步, 上下文直接坏掉 —— 表现就是 D 立刻吐 </think>、思考过程整段消失。
+            # 不砍时 P 算满整段, D 靠首 token 注入跳过"重算末格", 状态与 KV 都对得上。
+            or self._reuse_first_token(params)
             or params.get("_p_side_truncated")
             or getattr(request, "num_prompt_tokens", len(request.prompt_token_ids or [])) <= 1
         ):
@@ -2110,8 +2122,12 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         request.max_tokens = 1
         params["_p_side_truncated"] = True
 
-    def _trim_hybrid_remote_block_ids(self, block_ids: tuple[list[int], ...], prompt_len: int) -> tuple[list[int], ...]:
-        if not self.need_truncate or prompt_len <= 1:
+    def _trim_hybrid_remote_block_ids(
+        self, block_ids: tuple[list[int], ...], prompt_len: int, reuse_first_token: bool
+    ) -> tuple[list[int], ...]:
+        # 只在 P 侧真的砍了末格时才裁目的块表 —— 那时最后一格是"被砍那一格", D 要自己
+        # 重算, 传输范围跟着少一块; 复用首 token 时 P 算满整段, 两块表同长, 不能裁。
+        if not self.need_truncate or reuse_first_token or prompt_len <= 1:
             return block_ids
 
         trimmed_block_ids: list[list[int]] = []
@@ -2121,6 +2137,43 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
             else:
                 trimmed_block_ids.append(list(group_block_ids))
         return tuple(trimmed_block_ids)
+
+    @staticmethod
+    def _reuse_first_token(params: dict[str, Any] | None) -> bool:
+        """P 侧: 本请求是否要复用 P 采样的首 token。
+
+        由 render serving 侧写入(REUSE_PREFILLED_TOKENS + 是否流式), p_then_d 流式请求为
+        True —— 此时 P **不截断**(见 _truncate_request_for_hybrid_prefill), 采出来的就是
+        答案的真首 token, 随 KV 末轮投给 D。
+        """
+        if not params:
+            return False
+        return bool(params.get("reuse_prefilled_tokens", True))
+
+    def _reuse_first_token_on_decoder(self, params: dict[str, Any] | None) -> bool:
+        """D 侧: 本请求是否真的会收到并复用首 token。
+
+        除了请求本身的 reuse 标记, 还要求这是 p_then_d 请求(带 kv_transfer_params_zmq_port):
+        D-first 流程里 P 的请求被 proxy 强制非流式(reuse=False), P 因此会截断末格、也不会投
+        首 token —— D 若还压着等就永远等不到; 反之 p_then_d 里 P/D 拿到的 stream 标志一致,
+        两边判定天然相同。判定同时决定"要不要等首 token"和"传输该拉多少 token", 必须与 P
+        侧 _truncate_request_for_hybrid_prefill 同判。
+        """
+        if not self._reuse_first_token(params):
+            return False
+        return (params or {}).get("kv_transfer_params_zmq_port") is not None
+
+    def _resolve_first_token_reuse_for_decoder(self, request: "Request") -> bool:
+        """D 侧定案: 把有效判定写回请求参数, 供 worker(压回/注入)与 scheduler(注入)共用。"""
+        params = request.kv_transfer_params
+        reuse = self._reuse_first_token_on_decoder(params)
+        if params is not None and bool(params.get("reuse_prefilled_tokens", True)) != reuse:
+            logger.info(
+                "Request %s will not reuse the prefilled first token: no p_then_d params channel",
+                request.request_id,
+            )
+            params["reuse_prefilled_tokens"] = reuse
+        return reuse
 
     def get_num_new_matched_tokens(self, request: "Request", num_computed_tokens: int) -> tuple[int, bool]:
         """
@@ -2149,7 +2202,10 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             # Remote prefill: get all prompt blocks from remote.
             assert num_computed_tokens % min(self.block_size) == 0
-            count = max(self._hybrid_prefill_token_count(len(request.prompt_token_ids)) - num_computed_tokens, 0)
+            prefill_tokens = self._hybrid_prefill_token_count(
+                len(request.prompt_token_ids), self._reuse_first_token_on_decoder(params)
+            )
+            count = max(prefill_tokens - num_computed_tokens, 0)
             return count, count > 0
 
         if params is not None and params.get("do_remote_decode"):
@@ -2170,7 +2226,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         if params is not None and params.get("do_remote_prefill"):
             do_virtual = params.get("do_virtual", False)
             local_block_ids = (blocks.get_block_ids()) if num_external_tokens > 0 else []
-            remote_block_ids = self._trim_hybrid_remote_block_ids(local_block_ids, len(request.prompt_token_ids))
+            remote_block_ids = self._trim_hybrid_remote_block_ids(
+                local_block_ids, len(request.prompt_token_ids), self._reuse_first_token_on_decoder(params)
+            )
             remote_cached_tokens = request.num_computed_tokens
             # Get unhashed blocks to pull from remote.
             logger.debug(
@@ -2253,6 +2311,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
             # Loop through scheduled reqs and convert to ReqMeta.
             for req_id, (req, token_ids, block_ids) in self._reqs_need_recv.items():
                 assert req.kv_transfer_params is not None
+                # 先 P 后 D: 本请求到底会不会收到首 token(决定 worker 压不压、scheduler 注不注)
+                # 在这里定案 —— 判定同时决定 P 侧截不截断、这里拉多少 token, 必须一致。
+                self._resolve_first_token_reuse_for_decoder(req)
                 # For the case where there are no remote blocks to pull
                 # (block_ids is empty), we don't need to schedule
                 # an async read on the worker side.
@@ -2604,7 +2665,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         req_meta.remote_dcp_size = params.get("remote_dcp_size")
         req_meta.do_virtual = params.get("do_virtual")
         req_meta.remote_cache_tokens = params.get("remote_cached_tokens")
-        req_meta.reuse_prefilled_tokens = params.get("reuse_prefilled_tokens", True)
+        # D 的推送里不带这个字段时**保留本侧已定的值**: P 侧按请求里的 reuse 标记决定要不要
+        # 截断末格/投递首 token, 不能被这里的默认 True 覆盖回去(见 _reuse_first_token)。
+        req_meta.reuse_prefilled_tokens = params.get("reuse_prefilled_tokens", req_meta.reuse_prefilled_tokens)
         req_meta.remote_recv_ports = MooncakeLayerwisePrefillThenDecodeConnectorMetadata._build_remote_recv_ports(
             params
         )
@@ -2931,6 +2994,8 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
             token = entry["token"]
             self.req_send_done_tasks.pop(req_id, None)
         if not req_meta.reuse_prefilled_tokens:
+            # 汇合点已在上面的临界区里摘掉, 这里直接丢: 采样出来的 token 对不发复用的
+            # 请求(非流式 / hybrid 截断)没有意义, 投给 D 反而会被当普通 prompt 尾 token 用。
             logger.debug("request %s cannot reuse prefilled tokens", req_id)
             return
         self._send_first_token_signal(req_id, req_meta, token)

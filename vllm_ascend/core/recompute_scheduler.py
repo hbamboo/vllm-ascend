@@ -173,8 +173,18 @@ class RecomputeScheduler(Scheduler):
                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
 
             # 先 P 后 D: P 已经采样出首 token 并经 connector 传了过来, 这里把它
-            # 补成请求的最后一个 prompt token —— D 只需要重算这一格的 KV, 不必
+            # **追加**成请求的最后一个 prompt token —— D 只需要算这一格的 KV, 不必
             # 重新采样首 token, 输出里也把它算作已生成的第 1 个 token。
+            #
+            # 注意必须是"追加 + num_computed_tokens += 1"(跳过末格重算), 不能改成
+            # "替换末格 + 重算": connector 侧的判定是"P 只在**不复用**首 token 时才砍掉
+            # prompt 末格"(见 _truncate_request_for_hybrid_prefill), 而不复用的时候 P
+            # 根本不会投首 token —— 也就是说 **D 只要收到了首 token, 它一定是真首 token**
+            # (不是被砍那一格的重采样)。既然如此:
+            #   * 追加: 真实末格取自 P 传过来的 KV(num_computed += 1 正好把它算作已算),
+            #     序列 = prompt + 首token, 与直连 P 一致;
+            #   * 替换末格 + 重算: 会吃掉真实末格 token, 把首 token 挪进末格, 再让 mamba
+            #     状态多走一步 —— 就是原来的乱码来源。
             reuse_prefilled_tokens = envs.REUSE_PREFILLED_TOKENS and (request.kv_transfer_params or {}).get(
                 "reuse_prefilled_tokens", True
             )

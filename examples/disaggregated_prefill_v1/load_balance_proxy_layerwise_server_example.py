@@ -493,31 +493,41 @@ def get_origin_request_id(api, req_id):
         return req_id.replace("chatcmpl-", "")
 
 
-def _is_first_token_event(event: bytes) -> bool:
-    """P 侧的输出只保留"带内容"的 chunk(role + 首 token)。
+def _first_token_event_to_forward(event: bytes) -> bytes | None:
+    """P 侧的输出只保留"带内容"的 chunk(role + 首 token), 并把收尾字段清掉。
 
-    P 的 max_tokens=1, 它的收尾 chunk 带 finish_reason, 后面还跟 usage/[DONE] ——
-    这些一旦转发, 客户端会认为流已结束, 看不到 D 续写的部分, 所以必须丢掉。
+    P 的 max_tokens=1, 首 token 与 finish_reason 常常在**同一个** chunk 里(末 chunk
+    就是带 finish_reason 的那个)——所以不能整块丢: 那会把首 token 一起丢掉, 客户端
+    就再也看不到 P 出的首 token 了。这里保留 chunk、只把 finish_reason/usage 清空,
+    客户端才不会以为流已结束、看不到 D 续写的部分。usage/[DONE] 直接丢。
+
+    重新序列化时用 ensure_ascii=False: json.dumps 默认会把非 ASCII 转成 `\\uXXXX`
+    (中文首 token 会变成 `"\\u55ef"`), 与 vLLM 自己发的 chunk(D 的 chunk 是原样透传)
+    风格不一致 —— 语义等价, 但对着 curl 看很容易被当成乱码。
     """
     text = event.decode("utf-8", errors="replace").strip()
     if not text.startswith("data:"):
-        return False
+        return None
     payload = text[len("data:") :].strip()
     if not payload or payload == "[DONE]":
-        return False
+        return None
     try:
         chunk_json = json.loads(payload)
     except json.JSONDecodeError:
-        return False
+        return None
     if chunk_json.get("usage"):
-        return False
+        return None
+    keep = False
     for choice in chunk_json.get("choices") or []:
-        if choice.get("finish_reason"):
-            return False
         delta = choice.get("delta") or {}
         if delta.get("content") or delta.get("role") or choice.get("text"):
-            return True
-    return False
+            keep = True
+        choice["finish_reason"] = None
+        if "stop_reason" in choice:
+            choice["stop_reason"] = None
+    if not keep:
+        return None
+    return b"data: " + json.dumps(chunk_json, ensure_ascii=False).encode("utf-8")
 
 
 async def _handle_p_then_d(
@@ -663,7 +673,7 @@ async def _handle_p_then_d(
                     )
                 )
                 # 按 SSE 事件边界切整齐再挑: 只转发 P 的首 token (含 role),
-                # 丢掉 finish_reason/usage/[DONE], 否则客户端会提前收流。
+                # 清掉 finish_reason/usage/[DONE], 否则客户端会提前收流。
                 pending = b""
                 while True:
                     item = await prefiller_queue.get()
@@ -675,13 +685,16 @@ async def _handle_p_then_d(
                     pending += item
                     while b"\n\n" in pending:
                         event, pending = pending.split(b"\n\n", 1)
-                        if not _is_first_token_event(event):
+                        forward = _first_token_event_to_forward(event)
+                        if forward is None:
                             continue
                         if "tok" not in proxy_state.req_perf.get(request_id, {}):
                             proxy_state.req_perf[request_id]["tok"] = time.perf_counter()
-                        yield event + b"\n\n"
-                if pending.strip() and _is_first_token_event(pending):
-                    yield pending
+                        yield forward + b"\n\n"
+                if pending.strip():
+                    forward = _first_token_event_to_forward(pending)
+                    if forward is not None:
+                        yield forward
             else:
                 # 非流式: 不需要转发 P 的输出, 但**必须**和 D 并发派发 —— P 在
                 # 自己的前向里等 D 投来 block table, 若先 await P 再派发 D 就成

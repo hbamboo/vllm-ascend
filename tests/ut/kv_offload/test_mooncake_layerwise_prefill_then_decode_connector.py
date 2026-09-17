@@ -414,6 +414,159 @@ class TestGetFinishedHoldsBackMissingToken(unittest.TestCase):
         recv.requeue_done_requests.assert_not_called()
 
 
+class TestHybridTruncationTracksFirstTokenReuse(unittest.TestCase):
+    """hybrid(attn+mamba) 模型: P 采出的"首 token"只有在**它自己算满了整段 prompt** 时才是真
+    首 token。
+
+    - 复用首 token(流式 p_then_d): P 不能砍最后一格 —— 砍掉的那格正是 P 要采样的位置, 采出来
+      是它的重采样(属于 prompt 内容), D 当新 token 追加就会让 prompt 尾重复一格、mamba 状态
+      漏走一步, 上下文直接坏掉(表现: D 立刻吐 </think>、思考过程整段消失或复读)。此时 P 算满
+      整段并投真首 token, D 靠注入跳过"重算末格"。
+    - 不复用(非流式 / D-first): 保持原样砍末格, 由 D 重算整格后自己采样首 token。
+
+    截断与"拉多少 token/裁不裁块表"必须同判, 只改一边会变成 KV 空洞或状态多走一步。
+    """
+
+    def _make_request(self, prompt_len=8, reuse=None, marker=None):
+        tokens = list(range(prompt_len))
+        request = types.SimpleNamespace(
+            request_id="r1-00000000",
+            max_tokens=4096,
+            num_prompt_tokens=prompt_len,
+            prompt_token_ids=list(tokens),
+            prompt_embeds=None,
+            _all_token_ids=list(tokens),
+        )
+        request.kv_transfer_params = {"do_remote_decode": True}
+        if reuse is not None:
+            request.kv_transfer_params["reuse_prefilled_tokens"] = reuse
+        if marker is not None:
+            request.kv_transfer_params["kv_transfer_params_zmq_port"] = marker
+        return request
+
+    @staticmethod
+    def _make_scheduler(need_truncate=True, block_size=(4, 4)):
+        scheduler = object.__new__(ptd.MooncakeLayerwisePrefillThenDecodeConnectorScheduler)
+        scheduler.need_truncate = need_truncate
+        scheduler.block_size = list(block_size)
+        return scheduler
+
+    @staticmethod
+    def _make_req_meta(kv_transfer_params, prompt_len=8):
+        meta = ptd.MooncakeLayerwisePrefillThenDecodeConnectorMetadata()
+        meta.add_new_req(
+            request_id="r1-00000000",
+            local_block_ids=[[1]],
+            kv_transfer_params=kv_transfer_params,
+            prompt_len=prompt_len,
+        )
+        return meta.requests["r1-00000000"]
+
+    def test_p_side_does_not_truncate_when_reusing_first_token(self):
+        scheduler = self._make_scheduler()
+        request = self._make_request(prompt_len=8, reuse=True)
+
+        scheduler._truncate_request_for_hybrid_prefill(request)
+
+        self.assertEqual(len(request.prompt_token_ids), 8)
+        self.assertEqual(request.num_prompt_tokens, 8)
+        self.assertNotIn("_p_side_truncated", request.kv_transfer_params)
+
+    def test_p_side_truncates_when_not_reusing_first_token(self):
+        scheduler = self._make_scheduler()
+        request = self._make_request(prompt_len=8, reuse=False)
+
+        scheduler._truncate_request_for_hybrid_prefill(request)
+
+        self.assertEqual(len(request.prompt_token_ids), 7)
+        self.assertEqual(request.max_tokens, 1)
+        self.assertTrue(request.kv_transfer_params["_p_side_truncated"])
+
+    def test_p_side_no_truncation_without_hybrid(self):
+        scheduler = self._make_scheduler(need_truncate=False)
+        request = self._make_request(prompt_len=8, reuse=False)
+
+        scheduler._truncate_request_for_hybrid_prefill(request)
+
+        self.assertEqual(len(request.prompt_token_ids), 8)
+
+    def test_prefill_token_count_follows_reuse(self):
+        scheduler = self._make_scheduler()
+        self.assertEqual(scheduler._hybrid_prefill_token_count(8, True), 8)
+        self.assertEqual(scheduler._hybrid_prefill_token_count(8, False), 7)
+        # prompt 只有一格时 P 不砍(砍了就没有可算的了), 两侧都要按整段算。
+        self.assertEqual(scheduler._hybrid_prefill_token_count(1, False), 1)
+        non_hybrid = self._make_scheduler(need_truncate=False)
+        self.assertEqual(non_hybrid._hybrid_prefill_token_count(8, False), 8)
+
+    def test_trim_remote_block_ids_only_when_truncating(self):
+        scheduler = self._make_scheduler()
+        block_ids = tuple([[1, 2, 3], [4, 5, 6]])
+
+        # prompt_len % block_size == 1 -> 砍末格时目的块表要少一块; 复用时不裁。
+        truncated = scheduler._trim_hybrid_remote_block_ids(block_ids, 9, False)
+        reused = scheduler._trim_hybrid_remote_block_ids(block_ids, 9, True)
+        not_hybrid = self._make_scheduler(need_truncate=False)._trim_hybrid_remote_block_ids(block_ids, 9, False)
+
+        self.assertEqual([list(g) for g in truncated], [[1, 2], [4, 5]])
+        self.assertEqual([list(g) for g in reused], [[1, 2, 3], [4, 5, 6]])
+        self.assertEqual([list(g) for g in not_hybrid], [[1, 2, 3], [4, 5, 6]])
+
+    def test_decoder_reuse_requires_p_then_d_channel(self):
+        scheduler = self._make_scheduler()
+        p_then_d = {"reuse_prefilled_tokens": True, "kv_transfer_params_zmq_port": 16583}
+
+        # D-first: D 的请求流式(reuse=True)但 P 的请求被 proxy 强制非流式 -> P 会砍末格、
+        # 不投首 token; D 不能还压着等, 否则永远等不到。
+        self.assertFalse(scheduler._reuse_first_token_on_decoder({"reuse_prefilled_tokens": True}))
+        # p_then_d: 带参数直连通道, P/D 拿到的 stream 一致, 判定一致。
+        self.assertTrue(scheduler._reuse_first_token_on_decoder(p_then_d))
+        self.assertFalse(scheduler._reuse_first_token_on_decoder({**p_then_d, "reuse_prefilled_tokens": False}))
+        self.assertFalse(scheduler._reuse_first_token_on_decoder(None))
+
+    def test_decoder_resolution_downgrades_request_and_req_meta(self):
+        scheduler = self._make_scheduler()
+        request = self._make_request(prompt_len=8, reuse=True)  # 没有 p_then_d 通道
+
+        self.assertFalse(scheduler._resolve_first_token_reuse_for_decoder(request))
+
+        self.assertFalse(request.kv_transfer_params["reuse_prefilled_tokens"])
+        req_meta = self._make_req_meta(request.kv_transfer_params)
+        self.assertFalse(req_meta.reuse_prefilled_tokens)
+
+    def test_decoder_keeps_reuse_for_p_then_d_request(self):
+        scheduler = self._make_scheduler()
+        request = self._make_request(prompt_len=8, reuse=True, marker=16583)
+
+        self.assertTrue(scheduler._resolve_first_token_reuse_for_decoder(request))
+
+        self.assertTrue(request.kv_transfer_params["reuse_prefilled_tokens"])
+
+    def test_p_side_req_meta_carries_reuse_flag(self):
+        """P 的 worker 只看 ReqMeta.reuse_prefilled_tokens 决定投不投首 token。"""
+        reusing = self._make_req_meta({"do_remote_decode": True, "reuse_prefilled_tokens": True}, prompt_len=8)
+        truncated = self._make_req_meta(
+            {"do_remote_decode": True, "_p_side_truncated": True, "reuse_prefilled_tokens": False}, prompt_len=7
+        )
+
+        self.assertTrue(reusing.reuse_prefilled_tokens)
+        self.assertFalse(truncated.reuse_prefilled_tokens)
+
+    def test_decoder_params_push_does_not_reenable_reuse(self):
+        """D 的推送里不带该字段时不能把 False 覆盖回 True, 否则 D 会一直等一个不会来的 token。"""
+        req_meta = self._make_req_meta(
+            {"do_remote_decode": True, "_p_side_truncated": True, "reuse_prefilled_tokens": False}, prompt_len=7
+        )
+        worker = _make_worker()
+        pull = MagicMock()
+        pull.get_kv_transfer_params.return_value = ({"remote_block_ids": [[7]], "remote_host": "10.0.0.1"}, False)
+        worker.pull_thread = pull
+
+        self.assertTrue(worker._apply_decoder_params("r1-00000000", req_meta, True))
+
+        self.assertFalse(req_meta.reuse_prefilled_tokens)
+
+
 class TestDecoderParamsChannel(unittest.TestCase):
     """P 先受理时手里没有对端信息, 靠 D 直投的 block table 建 peer 映射。"""
 
