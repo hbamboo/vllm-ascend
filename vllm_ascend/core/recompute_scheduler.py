@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import time
 from collections import defaultdict, deque
+from collections.abc import Iterable
 from dataclasses import dataclass, fields
 
 from vllm.config import SchedulerConfig, VllmConfig
@@ -49,6 +50,8 @@ from vllm.v1.request import Request, RequestStatus, StreamingUpdate
 from vllm.v1.sample.rejection_sampler import PLACEHOLDER_TOKEN_ID
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.utils import ConstantList, record_function_or_nullcontext
+
+from vllm_ascend import envs
 
 
 @dataclass
@@ -106,6 +109,9 @@ class RecomputeScheduler(Scheduler):
             and self.vllm_config.kv_transfer_config.is_kv_consumer
         )
         self.is_kv_producer = self.vllm_config.kv_transfer_config and self.vllm_config.kv_transfer_config.is_kv_producer
+        # 先 P 后 D: P 采样的首 token 由 connector 经 kv_connector_output 回传,
+        # 在此暂存, 等 KV 接收完成 (_update_waiting_for_remote_kv) 再补进请求。
+        self._pending_first_tokens = {}
 
     def add_request(self, request: Request) -> None:
         existing = self.requests.get(request.request_id)
@@ -165,6 +171,25 @@ class RecomputeScheduler(Scheduler):
                 and self.max_model_len >= request.num_tokens + self.num_spec_tokens
             ):
                 request.spec_token_ids = [PLACEHOLDER_TOKEN_ID] * self.num_spec_tokens
+
+            # 先 P 后 D: P 已经采样出首 token 并经 connector 传了过来, 这里把它
+            # 补成请求的最后一个 prompt token —— D 只需要重算这一格的 KV, 不必
+            # 重新采样首 token, 输出里也把它算作已生成的第 1 个 token。
+            reuse_prefilled_tokens = envs.REUSE_PREFILLED_TOKENS and (request.kv_transfer_params or {}).get(
+                "reuse_prefilled_tokens", True
+            )
+            pending_first_tokens = getattr(self, "_pending_first_tokens", {})
+            if reuse_prefilled_tokens and request.request_id in pending_first_tokens:
+                first_token = pending_first_tokens.pop(request.request_id)
+                request.prompt_token_ids.append(first_token)
+                request.append_output_token_ids(first_token)
+                request.num_computed_tokens += 1
+                request.update_block_hashes()
+                logger.debug(
+                    "Added first token %s to request %s in _update_waiting_for_remote_kv",
+                    first_token,
+                    request.request_id,
+                )
 
         self.finished_recving_kv_req_ids.remove(request.request_id)
 
@@ -828,6 +853,32 @@ class RecomputeScheduler(Scheduler):
     ) -> KVConnectorMetadata:
         return connector.build_connector_meta(scheduler_output)
 
+    def _update_requests_with_invalid_blocks(
+        self,
+        requests: Iterable[Request],
+        invalid_block_ids: set[int],
+        num_scheduled_tokens: dict[str, int],
+        evict_blocks: bool = True,
+    ) -> tuple[set[str], int, set[int]]:
+        """上游实现假定每个请求只有一张 block 表, Ascend 的多 group KV cache
+        (如 MLA) 会返回多张, 直接解包会抛错。kv_load_failure_policy=fail 时这里
+        只需要定位受影响的请求, 因此用扁平化后的 block ids 判断即可。"""
+        if not self.recompute_kv_load_failures:
+            affected_req_ids: set[str] = set()
+            for request in requests:
+                req_id = request.request_id
+                req_block_ids = self.kv_cache_manager.get_block_ids(req_id)
+                block_ids = [block_id for sub_block_ids in req_block_ids for block_id in sub_block_ids]
+                for block_id in block_ids:
+                    if block_id in invalid_block_ids:
+                        affected_req_ids.add(req_id)
+                        break
+            return affected_req_ids, 0, set()
+
+        return Scheduler._update_requests_with_invalid_blocks(
+            self, requests, invalid_block_ids, num_scheduled_tokens, evict_blocks
+        )
+
     def update_from_output(
         self,
         scheduler_output: SchedulerOutput,
@@ -1075,6 +1126,14 @@ class RecomputeScheduler(Scheduler):
 
         # KV Connector: update state for finished KV Transfers.
         if kv_connector_output:
+            # 先 P 后 D: 先收下 worker 侧 connectors 回传的首 token, 等该请求
+            # finished_recving 后由 _update_waiting_for_remote_kv 补进请求。
+            if envs.REUSE_PREFILLED_TOKENS and kv_connector_output.first_tokens:
+                self._pending_first_tokens.update(kv_connector_output.first_tokens)
+                logger.debug(
+                    "Stored first tokens for requests: %s",
+                    list(kv_connector_output.first_tokens.keys()),
+                )
             self._update_from_kv_xfer_finished(kv_connector_output)
 
         # collect KV cache events from KV cache manager

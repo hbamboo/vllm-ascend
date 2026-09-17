@@ -55,3 +55,12 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
     import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+# ---- 先 P 后 D (p_then_d) 所需的 vLLM 侧 patch ----
+# 三者必须成套生效: connector 在 get_finished 里多返回一路 first_tokens,
+# 需要 KVConnectorModelRunnerMixin 认识三元组, KVConnectorOutput 能承载它,
+# 并由 OpenAIServingRender 把 reuse_prefilled_tokens 透传进 kv_transfer_params。
+if vllm_version_is("0.23.0"):
+    import vllm_ascend.patch.platform.patch_kv_connector  # noqa
+    import vllm_ascend.patch.platform.patch_kv_utils  # noqa
+    import vllm_ascend.patch.platform.patch_render_serving  # noqa

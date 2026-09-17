@@ -54,6 +54,15 @@ def register_connector():
         "MooncakeLayerwiseConnector",
     )
 
+    # 先 P 后 D: P 侧把首个采样 token 随 KV 一起投递给 D, D 复用该 token
+    # 继续 decode (REUSE_PREFILLED_TOKENS=1)。与 MooncakeLayerwiseConnector
+    # 并存, 由 --kv-transfer-config 里的 kv_connector 选择。
+    KVConnectorFactory.register_connector(
+        "MooncakeLayerwisePrefillThenDecodeConnector",
+        "vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_layerwise_prefill_then_decode_connector",
+        "MooncakeLayerwisePrefillThenDecodeConnector",
+    )
+
     KVConnectorFactory.register_connector(
         "UCMConnector", "vllm_ascend.distributed.kv_transfer.kv_pool.ucm_connector", "UCMConnectorV1"
     )

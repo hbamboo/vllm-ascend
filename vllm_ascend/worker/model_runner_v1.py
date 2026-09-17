@@ -2528,6 +2528,22 @@ class NPUModelRunner(GPUModelRunner):
             spec_decode_metadata,
         )
 
+        # 先 P 后 D: P 侧把本步采样出的首个 token 交给 connector。connector 会在
+        # 该请求最后一层 KV 传输完成后, 把首 token 随 DONE_SENDING 一起投给 D,
+        # 让 D 复用这个 token 而不必重新采样 (见 REUSE_PREFILLED_TOKENS)。
+        if self.is_kv_producer and ascend_envs.REUSE_PREFILLED_TOKENS:
+            # 异步调度下 _bookkeeping_sync 交回的是空表(本步采样 id 走
+            # prev_sampled_token_ids 延迟到下一步才对 CPU 可见), 这里退回本步
+            # sampler 的输出取真值。
+            prefilled_token_ids = valid_sampled_token_ids
+            if len(prefilled_token_ids) == 0 and isinstance(sampler_output.sampled_token_ids, torch.Tensor):
+                prefilled_token_ids = sampler_output.sampled_token_ids.tolist()
+            self.send_prefilled_tokens(
+                scheduler_output,
+                req_ids_output_copy,
+                prefilled_token_ids,
+            )
+
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:
                 use_padded_batch = (

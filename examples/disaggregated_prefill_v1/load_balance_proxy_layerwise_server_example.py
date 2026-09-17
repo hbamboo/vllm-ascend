@@ -77,6 +77,27 @@
 # This will return a JSON object with the status and the number of prefiller
 # and decoder instances.
 #
+# Step 5: 先 P 后 D (p_then_d, 可选)
+# ----------------------------------
+# 默认流程是 D 先受理, 再由 D 通过 proxy 的 /v1/metaserver 触发 P 做 prefill。
+# 加上 --p-then-d 则改成 P 先派发:
+#
+#   P 只做 prefill 并采样出第 1 个 token, 其 KV 逐层直接写进 D 的显存; D 收到
+#   KV 后把首 token 当作 prompt 的最后一格重算 KV 并继续 decode, 因此不会重复
+#   输出它。客户端的第 1 个 token 来自 P, 其余来自 D, proxy 把两段流拼接起来。
+#
+# 需要:
+#   - P/D 引擎都设置 REUSE_PREFILLED_TOKENS=1 (流式请求才生效, 非流式由 D 自己
+#     重算首 token), 并使用 MooncakeLayerwisePrefillThenDecodeConnector;
+#   - 所有引擎设置相同的 kv_port 基准, 并给出每个 prefiller 的 params 通道端口
+#     (P 引擎启动日志里的 kv_transfer_params_zmq_port) 与 tp_size:
+#
+#   python load_balance_proxy_layerwise_server_example.py \
+#     --host 127.0.0.1 --port 9000 --p-then-d \
+#     --prefiller-hosts 127.0.0.1 --prefiller-ports 8100 \
+#     --prefiller-kv-params-ports 14580 --prefiller-tp-sizes 8 \
+#     --decoder-hosts 127.0.0.1 --decoder-ports 8200
+#
 # Notes:
 # - You can scale the number of prefiller and decoder servers as needed.
 # - The proxy will round-robin requests to balance load.
@@ -114,9 +135,14 @@ except ImportError:
 
 
 class ServerState:
-    def __init__(self, host, port):
+    def __init__(self, host, port, kv_params_port=None, tp_size=1):
         self.host = host
         self.port = port
+        # 先 P 后 D: P 引擎接收 D 侧 kv_transfer_params 的 ZMQ 基址
+        # (引擎启动日志里的 kv_transfer_params_zmq_port, tp_rank=0 那个),
+        # 以及 P 的 tp_size (D 需要按 rank 逐个投递)。仅 prefiller 需要。
+        self.kv_params_port = kv_params_port
+        self.tp_size = tp_size
         self.url = f"http://{host}:{port}/v1"
         # Auto-completion for ipv6
         try:
@@ -139,7 +165,11 @@ class ServerState:
 
 class ProxyState:
     def __init__(self, prefiller_instances, decoder_instances):
-        self.prefillers: list[ServerState] = [ServerState(h, p) for h, p in prefiller_instances]
+        # parse_args 给出的是扁平四元组 (host, port, kv_params_port, tp_size)
+        self.prefillers: list[ServerState] = [
+            ServerState(host, port, kv_params_port=kv_params_port, tp_size=tp_size)
+            for host, port, kv_params_port, tp_size in prefiller_instances
+        ]
         self.decoders: list[ServerState] = [ServerState(h, p) for h, p in decoder_instances]
         self.req_to_prefiller = {}
         self.req_id_lock = asyncio.Lock()
@@ -273,6 +303,29 @@ def parse_args():
     parser.add_argument(
         "--retry-delay", type=float, default=0.001, help="Base delay (seconds) for exponential backoff retries"
     )
+    # ---- 先 P 后 D (p_then_d) ----
+    parser.add_argument(
+        "--p-then-d",
+        action="store_true",
+        help="先派发 P 再派发 D: P 的流式输出(首 token)先转发给客户端, D 复用该 token "
+        "继续 decode。需要 P/D 引擎都实现 first token 投递, 且各引擎设置 "
+        "REUSE_PREFILLED_TOKENS=1 (流式请求才生效)。",
+    )
+    parser.add_argument(
+        "--prefiller-kv-params-ports",
+        type=int,
+        nargs="+",
+        default=None,
+        help="每个 prefiller 接收 D 侧 kv_transfer_params 的 ZMQ 基址 (即 P 引擎启动日志里的 "
+        "kv_transfer_params_zmq_port)。开启 --p-then-d 时必须与 --prefiller-hosts 一一对应。",
+    )
+    parser.add_argument(
+        "--prefiller-tp-sizes",
+        type=int,
+        nargs="+",
+        default=None,
+        help="每个 prefiller 的 tensor_parallel_size。开启 --p-then-d 时必须与 --prefiller-hosts 一一对应。",
+    )
     args = parser.parse_args()
     logger.info(
         "Decoder hosts will access Proxy host:port/metaserver, ensure that %s can access %s:%s/metaserver",
@@ -290,7 +343,22 @@ def parse_args():
         raise ValueError("Number of prefiller hosts must match number of prefiller ports")
     if len(args.decoder_hosts) != len(args.decoder_ports):
         raise ValueError("Number of decoder hosts must match number of decoder ports")
-    args.prefiller_instances = list(zip(args.prefiller_hosts, args.prefiller_ports))
+    if args.p_then_d:
+        if args.prefiller_kv_params_ports is None or args.prefiller_tp_sizes is None:
+            raise ValueError("--p-then-d 需要同时给出 --prefiller-kv-params-ports 与 --prefiller-tp-sizes")
+        if len(args.prefiller_kv_params_ports) != len(args.prefiller_hosts):
+            raise ValueError("Number of prefiller kv params ports must match number of prefiller hosts")
+        if len(args.prefiller_tp_sizes) != len(args.prefiller_hosts):
+            raise ValueError("Number of prefiller tp sizes must match number of prefiller hosts")
+    else:
+        args.prefiller_kv_params_ports = [None] * len(args.prefiller_hosts)
+        args.prefiller_tp_sizes = [1] * len(args.prefiller_hosts)
+    args.prefiller_instances = [
+        (host, port, kv_ports, tp)
+        for host, port, kv_ports, tp in zip(
+            args.prefiller_hosts, args.prefiller_ports, args.prefiller_kv_params_ports, args.prefiller_tp_sizes
+        )
+    ]
     args.decoder_instances = list(zip(args.decoder_hosts, args.decoder_ports))
     return args
 
@@ -425,6 +493,250 @@ def get_origin_request_id(api, req_id):
         return req_id.replace("chatcmpl-", "")
 
 
+def _is_first_token_event(event: bytes) -> bool:
+    """P 侧的输出只保留"带内容"的 chunk(role + 首 token)。
+
+    P 的 max_tokens=1, 它的收尾 chunk 带 finish_reason, 后面还跟 usage/[DONE] ——
+    这些一旦转发, 客户端会认为流已结束, 看不到 D 续写的部分, 所以必须丢掉。
+    """
+    text = event.decode("utf-8", errors="replace").strip()
+    if not text.startswith("data:"):
+        return False
+    payload = text[len("data:") :].strip()
+    if not payload or payload == "[DONE]":
+        return False
+    try:
+        chunk_json = json.loads(payload)
+    except json.JSONDecodeError:
+        return False
+    if chunk_json.get("usage"):
+        return False
+    for choice in chunk_json.get("choices") or []:
+        if choice.get("finish_reason"):
+            return False
+        delta = choice.get("delta") or {}
+        if delta.get("content") or delta.get("role") or choice.get("text"):
+            return True
+    return False
+
+
+async def _handle_p_then_d(
+    api: str,
+    req_data: dict,
+    request_id: str,
+    request_length: int,
+    stream_flag: bool,
+    chat_flag: bool,
+    origin_prompt: str,
+    origin_max_tokens: int,
+):
+    """先 P 后 D: 先派发 P, 再把 P 的首 token 与 D 的后续输出拼成一个流返回。
+
+    P 只算 prefill 并采样出第 1 个 token, 它的 KV 逐层直接写进 D 的显存; D 侧
+    收到 KV 后把首 token 当作 prompt 的最后一格重算 KV, 因此不会重复输出它 ——
+    客户端看到的第 1 个 token 来自 P, 其余来自 D。非流式请求无法拼接两段响应,
+    此时 D 会自己重算首 token (reuse_prefilled_tokens=False), P 的输出丢弃。
+    """
+    prefiller_score = proxy_state.calculate_prefill_scores(request_length)
+    prefiller_idx = proxy_state.select_prefiller(prefiller_score)
+    prefiller = proxy_state.prefillers[prefiller_idx]
+    decoder_score = proxy_state.calculate_decode_scores(request_length)
+    decoder_idx = proxy_state.select_decoder(decoder_score)
+    decoder = proxy_state.decoders[decoder_idx]
+
+    # P 侧: do_remote_decode=True 让 P 把本请求登记为"待发送", 并等待 D 的
+    # block table 经 kv_transfer_params channel 直投过来 (不走 metaserver)。
+    req_data_p = {k: v for k, v in req_data.items() if k != "kv_transfer_params"}
+    req_data_p["kv_transfer_params"] = {"do_remote_decode": True}
+    req_data_p["stream"] = stream_flag
+    req_data_p["max_tokens"] = 1
+    req_data_p["min_tokens"] = 1
+    if "max_completion_tokens" in req_data_p:
+        req_data_p["max_completion_tokens"] = 1
+    req_data_p.pop("stream_options", None)
+
+    # D 侧: do_remote_prefill=True 触发拉取; kv_transfer_params_zmq_port /
+    # remote_tp_size 告诉 D 把 block table 投给哪个 P (逐个 tp rank)。
+    req_data_d = copy.deepcopy(req_data)
+    req_data_d["kv_transfer_params"] = {
+        "do_remote_prefill": True,
+        # D 要经专线把 block table 投给 P 的每个 tp rank: 基址 + 目标主机
+        "kv_transfer_params_zmq_port": prefiller.kv_params_port,
+        "remote_tp_size": prefiller.tp_size,
+        "remote_host": prefiller.host,
+    }
+
+    async def _pump(gen, out_queue):
+        try:
+            async for chunk in gen:
+                await out_queue.put(chunk)
+        except Exception as e:
+            # 交给消费端统一处理 (与 D-first 路径的报错方式保持一致)
+            await out_queue.put(e)
+        finally:
+            await out_queue.put(None)
+
+    async def _decoder_chunks():
+        """消费 D 的流, 保留 recompute 重试语义 (与 D-first 路径一致)。"""
+        generated_token = ""
+        retry_count = 0
+        retry = True
+        completion_tokens = 0
+        while retry:
+            retry = False
+            async for chunk in stream_service_response_with_retry(
+                decoder.client,
+                api,
+                req_data_d,
+                request_id=request_id,
+                max_retries=global_args.max_retries,
+                base_delay=global_args.retry_delay,
+            ):
+                try:
+                    chunk_str = chunk.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    yield chunk
+                    continue
+                if not chunk_str:
+                    continue
+                if chunk_str.startswith("data: "):
+                    chunk_str = chunk_str[len("data: ") :]
+                try:
+                    chunk_json = json.loads(chunk_str)
+                except json.JSONDecodeError:
+                    yield chunk
+                    continue
+                choices = chunk_json.get("choices", [])
+                if not choices:
+                    yield chunk
+                    continue
+                choice = choices[0]
+                delta = choice.get("delta") or {}
+                message = choice.get("message") or {}
+                content = delta.get("content") or message.get("content") or choice.get("text") or ""
+                generated_token += content
+                usage = chunk_json.get("usage", {})
+                completion_tokens = (
+                    (completion_tokens + 1)
+                    if stream_flag
+                    else (completion_tokens + (usage.get("completion_tokens") or 0))
+                )
+                if choice.get("stop_reason") == "recomputed":
+                    retry = True
+                    retry_count += 1
+                    if chat_flag:
+                        messages = req_data_d["messages"]
+                        messages[0]["content"] = origin_prompt + generated_token
+                    else:
+                        req_data_d["prompt"] = origin_prompt + generated_token
+                    req_data_d["max_tokens"] = origin_max_tokens - completion_tokens + retry_count
+                    break
+                if retry_count > 0 and not stream_flag:
+                    if chat_flag:
+                        choice["message"]["content"] = generated_token
+                    else:
+                        choice["text"] = generated_token
+                    chunk = json.dumps(chunk_json).encode("utf-8")
+                yield chunk
+
+    async def generate_stream():
+        decoder_queue: asyncio.Queue = asyncio.Queue()
+        decoder_task = asyncio.create_task(_pump(_decoder_chunks(), decoder_queue))
+        prefiller_task = None
+        try:
+            # 先把 P 放出去 (它一受理就开始 prefill), 再转发 D 的输出。
+            # 流式: P 的首 token 直接转发; 非流式: P 的输出丢弃, D 会自己算。
+            if stream_flag:
+                proxy_state.req_perf.setdefault(request_id, {})["pf"] = time.perf_counter()
+                prefiller_queue: asyncio.Queue = asyncio.Queue()
+                prefiller_task = asyncio.create_task(
+                    _pump(
+                        stream_service_response_with_retry(
+                            prefiller.client,
+                            api,
+                            req_data_p,
+                            request_id=request_id,
+                            max_retries=global_args.max_retries,
+                            base_delay=global_args.retry_delay,
+                        ),
+                        prefiller_queue,
+                    )
+                )
+                # 按 SSE 事件边界切整齐再挑: 只转发 P 的首 token (含 role),
+                # 丢掉 finish_reason/usage/[DONE], 否则客户端会提前收流。
+                pending = b""
+                while True:
+                    item = await prefiller_queue.get()
+                    if item is None:
+                        break
+                    if isinstance(item, Exception):
+                        logger.warning("Prefiller stream failed for %s: %s", request_id, item)
+                        break
+                    pending += item
+                    while b"\n\n" in pending:
+                        event, pending = pending.split(b"\n\n", 1)
+                        if not _is_first_token_event(event):
+                            continue
+                        if "tok" not in proxy_state.req_perf.get(request_id, {}):
+                            proxy_state.req_perf[request_id]["tok"] = time.perf_counter()
+                        yield event + b"\n\n"
+                if pending.strip() and _is_first_token_event(pending):
+                    yield pending
+            else:
+                # 非流式: 不需要转发 P 的输出, 但**必须**和 D 并发派发 —— P 在
+                # 自己的前向里等 D 投来 block table, 若先 await P 再派发 D 就成
+                # 了互相等待。这里只把 P 发出去, 完成与否不阻塞 D。
+                proxy_state.req_perf.setdefault(request_id, {})["pf"] = time.perf_counter()
+                prefiller_task = asyncio.create_task(
+                    send_request_to_service(
+                        prefiller.client,
+                        prefiller_idx,
+                        api,
+                        req_data_p,
+                        request_id,
+                        max_retries=global_args.max_retries,
+                        base_delay=global_args.retry_delay,
+                    )
+                )
+
+                def _log_prefiller_failure(task):
+                    if not task.cancelled() and task.exception() is not None:
+                        logger.error("Prefiller request failed for %s: %s", request_id, task.exception())
+
+                prefiller_task.add_done_callback(_log_prefiller_failure)
+
+            while True:
+                item = await decoder_queue.get()
+                if item is None:
+                    break
+                if isinstance(item, Exception):
+                    raise item
+                yield item
+        finally:
+            for task in (prefiller_task, decoder_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            proxy_state.release_prefiller(prefiller_idx, prefiller_score)
+            proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
+            proxy_state.release_decoder(decoder_idx, decoder_score)
+            st = proxy_state.req_perf.pop(request_id, None)
+            if st:
+
+                def _f(k: str) -> str:
+                    return f"{st[k]:.6f}" if k in st else "-"
+
+                print(
+                    f"[h2h][perf] proxy req={request_id} in={_f('in')} meta={_f('meta')} "
+                    f"pf={_f('pf')} tok={_f('tok')} done={time.perf_counter():.6f}",
+                    flush=True,
+                )
+
+    return StreamingResponse(
+        generate_stream(),
+        media_type="text/event-stream" if stream_flag else "application/json",
+    )
+
+
 async def _handle_completions(api: str, request: Request):
     try:
         req_data = await request.json()
@@ -463,6 +775,19 @@ async def _handle_completions(api: str, request: Request):
             origin_prompt = ""
         # refer to vLLM sampling_params: max_token default value
         origin_max_tokens = req_data.get("max_tokens", 16)
+
+        if global_args.p_then_d:
+            # 先 P 后 D: P 先受理并把首 token 流回来, D 复用该 token 续跑。
+            return await _handle_p_then_d(
+                api=api,
+                req_data=req_data,
+                request_id=request_id,
+                request_length=request_length,
+                stream_flag=stream_flag,
+                chat_flag=chat_flag,
+                origin_prompt=origin_prompt,
+                origin_max_tokens=origin_max_tokens,
+            )
 
         async def generate_stream():
             nonlocal released_kv

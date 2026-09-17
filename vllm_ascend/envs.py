@@ -126,7 +126,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # write 完成后按序发出(与后续批重叠). 关闭时保持单线程原语义.
     "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
-    "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
+    "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
+    # 先 P 后 D (p_then_d): 1=开启首 token 复用. P 侧 prefill 完成后, 把本步
+    # 采样出的首个 token 经侧信道 (FIRST_TOKEN_MSG) 随 DONE_SENDING 一起发给 D;
+    # D 侧把该 token 追加到 prompt 末尾并只重算这一个 token 的 KV, 从而省掉
+    # "D 重算首 token" 的开销. 0=关闭, 只传 KV, 首 token 由 D 自己算.
+    # 仅对流式请求生效(非流式在 render serving 侧强制关闭).
+    "REUSE_PREFILLED_TOKENS": lambda: bool(int(os.getenv("REUSE_PREFILLED_TOKENS", "0")))
 }
 
 # end-env-vars-definition
