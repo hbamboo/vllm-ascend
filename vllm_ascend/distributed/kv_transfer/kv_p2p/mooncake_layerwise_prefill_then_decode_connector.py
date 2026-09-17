@@ -1267,8 +1267,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += job.batch_wait_ms
         for send_task in job.tasks:
-            if send_task.layer_idx == (self.total_layers - 1):
-                layer_group_idx = self.layer_metadata[send_task.layer_name].tensor_group_idx[0]
+            # 请求级信号(首 token / DONE / 作废)由**每个参与发送的 rank 在各自的
+            # group 末层**下发, 不能只看最后一层: 不等分 P/D 切分下 attention 组
+            # 的数据按请求落在不同的 P rank 上, 只认 total_layers-1 会让"本 rank
+            # 不承载该请求末层"的请求永远发不出首 token —— D 侧压着等首 token,
+            # 客户端就此挂死(2026-09-17 实测 P TP4→D TP2 约 6% 请求命中)。
+            is_group_end, layer_group_idx = self._group_end_of_task(send_task)
+            if is_group_end:
                 for req_id, req_meta in send_task.send_request.items():
                     if req_id not in job.transferred_reqs:
                         continue
