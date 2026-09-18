@@ -99,6 +99,21 @@ _LAYER_BATCH = int(os.getenv("MC_TCP_LAYER_BATCH", "8"))
 # 用于定位 H2H 通路相对 D2D 的 TTFT 增量来源(攒批等待/事件/D2H/写/LAYER_DONE/H2D).
 _PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
 
+# mamba 状态块下标探针: 1=每个 mamba 层打印 (mode, nspec, 源/目的表长与取块下标).
+# 用于核对 align 模式下"源块 == 目的块"这一不变式 —— 两侧表长或下标一旦不对齐,
+# D 侧读到的就是占位块/别人的状态(跨块 prompt 乱码).
+_MAMBA_IDX_DEBUG = os.getenv("MC_DEBUG_MAMBA_IDX", "0") == "1"
+
+# 发送线程与模型前向是异步的: 请求前向结束时, 本 rank 的发送线程可能仍在读该
+# 请求的 KV cache 块(并发的请求越多, 发送线程滞后越久). 若不延迟释放, vLLM 会
+# 立即把块还给分配器, 被下一个请求复用并覆写 —— 发送线程随后 flush 到的是**别人
+# 的数据**, 表现为并发下内容级损坏(串行/错开派发时看不到). 置 0 可回退旧行为做
+# A/B. 释放时机由 worker 上报 finished_sending 决定: 该请求最后一个批
+# write+LAYER_DONE 完成之后.
+# 2026-09-18 A/B: P TP4/D TP4 + D-first 下开启它并不改善 needle 长 prompt 的
+# 内容损坏(3-4/10 通过, 与关闭时相当), 故默认关; 保留实现供后续排查/启用.
+_DELAY_FREE_SEND = os.getenv("MC_DELAY_FREE_SEND", "0") == "1"
+
 # H2H 写线程流水 A/B (仅 protocol=tcp 且非 reshard/量化路径): 1=发送线程只做
 # "等事件 + D2H flush", write 交给独立写线程连续占满数据面, LAYER_DONE 在对应
 # write 完成后按序发出(与后续批的 write / flush 重叠). 关闭时保持单线程原语义.
@@ -349,6 +364,12 @@ class KVCacheSendingLayerThread(threading.Thread):
         # perf: 上一批处理完成的时刻(用于统计批间攒批等待)与批序号.
         self._last_batch_end_at: float | None = None
         self._batch_seq = 0
+        # 延迟释放登记: req_id -> 含该请求的最后一个批号. 批按序号 FIFO 收尾,
+        # 故"最后一个批 <= 已收尾批号"即该请求再无发送线程在读它的块.
+        self._send_done_lock = threading.Lock()
+        self._req_last_batch: dict[str, int] = {}
+        self._done_send_reqs: set[str] = set()
+        self._finalized_batch = -1
         # perf: 请求级累计(external req id -> 累计), 在 DONE 回调处打印后清除.
         # 批内共享段(flush/write/layerdone)以批共享口径计入该批全部请求.
         self._perf_req: dict[str, dict[str, float]] = {}
@@ -417,6 +438,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                 [t.layer_idx for t in tasks],
                 e,
             )
+        finally:
+            if _DELAY_FREE_SEND and not self.use_pipe_writer:
+                # 单线程路径: 本批的 write+LAYER_DONE 已在本方法内同步完成
+                # (异常也视为不再读该批的块), 可释放其覆盖到的请求.
+                self._mark_batch_finalized(self._batch_seq)
         if _PERF_LOG and not self.use_pipe_writer:
             self._last_batch_end_at = time.perf_counter()
 
@@ -431,6 +457,37 @@ class KVCacheSendingLayerThread(threading.Thread):
         return send_task.layer_idx == self.group_max_layer_idx.get(layer_group_idx, self.total_layers - 1), (
             layer_group_idx
         )
+
+    def _track_req_batch(self, req_id: str, batch_id: int) -> None:
+        """登记"含该请求的批". 发送线程处理完该批前, 该请求的块不能被释放."""
+        with self._send_done_lock:
+            prev = self._req_last_batch.get(req_id)
+            if prev is None or batch_id > prev:
+                self._req_last_batch[req_id] = batch_id
+
+    def _mark_batch_finalized(self, batch_id: int) -> None:
+        """批的 write + LAYER_DONE 已全部收尾; 其覆盖到的请求再无发送线程在读."""
+        with self._send_done_lock:
+            if batch_id > self._finalized_batch:
+                self._finalized_batch = batch_id
+            for r in [r for r, b in self._req_last_batch.items() if b <= self._finalized_batch]:
+                self._req_last_batch.pop(r, None)
+                self._done_send_reqs.add(r)
+
+    def forget_req(self, req_id: str) -> None:
+        with self._send_done_lock:
+            self._req_last_batch.pop(req_id, None)
+            self._done_send_reqs.discard(req_id)
+
+    def has_pending_send(self, req_id: str) -> bool:
+        with self._send_done_lock:
+            return req_id in self._req_last_batch
+
+    def get_and_clear_done_sending(self) -> set[str]:
+        with self._send_done_lock:
+            out = set(self._done_send_reqs)
+            self._done_send_reqs.clear()
+            return out
 
     def _request_sender_path_count(self, peer_blocks: dict) -> int:
         """本请求在该 peer 上期望的 P 侧发送方路径总数(各 group 取并集).
@@ -469,6 +526,24 @@ class KVCacheSendingLayerThread(threading.Thread):
             return (src_list, dst_list, length_list)
         layer_name = send_task.layer_name
         layer_kv_cache_spec = self.kv_cache_specs[layer_group_idx]
+        if _MAMBA_IDX_DEBUG and getattr(self, "_blk_len_logged", None) != (req_id, layer_group_idx):
+            # 不变式探针: 逐 group 核对 P 与 D 的块表长度. 长度不等时 zip/下标配对
+            # 会静默错位(长 prompt 多块场景尤甚) —— 这是"部分位置 KV 错"的典型来源.
+            self._blk_len_logged = (req_id, layer_group_idx)
+            logger.info(
+                "[blk_len] P req=%s grp=%d spec=%s prompt_len=%s len_local=%d len_remote=%d "
+                "local_head=%s remote_head=%s local_tail=%s remote_tail=%s",
+                req_id,
+                layer_group_idx,
+                type(layer_kv_cache_spec).__name__,
+                getattr(req_meta, "prompt_len", None),
+                len(local_block_ids),
+                len(remote_block_ids),
+                local_block_ids[:4],
+                remote_block_ids[:4],
+                local_block_ids[-4:],
+                remote_block_ids[-4:],
+            )
         remote_layer_metadata = req_meta.peer_layer_metadata[peer][layer_name]
         local_layer_metadata = self.layer_metadata[layer_name]
 
@@ -490,6 +565,24 @@ class KVCacheSendingLayerThread(threading.Thread):
             else:
                 local_transfer_idx = 0
                 remote_transfer_idx = 0
+            if _MAMBA_IDX_DEBUG and getattr(self, "_mamba_idx_logged", None) != (req_id, layer_group_idx):
+                self._mamba_idx_logged = (req_id, layer_group_idx)
+                logger.info(
+                    "[mamba_idx] P req=%s layer=%s grp=%d mode=%s nspec=%d prompt_len=%s "
+                    "len_local=%d idx_l=%d blk_l=%s len_remote=%d idx_r=%d blk_r=%s",
+                    req_id,
+                    layer_name,
+                    layer_group_idx,
+                    self.mamba_cache_mode,
+                    self.num_speculative_tokens,
+                    getattr(req_meta, "prompt_len", None),
+                    len(local_block_ids),
+                    local_transfer_idx,
+                    local_block_ids[local_transfer_idx] if 0 <= local_transfer_idx < len(local_block_ids) else None,
+                    len(remote_block_ids),
+                    remote_transfer_idx,
+                    remote_block_ids[remote_transfer_idx] if 0 <= remote_transfer_idx < len(remote_block_ids) else None,
+                )
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
@@ -749,6 +842,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_meta[session_id] = meta
                     if req_id not in meta.req_ids:
                         meta.req_ids.append(req_id)
+                        if _DELAY_FREE_SEND:
+                            self._track_req_batch(req_id, batch_id)
                     meta.req_peer[req_id] = (peer_host, peer_port)
                     (src_list, dst_list, length_list) = self.get_transfer_meta(
                         send_task, req_id, req_meta, layer_group_idx, peer
@@ -769,6 +864,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                         # 每个参与发送的 rank 各自下发一次, D 侧按 sender_path 计数
                         # 收齐 —— 只由最后一层(MTP, 属 attention 组)那批下发时, mamba
                         # 组另一个发送方的数据可能尚未落地, D 会提前开始解码.
+                        # (2026-09-18 试过"等该请求全部 group 末层再下发", 实测不改善
+                        #  needle 长 prompt 损坏, 且有"某组末层不出现 => D 永久等待"的
+                        #  挂死风险, 故未采用.)
                         meta.req_done[(peer_host, peer_port, req_id)] = (
                             req_meta.chunk_finish,
                             self._request_sender_path_count(req_meta.peer_transfer[peer]),
@@ -1025,6 +1123,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                         session_meta[session_id] = meta
                     if req_id not in meta.req_ids:
                         meta.req_ids.append(req_id)
+                        if _DELAY_FREE_SEND:
+                            self._track_req_batch(req_id, batch_id)
                     meta.req_peer[req_id] = (peer_host, peer_port)
                     (src_list, dst_list, length_list) = self.get_transfer_meta(
                         send_task, req_id, req_meta, layer_group_idx, peer
@@ -1045,6 +1145,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                         # 每个参与发送的 rank 各自下发一次, D 侧按 sender_path 计数
                         # 收齐 —— 只由最后一层(MTP, 属 attention 组)那批下发时, mamba
                         # 组另一个发送方的数据可能尚未落地, D 会提前开始解码.
+                        # (2026-09-18 试过"等该请求全部 group 末层再下发", 实测不改善
+                        #  needle 长 prompt 损坏, 且有"某组末层不出现 => D 永久等待"的
+                        #  挂死风险, 故未采用.)
                         meta.req_done[(peer_host, peer_port, req_id)] = (
                             req_meta.chunk_finish,
                             self._request_sender_path_count(req_meta.peer_transfer[peer]),
@@ -1143,6 +1246,15 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _pipe_finalize(self, job: _PipeJob):
         """LAYER_DONE + perf 批行 + 请求级累计/DONE. 语义镜像单线程版 4/5 步."""
+        try:
+            self._pipe_finalize_inner(job)
+        finally:
+            if _DELAY_FREE_SEND:
+                # 该批 write 与 LAYER_DONE 均已收尾(异常亦然), 其覆盖到的请求
+                # 此后不再被发送线程读取, 可交回 vLLM 释放.
+                self._mark_batch_finalized(job.batch_id)
+
+    def _pipe_finalize_inner(self, job: _PipeJob):
         # 写失败的 session 不发 LAYER_DONE, 其 req 计入 failed(镜像 ret<0 分支).
         for session_id, failed_ids in job.failed.items():
             self.failed_reqs.update(failed_ids)
@@ -1722,7 +1834,7 @@ class MooncakeLayerwiseConnector(KVConnectorBase_V1, SupportsHMA):
     def get_finished(self, finished_req_ids: set[str]) -> tuple[set[str], set[str]]:
         """Get the finished recving and sending requests."""
         assert self.connector_worker is not None
-        return self.connector_worker.get_finished()
+        return self.connector_worker.get_finished(finished_req_ids)
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """Get the block ids that have load errors."""
@@ -2065,6 +2177,20 @@ class MooncakeLayerwiseConnectorScheduler:
                 if retry == 3:
                     raise e
 
+    def _delay_free_for_sending(self, request: "Request") -> bool:
+        """P 侧: 该请求的 KV 是否可能仍在被发送线程读取.
+
+        逐层 push 的发送线程与模型前向异步, 前向结束 ≠ 数据发完. 释放太快
+        会被后续请求复用并覆写, 发送线程于是把别人的数据发给 D(并发下内容级
+        损坏). 返回 True 时由 worker 在发送收尾后上报 finished_sending。
+        """
+        if not _DELAY_FREE_SEND:
+            return False
+        params = request.kv_transfer_params
+        if params is None:
+            return False
+        return bool(params.get("do_remote_decode"))
+
     def request_finished(
         self,
         request: "Request",
@@ -2074,8 +2200,7 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        # layer_wise push, not need delay_free_blocks
-        return False, None
+        return self._delay_free_for_sending(request), None
 
     def request_finished_all_groups(
         self,
@@ -2086,8 +2211,7 @@ class MooncakeLayerwiseConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        # layer_wise push, not need delay_free_blocks
-        return False, None
+        return self._delay_free_for_sending(request), None
 
 
 class MooncakeLayerwiseConnectorWorker:
@@ -2177,6 +2301,8 @@ class MooncakeLayerwiseConnectorWorker:
         self.k_buffer: torch.Tensor | None = None
         self.v_buffer: torch.Tensor | None = None
         self.virtual_request: set[str] = set()
+        # 已结束、等发送线程收尾后再上报 finished_sending 的请求.
+        self._awaiting_send_done: set[str] = set()
         self._invalid_block_ids: set[int] = set()
         self._recving_metadata: dict[str, ReqMeta] = {}
 
@@ -2433,7 +2559,27 @@ class MooncakeLayerwiseConnectorWorker:
             self.kv_recv_layer_thread.start()
             ready_event.wait()
 
-    def get_finished(self) -> tuple[set[str], set[str]]:
+    def get_finished(self, finished_req_ids: set[str] | None = None) -> tuple[set[str], set[str]]:
+        done_sending: set[str] = set()
+        if (
+            _DELAY_FREE_SEND
+            and self.vllm_config.kv_transfer_config.is_kv_producer
+            and self.kv_send_layer_thread is not None
+        ):
+            # 只上报"确实已结束"的请求(vLLM 在 finished_sending 分支里断言
+            # request.is_finished()): 它们在本步的 finished_req_ids 里出现过。
+            # 发送线程还没把最后一个批收尾的, 记在待上报集合里, 后续步再报;
+            # 从未被发送线程登记过的(没有层要发)立即上报, 否则块会一直挂着。
+            for req_id in finished_req_ids or ():
+                if self.kv_send_layer_thread.has_pending_send(req_id):
+                    self._awaiting_send_done.add(req_id)
+                else:
+                    self.kv_send_layer_thread.forget_req(req_id)
+                    done_sending.add(req_id)
+            for req_id in [r for r in self._awaiting_send_done if not self.kv_send_layer_thread.has_pending_send(r)]:
+                self._awaiting_send_done.discard(req_id)
+                self.kv_send_layer_thread.forget_req(req_id)
+                done_sending.add(req_id)
         done_recving = (
             self.kv_recv_layer_thread.get_and_clear_done_requests(  # type: ignore[union-attr]
             )
@@ -2461,7 +2607,7 @@ class MooncakeLayerwiseConnectorWorker:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
             )
-        return set(), done_recving
+        return done_sending, done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
