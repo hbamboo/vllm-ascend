@@ -1,6 +1,7 @@
 import os
 import threading
 import time
+import zlib
 from bisect import bisect_right
 
 import numpy as np
@@ -814,6 +815,59 @@ class GlobalTE:
                 (time.perf_counter() - t0) * 1000,
                 len(synced),
             )
+
+
+    # ------------------------------------------------------------------
+    # 内容链路自检 (MC_XCHK=1, 调试用): 对 staging 区间取 crc, 用于
+    # 「P staging -> TCP -> D staging -> H2D -> D NPU」逐段比对 —— 只有带上
+    # 由调用方给定的 (批/序号) 键才不会像早期版本那样被"同地址被后续批复用"
+    # 搞成配对错位.
+    # ------------------------------------------------------------------
+    def crc_for_cpu_addrs(self, cpu_addrs: list[int], lengths: list[int], sample: int = 512) -> list[int]:
+        if not self._cpu_tensors:
+            return []
+        cpu_tensor = self._cpu_tensors[0]
+        base = cpu_tensor.data_ptr()
+        nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+        flat = cpu_tensor.view(torch.uint8).reshape(-1)
+        out: list[int] = []
+        for addr, ln in zip(cpu_addrs, lengths):
+            off = addr - base
+            if off < 0 or off >= nbytes or ln <= 0:
+                out.append(0)
+                continue
+            take = min(sample, ln, nbytes - off)
+            out.append(zlib.crc32(flat[off : off + take].numpy().tobytes()))
+        return out
+
+    def poke_cpu_addr(self, cpu_addr: int, nbytes: int = 4) -> None:
+        """MC_XCHK_FAULT 反向对照: 故意改坏 staging 头 nbytes 字节."""
+        if not self._cpu_tensors:
+            return
+        cpu_tensor = self._cpu_tensors[0]
+        base = cpu_tensor.data_ptr()
+        off = cpu_addr - base
+        flat = cpu_tensor.view(torch.uint8).reshape(-1)
+        if 0 <= off < flat.numel():
+            flat[off : off + min(nbytes, flat.numel() - off)] = 0xAB
+
+    def refetch_npu_to_staging(self, cpu_addrs: list[int], lengths: list[int]) -> None:
+        """把 staging 区间对应的 NPU 内容反向拷回 staging(crc 自检用)."""
+        if not self._cpu_tensors or not self._region_mode:
+            return
+        src: list[int] = []
+        dst: list[int] = []
+        sizes: list[int] = []
+        for addr, ln in zip(cpu_addrs, lengths):
+            npu_addr = self._cpu_to_npu_addr_in_regions(addr)
+            if npu_addr is None or ln <= 0:
+                continue
+            src.append(npu_addr)
+            dst.append(addr)
+            sizes.append(ln)
+        if src:
+            self.submit_dma_copy_ptrs(src, dst, sizes, _DIRECTION_D2H)
+
 
     def stop_bg_sync(self):
         self._bg_sync_stop.set()
