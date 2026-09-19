@@ -385,8 +385,6 @@ class KVCacheSendingLayerThread(threading.Thread):
         # 故"最后一个批 <= 已收尾批号"即该请求再无发送线程在读它的块.
         self._send_done_lock = threading.Lock()
         self._req_last_batch: dict[str, int] = {}
-        # (peer, req) -> 已发到末层的 group 集合(门闩: 见 _req_all_groups_ended)
-        self._group_end_seen: dict[tuple[tuple[str, int], str], set[int]] = {}
         # MC_XCHK: 在飞批次的 staging 区间(batch_id -> [(addr,len)]) —— 检测共享
         # staging 被后续批 flush 改写
         self._inflight_ranges: dict[int, list[tuple[int, int]]] = {}
@@ -512,33 +510,6 @@ class KVCacheSendingLayerThread(threading.Thread):
             return
         with self._send_done_lock:
             self._inflight_ranges.pop(batch_id, None)
-
-    def _req_all_groups_ended(
-        self, req_meta: ReqMeta, peer: tuple[str, int], req_id: str, group_idx: int
-    ) -> bool:
-        """本 rank 是否已把该请求在本 peer 上的所有 group 都发到各自的末层.
-
-        请求级完成信号必须晚于"该请求在本 rank 上的数据全部写达对端":
-        2026-09-18 实测, 只在**第一个** group 末层就下发时, D 侧 376/376 条请求都在
-        **最后一个批到达之前**就被判定"收齐"(完成时只计入 11/12 个批), 而最后一个批
-        正是携带末几层 KV / mamba 状态的那个 —— D 于是带着"不可用的上下文"做首个前向,
-        首 token 分布直接塌成均匀(top-3 logprob 齐刷刷 -5.4), 随后复读/乱码。
-        层按 layer_idx 递增发送, 故**末层批发完**即代表全部写过; 不等 TP 时本 rank
-        可能不承载末层, 用"所有 group 都到末层"兜底, 两者取或 => 不会挂死.
-        """
-        peer_blocks = req_meta.peer_transfer.get(peer)
-        if peer_blocks is None:
-            return False
-        expected = {g for g, ids in enumerate(peer_blocks["local_block_ids"]) if ids}
-        if not expected:
-            return False
-        with self._send_done_lock:
-            seen = self._group_end_seen.setdefault((peer, req_id), set())
-            seen.add(group_idx)
-            if seen >= expected:
-                self._group_end_seen.pop((peer, req_id), None)
-                return True
-            return False
 
     def _track_req_batch(self, req_id: str, batch_id: int) -> None:
         """登记"含该请求的批". 发送线程处理完该批前, 该请求的块不能被释放."""
@@ -949,12 +920,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
-                    is_group_end, group_idx_of_task = self._group_end_of_task(send_task)
-                    # 末层批(该请求所有 group 的数据都已发过) 或 本 rank 全部 group
-                    # 都到末层 —— 取或, 既不下发过早也不挂死(见 _req_all_groups_ended).
-                    if send_task.layer_idx == (self.total_layers - 1) or (
-                        is_group_end and self._req_all_groups_ended(req_meta, peer, req_id, group_idx_of_task)
-                    ):
+                    is_group_end, _ = self._group_end_of_task(send_task)
+                    if is_group_end:
                         # 本 rank 在该 group 上对该请求的最后一个带数据层: 它此前各批
                         # 的 LAYER_DONE 握手已完成, 数据全部写达. 记录该 peer 在该请求
                         # 末轮的完成信息(is_last=chunk_finish; trans_count=该请求在该
@@ -1248,12 +1215,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                     meta.dst.extend(dst_list)
                     meta.length.extend(length_list)
                     meta.req_slices.setdefault(req_id, []).append((start, len(src_list)))
-                    is_group_end, group_idx_of_task = self._group_end_of_task(send_task)
-                    # 末层批(该请求所有 group 的数据都已发过) 或 本 rank 全部 group
-                    # 都到末层 —— 取或, 既不下发过早也不挂死(见 _req_all_groups_ended).
-                    if send_task.layer_idx == (self.total_layers - 1) or (
-                        is_group_end and self._req_all_groups_ended(req_meta, peer, req_id, group_idx_of_task)
-                    ):
+                    is_group_end, _ = self._group_end_of_task(send_task)
+                    if is_group_end:
                         # 本 rank 在该 group 上对该请求的最后一个带数据层: 它此前各批
                         # 的 LAYER_DONE 握手已完成, 数据全部写达. 记录该 peer 在该请求
                         # 末轮的完成信息(is_last=chunk_finish; trans_count=该请求在该
