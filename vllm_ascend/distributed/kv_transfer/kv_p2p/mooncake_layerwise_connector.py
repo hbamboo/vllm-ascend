@@ -1909,24 +1909,27 @@ class KVCacheRecvingLayerThread(threading.Thread):
                                 # 故只需探测"最后一个区间的尾部"(它最后到)即可判定整批是否到齐 ——
                                 # 这一点开销极小(~0.05ms), 不用对全部区间重算 crc(那样每次重试 ~10ms,
                                 # 会把请求拖到 20s+ 量级).
-                                _last_a = layer_dst_addrs[-1]
-                                _last_l = layer_lengths[-1]
-                                _tail = min(_VERIFY_TAIL_BYTES, _last_l)
-                                _want = peer_crcs[-1] if peer_crcs else -1
+                                # 逐**区间**尾部校验(不是只查最后一个区间): 实测各区间并非严格按序到达
+                                # (残留不一致的区间下标是散的), 只探末尾会漏 ⇒ 每区间取尾部
+                                # _VERIFY_TAIL_BYTES 字节, 全部到齐才 H2D.
                                 t_v0 = time.perf_counter()
                                 retries = 0
                                 while True:
-                                    _got = global_te.crc_for_cpu_addrs([_last_a + _last_l - _tail], [_tail], _tail)
-                                    if not _got or _got[0] == _want:
+                                    _got = global_te.crc_for_cpu_addrs_tail(
+                                        layer_dst_addrs, layer_lengths, _VERIFY_TAIL_BYTES
+                                    )
+                                    _bad = [k for k, (a, b) in enumerate(zip(peer_crcs, _got)) if a != b]
+                                    if not _bad:
                                         break
                                     if (time.perf_counter() - t_v0) * 1e3 >= _H2D_VERIFY_TIMEOUT_MS:
                                         logger.warning(
-                                            "[H2D-VERIFY] 等 bulk 数据到齐超时 %.0f ms (重试 %d 次) reqs=%s last_range=[%d,+%d)",
+                                            "[H2D-VERIFY] 等 bulk 数据到齐超时 %.0f ms (重试 %d 次) reqs=%s bad=%d/%d idx=%s",
                                             (time.perf_counter() - t_v0) * 1e3,
                                             retries,
                                             layer_req_ids,
-                                            _last_a,
-                                            _last_l,
+                                            len(_bad),
+                                            len(_got),
+                                            _bad[:6],
                                         )
                                         break
                                     retries += 1
