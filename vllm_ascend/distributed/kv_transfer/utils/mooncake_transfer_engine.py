@@ -851,6 +851,25 @@ class GlobalTE:
         if 0 <= off < flat.numel():
             flat[off : off + min(nbytes, flat.numel() - off)] = 0xAB
 
+    def crc_for_cpu_addrs_tail(self, cpu_addrs: list[int], lengths: list[int], n: int = 512) -> list[int]:
+        """与 crc_for_cpu_addrs 相同, 但取每个区间**尾部** n 字节 —— TCP 顺序流下尾部最后到,
+        用它判定"整批是否到齐"最敏感也最省."""
+        if not self._cpu_tensors:
+            return []
+        cpu_tensor = self._cpu_tensors[0]
+        base = cpu_tensor.data_ptr()
+        nbytes = cpu_tensor.numel() * cpu_tensor.element_size()
+        flat = cpu_tensor.view(torch.uint8).reshape(-1)
+        out: list[int] = []
+        for addr, ln in zip(cpu_addrs, lengths):
+            off = addr - base
+            if off < 0 or off >= nbytes or ln <= 0:
+                out.append(0); continue
+            take = min(n, ln, nbytes - off)
+            end = min(off + ln, nbytes)
+            out.append(zlib.crc32(flat[end - take : end].numpy().tobytes()))
+        return out
+
     def cpu_to_npu_addr(self, cpu_addr: int) -> int | None:
         if not self._cpu_tensors or not self._region_mode:
             return None

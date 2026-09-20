@@ -118,6 +118,22 @@ _XCHK_FAULT = os.getenv("MC_XCHK_FAULT", "0") == "1"
 _XCHK_LANDING = os.getenv("MC_XCHK_LANDING", "0") == "1"
 # 每区间取样字节数(自检覆盖范围).
 _XCHK_SAMPLE = int(os.getenv("MC_XCHK_SAMPLE", "8192"))
+# "用到前再验一次"(start_load_kv 里读 NPU 比对)会引入 host 同步, 会把"批内读串"的现象压掉,
+# 故默认关, 只在需要单独查落盘问题时开(见提交 c0d551ae9 的结论).
+_XCHK_USE = os.getenv("MC_XCHK_USE", "0") == "1"
+# 诊断: D 侧在 H2D 之前额外等这么久(毫秒) —— 用来判定"LAYER_DONE 信号跑在 bulk 数据前面"
+# 这条竞态: 若加上延时后 `[XCHK] tcp-leg 不一致` 消失, 即坐实. 默认 0=不启用.
+_H2D_DELAY_MS = float(os.getenv("MC_DEBUG_H2D_DELAY_MS", "0"))
+
+# 修复: "LAYER_DONE 信号可能跑在 bulk 数据前面"(P 的 TCP write() 只保证进本端 socket 缓冲,
+# 不保证对端已收到), D 若此时读 staging 并 H2D, 就会把上一占用者遗留的旧 KV 拷进 NPU ——
+# 实测 0ms 延时下 35 次不一致且判据大量失败, D 侧延时 50ms 后 2 次不一致且 30/30 全过.
+# 修法: P 随 LAYER_DONE 下发各区间(flush 时刻)的 crc, D 在 H2D **之前**拿它校验 staging,
+# 不一致就短暂轮询重试(有上限), 数据到齐再拷. 正常情况下一次即过, 不牺牲流水.
+# 置 0 可回退做 A/B.
+_LAYER_DONE_CRC = os.getenv("MC_LAYER_DONE_CRC", "1") == "1"
+_H2D_VERIFY_TIMEOUT_MS = float(os.getenv("MC_H2D_VERIFY_TIMEOUT_MS", "200"))
+_VERIFY_TAIL_BYTES = int(os.getenv("MC_H2D_VERIFY_TAIL_BYTES", "512"))
 
 # 发送线程与模型前向是异步的: 请求前向结束时, 本 rank 的发送线程可能仍在读该
 # 请求的 KV cache 块(并发的请求越多, 发送线程滞后越久). 若不延迟释放, vLLM 会
@@ -1000,7 +1016,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         for layer_req_id in transfer_meta.req_ids:
                             peer_key = transfer_meta.req_peer[layer_req_id]
                             if peer_key not in peer_layer_msgs:
-                                peer_layer_msgs[peer_key] = ([], [], [])
+                                peer_layer_msgs[peer_key] = ([], [], [], [])
                             peer_layer_msgs[peer_key][2].append(get_external_request_id(layer_req_id))
                             for req_start, req_count in transfer_meta.req_slices[layer_req_id]:
                                 peer_layer_msgs[peer_key][0].extend(
@@ -1239,11 +1255,6 @@ class KVCacheSendingLayerThread(threading.Thread):
                 continue
             t_flush0 = time.perf_counter()
             global_te.sync_npu_to_cpu_for_npu_addrs(transfer_meta.src, transfer_meta.length)
-            if _XCHK:
-                transfer_meta.crc_pre_write = global_te.crc_for_cpu_addrs(
-                    transfer_meta.src, transfer_meta.length, _XCHK_SAMPLE
-                )
-                self._register_inflight_staging(batch_id, transfer_meta.src, transfer_meta.length)
             if _PERF_LOG:
                 flush_ms += _perf_ms(t_flush0)
                 if flush_win0 is None:
@@ -1256,6 +1267,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                     raise RuntimeError(f"H2H layerwise: NPU addr 0x{src_addr:x} not found in TCP staging map.")
                 staging_src.append(cpu_addr)
             transfer_meta.src = staging_src
+            if _LAYER_DONE_CRC or _XCHK:
+                # 必须在 src 换成 staging 地址**之后**取 crc: 拿 NPU 地址算会全返回 0,
+                # 会出现"每个区间都不一致"的假阳性(本会话踩过两次).
+                # 与 D 侧"尾部探针"同口径: 取每区间尾部 _VERIFY_TAIL_BYTES 字节
+                transfer_meta.crc_pre_write = global_te.crc_for_cpu_addrs_tail(
+                    transfer_meta.src, transfer_meta.length, _VERIFY_TAIL_BYTES
+                )
+                self._register_inflight_staging(batch_id, transfer_meta.src, transfer_meta.length)
 
         transferred_reqs = {req_id for meta in session_meta.values() for req_id in meta.req_ids}
         job = _PipeJob(
@@ -1384,21 +1403,26 @@ class KVCacheSendingLayerThread(threading.Thread):
                         [crc_now[i] for i in badp[:4]],
                     )
             # 组 LAYER_DONE 消息(与单线程版一致): 携带该批全部层范围.
-            peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str], list[int]]] = {}
+            peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str], list[int], list[int]]] = {}
             for layer_req_id in transfer_meta.req_ids:
                 peer_key = transfer_meta.req_peer[layer_req_id]
                 if peer_key not in peer_layer_msgs:
-                    peer_layer_msgs[peer_key] = ([], [], [], [])
+                    peer_layer_msgs[peer_key] = ([], [], [], [], [])
                 peer_layer_msgs[peer_key][2].append(get_external_request_id(layer_req_id))
                 for req_start, req_count in transfer_meta.req_slices[layer_req_id]:
                     peer_layer_msgs[peer_key][0].extend(transfer_meta.dst[req_start : req_start + req_count])
                     peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
                     peer_layer_msgs[peer_key][3].extend(transfer_meta.src[req_start : req_start + req_count])
+                    if _LAYER_DONE_CRC and transfer_meta.crc_pre_write:
+                        peer_layer_msgs[peer_key][4].extend(
+                            transfer_meta.crc_pre_write[req_start : req_start + req_count]
+                        )
             for (peer_host, peer_port), (
                 peer_addrs,
                 peer_lengths,
                 peer_req_ids,
                 peer_src,
+                peer_flush_crc,
             ) in peer_layer_msgs.items():
                 done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                 t_ld0 = time.perf_counter()
@@ -1410,6 +1434,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     peer_lengths,
                     done_list,
                     src_addrs=peer_src if _XCHK else None,
+                    flush_crcs=peer_flush_crc if (_LAYER_DONE_CRC and peer_flush_crc) else None,
                 )
                 if _PERF_LOG:
                     layerdone_ms += _perf_ms(t_ld0)
@@ -1586,6 +1611,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         lengths: list[int],
         done_list: list[tuple[str, bool, int, bool]] | None = None,
         src_addrs: list[int] | None = None,
+        flush_crcs: list[int] | None = None,
     ) -> bool:
         """H2H: 通知 D 本层 KV 已写入其 staging, 等待 D 完成该层 H2D 后的 ACK.
 
@@ -1609,7 +1635,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 lengths,
                 self.sender_path,
                 done_list or [],
-                global_te.crc_for_cpu_addrs(src_addrs or [], lengths, _XCHK_SAMPLE) if _XCHK else [],
+                (
+                    flush_crcs
+                    if flush_crcs is not None
+                    else global_te.crc_for_cpu_addrs(src_addrs or [], lengths, _XCHK_SAMPLE)
+                )
+                if (_LAYER_DONE_CRC or _XCHK)
+                else [],
             )
         )
         try:
@@ -1820,14 +1852,27 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         if _XCHK and peer_crcs:
                             with self._recv_crc_lock:
                                 for _a, _l, _c in zip(layer_dst_addrs, layer_lengths, peer_crcs):
+                                    # 跨请求重叠检测: staging 是 NPU 块的 1:1 镜像, 两个**不同请求**
+                                    # 的区间若重叠 => 一方的 TCP 写入会盖掉另一方尚未 H2D 的数据.
+                                    for _other, _ranges in self._recv_crcs.items():
+                                        if _other in layer_req_ids:
+                                            continue
+                                        for _oa, (_ol, _oc) in _ranges.items():
+                                            if _a < _oa + _ol and _oa < _a + _l:
+                                                logger.warning(
+                                                    "[XCHK] staging 跨请求重叠: %s [%d,+%d) 与 %s [%d,+%d)",
+                                                    list(layer_req_ids)[:1], _a, _l, _other, _oa, _ol,
+                                                )
+                                                break
                                     for _r in layer_req_ids:
                                         self._recv_crcs.setdefault(_r, {})[_a] = (_l, _c)
                             # 段 1: P staging(发送侧) vs D staging(到达侧) —— 覆盖
                             # TCP 段. 键 = (sender_path, 批内区间顺序), 同一批一一对应.
                             if _XCHK_FAULT and layer_dst_addrs:
                                 global_te.poke_cpu_addr(layer_dst_addrs[0], 4)
-                            local_crcs = global_te.crc_for_cpu_addrs(
-                                layer_dst_addrs, layer_lengths, _XCHK_SAMPLE
+                            # 与 P 下发口径一致: 尾部 _VERIFY_TAIL_BYTES 字节(crc_for_cpu_addrs_tail)
+                            local_crcs = global_te.crc_for_cpu_addrs_tail(
+                                layer_dst_addrs, layer_lengths, _VERIFY_TAIL_BYTES
                             )
                             bad = [k for k, (a, b) in enumerate(zip(peer_crcs, local_crcs)) if a != b]
                             self._xchk_total += 1
@@ -1857,6 +1902,42 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         t_recv0 = time.perf_counter()
                         layer_reply = b"ACK"
                         try:
+                            if _H2D_DELAY_MS > 0:
+                                time.sleep(_H2D_DELAY_MS / 1000.0)
+                            if _LAYER_DONE_CRC and peer_crcs:
+                                # H2D 之前自校验: TCP 是**顺序流**, 同一批各区间的字节按序落地,
+                                # 故只需探测"最后一个区间的尾部"(它最后到)即可判定整批是否到齐 ——
+                                # 这一点开销极小(~0.05ms), 不用对全部区间重算 crc(那样每次重试 ~10ms,
+                                # 会把请求拖到 20s+ 量级).
+                                _last_a = layer_dst_addrs[-1]
+                                _last_l = layer_lengths[-1]
+                                _tail = min(_VERIFY_TAIL_BYTES, _last_l)
+                                _want = peer_crcs[-1] if peer_crcs else -1
+                                t_v0 = time.perf_counter()
+                                retries = 0
+                                while True:
+                                    _got = global_te.crc_for_cpu_addrs([_last_a + _last_l - _tail], [_tail], _tail)
+                                    if not _got or _got[0] == _want:
+                                        break
+                                    if (time.perf_counter() - t_v0) * 1e3 >= _H2D_VERIFY_TIMEOUT_MS:
+                                        logger.warning(
+                                            "[H2D-VERIFY] 等 bulk 数据到齐超时 %.0f ms (重试 %d 次) reqs=%s last_range=[%d,+%d)",
+                                            (time.perf_counter() - t_v0) * 1e3,
+                                            retries,
+                                            layer_req_ids,
+                                            _last_a,
+                                            _last_l,
+                                        )
+                                        break
+                                    retries += 1
+                                    time.sleep(0.001)
+                                if retries:
+                                    logger.info(
+                                        "[H2D-VERIFY] bulk 数据迟到: 重试 %d 次, 等待 %.2f ms 后到齐 reqs=%s",
+                                        retries,
+                                        (time.perf_counter() - t_v0) * 1e3,
+                                        layer_req_ids,
+                                    )
                             global_te.sync_cpu_to_npu_for_transfer(layer_dst_addrs, layer_lengths)
                             h2d_ms = _perf_ms(t_recv0)
                         except Exception as e:
@@ -3007,7 +3088,7 @@ class MooncakeLayerwiseConnectorWorker:
                 assert self.kv_recv_layer_thread is not None
                 self.request_map[external_req_id] = req_id
                 self._recving_metadata[req_id] = meta
-                if _XCHK:
+                if _XCHK and _XCHK_USE:
                     _snap = self.kv_recv_layer_thread.get_recv_crc_snapshot().get(external_req_id)
                     if _snap:
                         _cpu = list(_snap)
