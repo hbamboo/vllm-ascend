@@ -493,6 +493,14 @@ class KVCacheSendingLayerThread(threading.Thread):
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
+            # 目的侧必须用**对端** block_len 当步长: remote_block_ids 是 D 侧块号,
+            # 它在 D 的 cache 里占 remote_layer_metadata.block_len 字节. 等分且两边
+            # block_size 相同时二者相等(常见路径行为不变); 但 connector 支持 P/D
+            # block_size 不同(_align_remote_block_ids: "remote block size must be
+            # divisible by local block size"), 那时拿 local_*_len 当步长会把 mamba
+            # 状态写到 D 块内的错误偏移, 甚至越界覆盖下一个块 —— 表现为状态错乱/
+            # 复读乱码. 传输长度取两者较小值, 保证不越界写坏相邻块.
+            remote_conv_len, remote_ssm_len = remote_layer_metadata.block_len
             tp_ratio = self.tp_size // req_meta.remote_tp_size
             if tp_ratio == 1:
                 src_list.extend(
@@ -503,11 +511,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 )
                 dst_list.extend(
                     [
-                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * local_conv_len,
-                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * local_ssm_len,
+                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * remote_conv_len,
+                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * remote_ssm_len,
                     ]
                 )
-                length_list.extend([local_conv_len, local_ssm_len])
+                length_list.extend(
+                    [min(local_conv_len, remote_conv_len), min(local_ssm_len, remote_ssm_len)]
+                )
             else:
                 conv_shape, ssm_shape = layer_kv_cache_spec.shapes
                 conv_dtype, ssm_dtype = layer_kv_cache_spec.dtypes
