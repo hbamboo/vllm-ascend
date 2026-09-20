@@ -1340,9 +1340,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                 if not block:
                     return
                 continue
-            self._pipe_inflight -= 1
             try:
                 self._pipe_finalize(job)
+                self._pipe_inflight -= 1
             except Exception as e:  # noqa: BLE001
                 logger.error("[mooncake][pipe] finalize batch=%d failed: %s", job.batch_id, e)
 
@@ -1658,10 +1658,16 @@ class KVCacheRecvingLayerThread(threading.Thread):
         # 仅在 recv 线程内访问, 无需额外锁.
         self._perf_d_req: dict[str, dict[str, float]] = {}
         # MC_XCHK 自检计数(段1=TCP 到达, 段2=H2D 落盘)
+        self._recv_crc_lock = threading.Lock()
+        self._recv_crcs: dict[str, dict[int, tuple[int, int]]] = {}
         self._xchk_total = 0
         self._xchk_bad = 0
         self._xchk_total2 = 0
         self._xchk_bad2 = 0
+
+    def get_recv_crc_snapshot(self) -> dict[str, dict[int, tuple[int, int]]]:
+        with self._recv_crc_lock:
+            return {k: dict(v) for k, v in self._recv_crcs.items()}
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -1812,6 +1818,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         done_list = msg[5] if len(msg) > 5 else ()
                         peer_crcs = msg[6] if len(msg) > 6 else ()
                         if _XCHK and peer_crcs:
+                            with self._recv_crc_lock:
+                                for _a, _l, _c in zip(layer_dst_addrs, layer_lengths, peer_crcs):
+                                    for _r in layer_req_ids:
+                                        self._recv_crcs.setdefault(_r, {})[_a] = (_l, _c)
                             # 段 1: P staging(发送侧) vs D staging(到达侧) —— 覆盖
                             # TCP 段. 键 = (sender_path, 批内区间顺序), 同一批一一对应.
                             if _XCHK_FAULT and layer_dst_addrs:
@@ -2997,6 +3007,22 @@ class MooncakeLayerwiseConnectorWorker:
                 assert self.kv_recv_layer_thread is not None
                 self.request_map[external_req_id] = req_id
                 self._recving_metadata[req_id] = meta
+                if _XCHK:
+                    _snap = self.kv_recv_layer_thread.get_recv_crc_snapshot().get(external_req_id)
+                    if _snap:
+                        _cpu = list(_snap)
+                        _len = [_snap[a][0] for a in _cpu]
+                        _ref = [_snap[a][1] for a in _cpu]
+                        _npu = [global_te.cpu_to_npu_addr(a) for a in _cpu]
+                        _v = [i for i, a in enumerate(_npu) if a is not None]
+                        if _v:
+                            _got = global_te.crc_for_npu_addrs([_npu[i] for i in _v], [_len[i] for i in _v], _XCHK_SAMPLE)
+                            _bad = [i for k, i in enumerate(_v) if _got[k] != _ref[i]]
+                            if _bad:
+                                logger.warning(
+                                    "[XCHK] D 用到前 KV 与 P 发来的不一致 req=%s bad=%d/%d idx=%s",
+                                    external_req_id, len(_bad), len(_v), _bad[:6],
+                                )
         elif self.vllm_config.kv_transfer_config.is_kv_producer:
             # update trans info
             update_metadata = {}

@@ -851,6 +851,30 @@ class GlobalTE:
         if 0 <= off < flat.numel():
             flat[off : off + min(nbytes, flat.numel() - off)] = 0xAB
 
+    def cpu_to_npu_addr(self, cpu_addr: int) -> int | None:
+        if not self._cpu_tensors or not self._region_mode:
+            return None
+        return self._cpu_to_npu_addr_in_regions(cpu_addr)
+
+    def crc_for_npu_addrs(self, npu_addrs: list[int], lengths: list[int], sample: int = 512) -> list[int]:
+        """对 NPU KV cache 各区间头 sample 字节取 crc(只读, 调试用)."""
+        if not self._npu_regions_by_base:
+            return []
+        out: list[int] = []
+        for addr, ln in zip(npu_addrs, lengths):
+            idx = bisect_right(self._npu_region_bases, addr) - 1
+            if idx < 0 or ln <= 0:
+                out.append(0); continue
+            base, _off, npu_tensor = self._npu_regions_by_base[idx]
+            nbytes = npu_tensor.numel() * npu_tensor.element_size()
+            if addr < base or addr >= base + nbytes:
+                out.append(0); continue
+            inner = addr - base
+            take = min(sample, ln, nbytes - inner)
+            flat = npu_tensor.detach().reshape(-1).view(torch.uint8)
+            out.append(zlib.crc32(flat[inner : inner + take].cpu().numpy().tobytes()))
+        return out
+
     def refetch_npu_to_staging(self, cpu_addrs: list[int], lengths: list[int]) -> None:
         """把 staging 区间对应的 NPU 内容反向拷回 staging(crc 自检用)."""
         if not self._cpu_tensors or not self._region_mode:
