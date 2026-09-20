@@ -12,6 +12,7 @@
 # Features:
 # - Load balances requests to multiple prefiller and decoder servers.
 # - Supports OpenAI-compatible /v1/completions and /v1/chat/completions endpoints.
+# - Supports OpenAI-compatible /v1/models, forwarded to a decoder backend server.
 # - Streams responses from backend servers to clients.
 #
 # Prerequisites:
@@ -67,6 +68,10 @@
 #           "max_tokens": 16
 #         }'
 #
+# To list the models served by the decoder backends:
+#
+#   curl http://localhost:9000/v1/models
+#
 # Step 4: Health Check
 # --------------------
 # To check if the proxy is running and see how many backend instances are
@@ -99,7 +104,7 @@ from contextlib import asynccontextmanager
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
@@ -586,6 +591,26 @@ async def handle_completions(request: Request):
 @with_cancellation
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/chat/completions", request)
+
+
+@app.get("/v1/models")
+async def list_models(request: Request):
+    """Forward /v1/models to a decoder backend and return its response as-is."""
+    params = dict(request.query_params)
+    headers = {"Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}"}
+    failures = []
+    for decoder in proxy_state.decoders:
+        try:
+            response = await decoder.client.get("/models", params=params, headers=headers)
+            response.raise_for_status()
+            return JSONResponse(status_code=response.status_code, content=response.json())
+        except Exception as e:
+            logger.error("list_models failed for %s: %s", decoder.url, e)
+            failures.append(decoder.url)
+    return JSONResponse(
+        status_code=503,
+        content={"error": f"Failed to list models from decoder instances: {failures}"},
+    )
 
 
 @app.get("/healthcheck")
