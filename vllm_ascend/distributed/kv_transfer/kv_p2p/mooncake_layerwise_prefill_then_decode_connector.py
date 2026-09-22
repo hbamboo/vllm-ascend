@@ -122,6 +122,20 @@ _PIPE_WRITER = os.getenv("MC_TCP_PIPE_WRITER", "0") == "1"
 # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
 _PIPE_DEPTH = int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
 
+# 逐层 H2H 的传输语义(仅 protocol=tcp 的 LAYER_DONE 路径):
+#   "push"(默认, 保持现设计) = P 把本端 staging 的字节用 TCP 写进 D 的 staging,
+#         再发 LAYER_DONE; D 收到即 H2D. 写与信号走两条独立通道, 数据可能还没到,
+#         所以 push 需要额外的"数据是否已到齐"校验才能保证精度.
+#   "pull" = P 只做 NPU->staging 的 D2H flush, LAYER_DONE 里带上本 rank 的 TE
+#         端点(session)与各区间在本端 staging 的地址; D 收到后自己
+#         batch_transfer_sync_read 把数据拉进本端 staging 再 H2D. 读是同步的 ——
+#         返回即数据已到, 不需要任何 crc 自校验, P 侧也省掉一次整批 TCP write.
+# 两端必须一致: pull 的 D 若收到没有 src/端点的 LAYER_DONE 会直接 NAK 该批.
+# 变量名沿用需求原文(TRASPORT), 同时接受正确拼写 TRANSPORT, 两种写法都能生效.
+_TRANSPORT_MODE = os.getenv("VLLM_ASCEND_LAYERWISE_TRANSPORT_MODE", "pull")
+
+_PULL_MODE = _TRANSPORT_MODE == "pull"
+
 
 def _perf_ms(t0: float) -> float:
     """perf_counter 差值的毫秒数."""
@@ -378,6 +392,10 @@ class KVCacheSendingLayerThread(threading.Thread):
         self.ready_event = ready_event
         # 本 rank 的侧信道标识, 随 LAYER_DONE 下发供 D 侧做多路径(P/D TP 不等)计数.
         self.sender_path = sender_path
+        # pull 模式: D 侧反向 sync_read 本 rank staging 用的 mooncake 端点
+        # ("host:te_rpc_port", 与 P 侧写时用的 session_id 同一命名口径), 随
+        # LAYER_DONE 下发. 端口是本进程 TE 自己分配的, 只有 pull 才需要解析.
+        self.sender_te_path = f"{sender_path.rsplit(':', 1)[0]}:{self.engine.get_rpc_port()}" if _PULL_MODE else ""
         # perf: 上一批处理完成的时刻(用于统计批间攒批等待)与批序号.
         self._last_batch_end_at: float | None = None
         self._batch_seq = 0
@@ -523,6 +541,14 @@ class KVCacheSendingLayerThread(threading.Thread):
             local_conv_addr, local_ssm_addr = local_layer_metadata.kv_caches_base_addr
             remote_conv_addr, remote_ssm_addr = remote_layer_metadata.kv_caches_base_addr
             local_conv_len, local_ssm_len = local_layer_metadata.block_len
+            # 目的侧必须用**对端** block_len 当步长: remote_block_ids 是 D 侧块号,
+            # 它在 D 的 cache 里占 remote_layer_metadata.block_len 字节. 等分且两边
+            # block_size 相同时二者相等(常见路径行为不变); 但 connector 支持 P/D
+            # block_size 不同(_align_remote_block_ids: "remote block size must be
+            # divisible by local block size"), 那时拿 local_*_len 当步长会把 mamba
+            # 状态写到 D 块内的错误偏移, 甚至越界覆盖下一个块 —— 表现为状态错乱/
+            # 复读乱码. 传输长度取两者较小值, 保证不越界写坏相邻块.
+            remote_conv_len, remote_ssm_len = remote_layer_metadata.block_len
             tp_ratio = self.tp_size // req_meta.remote_tp_size
             if tp_ratio == 1:
                 src_list.extend(
@@ -533,11 +559,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                 )
                 dst_list.extend(
                     [
-                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * local_conv_len,
-                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * local_ssm_len,
+                        remote_conv_addr + remote_block_ids[remote_transfer_idx] * remote_conv_len,
+                        remote_ssm_addr + remote_block_ids[remote_transfer_idx] * remote_ssm_len,
                     ]
                 )
-                length_list.extend([local_conv_len, local_ssm_len])
+                length_list.extend([min(local_conv_len, remote_conv_len), min(local_ssm_len, remote_ssm_len)])
             else:
                 conv_shape, ssm_shape = layer_kv_cache_spec.shapes
                 conv_dtype, ssm_dtype = layer_kv_cache_spec.dtypes
@@ -827,8 +853,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                         staging_src.append(cpu_addr)
                     transfer_meta.src = staging_src
                 req_start_time = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_write(
-                    session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                # pull: 不写对端 —— D 收到 LAYER_DONE 后自己来读本端 staging.
+                ret = (
+                    0
+                    if _PULL_MODE
+                    else self.engine.batch_transfer_sync_write(
+                        session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                    )
                 )
                 if _PERF_LOG:
                     write_ms += _perf_ms(req_start_time)
@@ -863,11 +894,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                         # 下发, D 的请求级 done 必然晚于全部层的 H2D, 满足
                         # "收到完整 KV 后才启动计算"的不变式.
                         layer_done_ok = True
-                        peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str]]] = {}
+                        peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str], list[int]]] = {}
                         for layer_req_id in transfer_meta.req_ids:
                             peer_key = transfer_meta.req_peer[layer_req_id]
                             if peer_key not in peer_layer_msgs:
-                                peer_layer_msgs[peer_key] = ([], [], [])
+                                peer_layer_msgs[peer_key] = ([], [], [], [])
                             peer_layer_msgs[peer_key][2].append(get_external_request_id(layer_req_id))
                             for req_start, req_count in transfer_meta.req_slices[layer_req_id]:
                                 peer_layer_msgs[peer_key][0].extend(
@@ -876,11 +907,28 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 peer_layer_msgs[peer_key][1].extend(
                                     transfer_meta.length[req_start : req_start + req_count]
                                 )
-                        for (peer_host, peer_port), (peer_addrs, peer_lengths, peer_req_ids) in peer_layer_msgs.items():
+                                if _PULL_MODE:
+                                    # pull: D 按本端 staging 地址反向读, 必须带上与
+                                    # dst/length 同序的 src 区间(此时 src 已是 staging 地址).
+                                    peer_layer_msgs[peer_key][3].extend(
+                                        transfer_meta.src[req_start : req_start + req_count]
+                                    )
+                        for (peer_host, peer_port), (
+                            peer_addrs,
+                            peer_lengths,
+                            peer_req_ids,
+                            peer_src,
+                        ) in peer_layer_msgs.items():
                             done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                             t_ld0 = time.perf_counter()
                             ok = self._send_layer_done_signal(
-                                peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list
+                                peer_host,
+                                peer_port,
+                                peer_req_ids,
+                                peer_addrs,
+                                peer_lengths,
+                                done_list,
+                                src_addrs=peer_src,
                             )
                             if _PERF_LOG:
                                 layerdone_ms += _perf_ms(t_ld0)
@@ -1136,8 +1184,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                     if len(transfer_meta.src) <= 0:
                         continue
                     t_w0 = time.perf_counter()
-                    ret = self.engine.batch_transfer_sync_write(
-                        session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                    # pull: 写线程没有数据要发(由 D 主动读), 但批的收尾(push 的
+                    # LAYER_DONE/失败判定)仍按原顺序走 finalize.
+                    ret = (
+                        0
+                        if _PULL_MODE
+                        else self.engine.batch_transfer_sync_write(
+                            session_id, transfer_meta.src, transfer_meta.dst, transfer_meta.length
+                        )
                     )
                     if _PERF_LOG:
                         job.write_ms += _perf_ms(t_w0)
@@ -1188,20 +1242,27 @@ class KVCacheSendingLayerThread(threading.Thread):
             if session_id in job.failed or len(transfer_meta.src) <= 0:
                 continue
             # 组 LAYER_DONE 消息(与单线程版一致): 携带该批全部层范围.
-            peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str]]] = {}
+            peer_layer_msgs: dict[tuple[str, int], tuple[list[int], list[int], list[str], list[int]]] = {}
             for layer_req_id in transfer_meta.req_ids:
                 peer_key = transfer_meta.req_peer[layer_req_id]
                 if peer_key not in peer_layer_msgs:
-                    peer_layer_msgs[peer_key] = ([], [], [])
+                    peer_layer_msgs[peer_key] = ([], [], [], [])
                 peer_layer_msgs[peer_key][2].append(get_external_request_id(layer_req_id))
                 for req_start, req_count in transfer_meta.req_slices[layer_req_id]:
                     peer_layer_msgs[peer_key][0].extend(transfer_meta.dst[req_start : req_start + req_count])
                     peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
-            for (peer_host, peer_port), (peer_addrs, peer_lengths, peer_req_ids) in peer_layer_msgs.items():
+                    if _PULL_MODE:
+                        peer_layer_msgs[peer_key][3].extend(transfer_meta.src[req_start : req_start + req_count])
+            for (peer_host, peer_port), (
+                peer_addrs,
+                peer_lengths,
+                peer_req_ids,
+                peer_src,
+            ) in peer_layer_msgs.items():
                 done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                 t_ld0 = time.perf_counter()
                 ok = self._send_layer_done_signal(
-                    peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list
+                    peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list, src_addrs=peer_src
                 )
                 if _PERF_LOG:
                     layerdone_ms += _perf_ms(t_ld0)
@@ -1393,8 +1454,14 @@ class KVCacheSendingLayerThread(threading.Thread):
         dst_addrs: list[int],
         lengths: list[int],
         done_list: list[tuple[str, bool, int, bool]] | None = None,
+        src_addrs: list[int] | None = None,
     ) -> bool:
-        """H2H: 通知 D 本层 KV 已写入其 staging, 等待 D 完成该层 H2D 后的 ACK.
+        """H2H: 通知 D 本批 KV 已就绪(在 staging 上), 等待 D 完成该层 H2D 后的 ACK.
+
+        push(默认): P 已把字节 TCP 写进 **D 的** staging(D 只需 H2D);
+        pull: P 只把数据 D2H flush 到**本端** staging, payload 里附带本 rank 的
+              TE 端点与各区间在本端 staging 的地址, 由 D 自己 sync_read 拉取
+              (读同步返回 ⇒ 数据必已到, 无需 crc 自校验).
 
         REQ-REP 同步往返同时充当流控: ACK 未回前不进入下一层, 保证 D 侧请求级
         done 严格晚于全层 H2D。请求级完成信息(末轮/期望路径数/失败)随本批
@@ -1404,10 +1471,11 @@ class KVCacheSendingLayerThread(threading.Thread):
         path = make_zmq_path("tcp", remote_host, remote_port)
         encoder = msgspec.msgpack.Encoder()
         # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths,
-        #           sender_path, done_list)
+        #           sender_path, done_list, src_addrs, sender_te_path)
         # req_ids 为 external id, 供 D 侧把每批 H2D 归到请求做请求级累计;
         # sender_path 为 P 侧本 rank 的侧信道标识, D 侧按它做多路径(不等 TP)计数;
-        # done_list 见 _req_done_list, 非空仅出现在含最后层的批.
+        # done_list 见 _req_done_list, 非空仅出现在含最后层的批;
+        # src_addrs/sender_te_path 仅 pull 模式非空: D 用它们从本端 staging 反向读.
         data_bytes = encoder.encode(
             (
                 LAYER_DONE_SENDING_MSG,
@@ -1416,6 +1484,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                 lengths,
                 self.sender_path,
                 done_list or [],
+                list(src_addrs) if (_PULL_MODE and src_addrs) else [],
+                self.sender_te_path,
             )
         )
         try:
@@ -1446,6 +1516,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         local_engine_id: str,
         metadata: MooncakeAgentMetadata,
         ready_event: threading.Event,
+        engine: TransferEngine,
     ):
         super().__init__(daemon=True, name="KVCacheRecvingLayerThread")
         self.tp_rank = tp_rank
@@ -1463,6 +1534,8 @@ class KVCacheRecvingLayerThread(threading.Thread):
         # 先 P 后 D: P 传来的首 token (external req id -> token id). 与完成信号
         # 配对交给 scheduler, 用掉即清 (见 clear_first_token)。
         self.first_tokens = dict[str, Any]()
+        # pull 模式: D 侧反向 sync_read P 的 staging 需要本端 TE 实例.
+        self.engine = engine
 
     def get_first_token(self, request_id: str) -> Any:
         with self.lock:
@@ -1631,23 +1704,62 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             self.first_tokens[external_request_id] = first_token
                         sock.send_multipart((identity, b"", b"ACK"))
                     elif msg[0] == LAYER_DONE_SENDING_MSG:
-                        # H2H: P 已完成本层推送, 数据落在本节点 CPU staging 中.
-                        # 把该层字节区间 H2D 拷回 NPU KV cache 后回 ACK; P 收到
-                        # ACK 才推进下一层, 保证请求级 done 严格晚于全层 H2D.
+                        # H2H: P 声明本批 KV 已就绪. push 下"就绪"= 已 TCP 写进本
+                        # 节点 staging(但写与信号不同通道, 可能还没到齐); pull 下
+                        # "就绪"= P 已 D2H flush 到**它的** staging, 由本端 sync_read
+                        # 拉过来. 之后都把该批字节区间 H2D 拷回 NPU KV cache 再回
+                        # ACK; P 收到 ACK 才推进下一层, 保证请求级 done 严格晚于全层
+                        # H2D.
                         # payload: (LAYER_DONE_SENDING_MSG, req_ids, dst_addrs, lengths,
-                        #           sender_path, done_list)
+                        #           sender_path, done_list, src_addrs, sender_te_path)
                         # done_list = [(ext_req_id, is_last, trans_count, failed), ...]:
                         # 只有含最后层的批(该请求末轮)非空 —— 请求级完成信息随本批
                         # 下发, D 侧 H2D 成功后就地判定完成(不再单发请求级 DONE).
+                        # src_addrs + sender_te_path 仅 pull 模式非空(见 _TRANSPORT_MODE).
                         layer_req_ids = msg[1]
                         layer_dst_addrs = msg[2]
                         layer_lengths = msg[3]
                         sender_path = msg[4] if len(msg) > 4 else ""
                         done_list = msg[5] if len(msg) > 5 else ()
+                        peer_src_addrs = msg[6] if len(msg) > 6 else ()
+                        sender_te_path = msg[7] if len(msg) > 7 else ""
                         logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(layer_dst_addrs))
                         t_recv0 = time.perf_counter()
+                        pull_ms = 0.0
                         layer_reply = b"ACK"
                         try:
+                            if _PULL_MODE:
+                                # pull: 主动从 P 的本端 staging 拉数据到本端 staging.
+                                # sync_read 返回即字节已落本地 ⇒ push 路径上那个
+                                # "信号跑在批量数据前面"的竞态不存在, 不需要 crc 自校验.
+                                if not peer_src_addrs or not sender_te_path:
+                                    raise RuntimeError(
+                                        "pull mode requires src_addrs+sender_te_path in LAYER_DONE "
+                                        f"(src={len(peer_src_addrs)} te_path={sender_te_path!r}); "
+                                        "P 侧是否也是 pull 模式?"
+                                    )
+                                if not (len(peer_src_addrs) == len(layer_lengths) == len(layer_dst_addrs)):
+                                    raise RuntimeError(
+                                        f"pull range mismatch: dst={len(layer_dst_addrs)} "
+                                        f"len={len(layer_lengths)} src={len(peer_src_addrs)}"
+                                    )
+                                t_pull0 = time.perf_counter()
+                                ret = self.engine.batch_transfer_sync_read(
+                                    sender_te_path, layer_dst_addrs, peer_src_addrs, layer_lengths
+                                )
+                                pull_ms = _perf_ms(t_pull0)
+                                if ret < 0:
+                                    raise RuntimeError(
+                                        f"batch_transfer_sync_read failed ret={ret} peer={sender_te_path} "
+                                        f"reqs={layer_req_ids}"
+                                    )
+                            elif sender_te_path or peer_src_addrs:
+                                # 两端模式不一致(P 是 pull, 本端是 push): 数据还在 P 的
+                                # staging 里没发过来, 这里 H2D 只会拷到旧内容 —— 直接拒.
+                                raise RuntimeError(
+                                    "got pull-style LAYER_DONE (src/te_path 非空) but local mode is push; "
+                                    "VLLM_ASCEND_LAYERWISE_TRASPORT_MODE 两端必须一致"
+                                )
                             global_te.sync_cpu_to_npu_for_transfer(layer_dst_addrs, layer_lengths)
                             h2d_ms = _perf_ms(t_recv0)
                         except Exception as e:
@@ -1674,12 +1786,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             # write/layerdone 窗口在同机时间线上对齐. H2D 单独
                             # 计时, 不计入 P 侧 H2H(write)统计.
                             logger.info(
-                                "[mooncake][perf] D batch layerdone reqs=%s ranges=%d h2d=%.1f total=%.1f ms t0=%.6f",
+                                "[mooncake][perf] D batch layerdone reqs=%s ranges=%d h2d=%.1f "
+                                "total=%.1f ms t0=%.6f pull=%.1f",
                                 layer_req_ids,
                                 len(layer_dst_addrs),
                                 h2d_ms,
                                 _perf_ms(t_recv0),
                                 t_recv0,
+                                pull_ms,
                             )
                             # 请求级累计(批共享口径): 该批 h2d 计入消息内全部请求.
                             for ext_req in layer_req_ids:
@@ -2929,6 +3043,7 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                 self.engine_id,
                 metadata,
                 ready_event,
+                engine=self.engine,
             )
             self.kv_recv_layer_thread.start()
             ready_event.wait()
