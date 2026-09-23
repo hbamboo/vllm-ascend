@@ -978,8 +978,6 @@ TMPL = """<!doctype html>
   .bar.mtp{fill:var(--mtp)}
   /* LAYER_DONE 往返折线: 上= P 侧, 下= D 侧; 三段各自一段斜/平线 */
   .ldflow { fill:none; stroke:var(--net); stroke-width:1.3; }
-  /* 每 rank 一段"D 收 → D 回 ACK"(按 DP 分泳道, 泳道内每 TP 一行) */
-  .ldseg  { stroke:var(--net); stroke-width:1.8; }
   .ldpt   { fill:var(--net); }
 .bar.d-fwd { fill:var(--d-fwd); }
   .bar.ext { fill:var(--ext); }
@@ -1132,18 +1130,19 @@ const LANES = [
   ["D 模型", "d-fwd"],
   ["首token 回传(图外)", "ext"],
 ];
-// LAYER_DONE: **每个 DP 域一条泳道**, 泳道内只画该 DP 的 TP rank 段(不混 P 侧, 不做跨
-// rank 聚合) —— 两条 TP 线在泳道里的横向错位就是"两 rank 收齐的时差".
-const DP_OF = w => (String(w).match(/DP\\d+/) || [""])[0];
-const DPS = [...new Set(R.flatMap(r=>r.groups.flatMap(g=>((g.dh&&g.dh.rows)||[]).map(x=>DP_OF(x.w)))))]
-  .filter(Boolean).sort();
-const LD_LANES = (DPS.length ? DPS : [""]).map(d=>["LAYER_DONE · " + (d||"?"), "ldflow"]);
-const ALL_LANES = LANES.concat(LD_LANES);
+// 短标签: Worker_DP0_TP1_EP1 -> DP0·TP1
+const rankTag = w => String(w).replace("Worker_","").split("_").slice(0,2).join("·");
 function drawB() {
   const host=document.getElementById("panelB"); host.innerHTML="";
   const r=R[sel], W=1450, LABEL=128, AX=24;
   const LD_Y0 = 7;
-  const yOf=[30,58,86,114,142,170,198].concat(LD_LANES.map((_,i)=>226+i*28));  // lane 顶部; 文本 Y+3, 条 Y+7..Y+17, 分隔线 Y+24
+  // LAYER_DONE: **该请求的每个 D rank 一条泳道**(DP 域内的 TP 各占一条; 只画本请求的
+  // DP 域, 不出现空泳道) —— 泳道之间的横向错位就是"各 rank 收齐的时差".
+  const reqRanks = [...new Set(r.groups.flatMap(g=>((g.dh&&g.dh.rows)||[]).map(x=>x.w)))]
+    .filter(Boolean).sort();
+  const LD_LANES = (reqRanks.length ? reqRanks : [""]).map(w=>["LAYER_DONE · " + (w? rankTag(w) : "?"), "ldflow"]);
+  const ALL_LANES = LANES.concat(LD_LANES);
+  const yOf=[30,58,86,114,142,170,198].concat(LD_LANES.map((_,i)=>226+i*28));
   const H=274 + Math.max(0, LD_LANES.length-1)*28;
   const [x0,x1] = win(r);
   const span=x1-x0, px=t=>LABEL+(t-x0)/span*(W-LABEL-8);
@@ -1238,43 +1237,46 @@ function drawB() {
       const l=S("line",{x1:px(g.lw[0]),x2:px(g.lw[1]),y1:yW+15,y2:yW+15,"class":"bchk"});
       svg.append(l);
     }
-    // LAYER_DONE: **按 DP 域分泳道**, 泳道内**只画该 DP 的 TP rank 段**(D 收 → D 回
-    // ACK) —— 不跨 rank 聚合、不混 P 侧数字; P 侧并集窗口只作浅色参照. 两条 TP 段的
-    // 横向错位就是"两 rank 收齐的时差".
+    // LAYER_DONE 折线: 每条 = 一个 D rank 的一次往返(P发 → D收 → D回ACK → P收齐).
+    // 泳道按 rank 分(见上); 泳道内把"同一次往返"(t0 相差 ≤1ms 的行)聚成一条折线, 多条
+    // 之间错开 5px.
     const rows = (g.dh && g.dh.rows) || [];
     if (g.lw && rows.length) {
-      const dps = [...new Set(rows.map(x => DP_OF(x.w)))].filter(Boolean);
-      dps.forEach(dp => {
-        const li = 7 + Math.max(0, DPS.indexOf(dp));
-        const yBase = yOf[li] || yOf[7], yRef = yBase + 21;
-        svg.append(S("line", {x1:px(g.lw[0]), x2:px(g.lw[1]), y1:yRef, y2:yRef, "class":"bchk", opacity:.5}));
-        const rsDp = rows.filter(x => DP_OF(x.w) === dp);
-        const tps = [...new Set(rsDp.map(x => x.w.replace("Worker_","")))].sort();
-        tps.forEach((tp, ti) => {
-          const rs = rsDp.filter(x => x.w.replace("Worker_","") === tp);
-          const y = yBase + 8 + ti * 8;
-          rs.forEach(rr => {
-            const a = Math.max(rr.t0, g.lw[0]), b = Math.max(rr.ack, a);
-            svg.append(S("line", {x1:px(a), x2:px(b), y1:y, y2:y, "class":"ldseg",
-                                  "stroke-dasharray": (ti % 2 ? "3,2" : "none")}));
-            const wave = rsDp.filter(x => Math.abs(x.t0 - rr.t0) < 1);   // 同一次往返(±1ms)
-            const hit = S("rect", {x:px(a)-2, y:y-4, width:Math.max(3, px(b)-px(a)+4), height:8, fill:"transparent"});
-            hit.addEventListener("mousemove", e => tip(
-              `<b>${r.u}</b> · LAYER_DONE round ${g.rnd+1} 批 layers=[${g.lay.join(",")}]<br>`+
-              `${dp} · <b>${tp.replace(dp+"_","")}</b>${rr.snd?` · 发送方 ⋯${rr.snd}`:""}<br>`+
-              `D 收 → D 回 ACK <b>${FMT(b-a,2)}</b> · 绝对 ${wallAt(r,a)} → ${wallAt(r,b)}<br>`+
-              `该 rank: pull ${FMT(rr.pull,2)} + H2D(纯) ${FMT(rr.h2d_only,2)}`+
-              (wave.length>1?`<br><span style="color:var(--text-2)">同一次往返里本 DP 有 ${wave.length} 段: 收齐相差 ${FMT(Math.max(...wave.map(x=>x.t0))-Math.min(...wave.map(x=>x.t0)),2)}</span>`:"")+
-              (g.lw?`<br><span style="color:var(--text-2)">P 侧并集窗口 ${wallAt(r,g.lw[0])} → ${wallAt(r,g.lw[1])}</span>`:""),
-              e.clientX, e.clientY));
-            hit.addEventListener("mouseleave", untip);
-            svg.append(hit);
-          });
+      reqRanks.forEach((w, ri) => {
+        const rs = rows.filter(x => x.w === w);
+        if (!rs.length) return;
+        const yBase = yOf[7 + ri], yP = yBase + 6, yD = yBase + 20;
+        const waves = [];
+        rs.slice().sort((a,b)=>a.t0-b.t0).forEach(rr => {
+          const last = waves[waves.length-1];
+          if (last && rr.t0 - last.t0 <= 1) last.rows.push(rr);
+          else waves.push({t0: rr.t0, rows: [rr]});
+        });
+        waves.forEach((wv, wi) => {
+          const t0 = Math.min(...wv.rows.map(x=>x.t0)), ack = Math.max(...wv.rows.map(x=>x.ack));
+          const dy = (wi - (waves.length-1)/2) * 5;
+          const x1 = Math.max(t0, g.lw[0]), x2 = Math.max(ack, x1), x3 = Math.max(g.lw[1], x2);
+          const xs = [g.lw[0], x1, x2, x3], ys = [yP+dy, yD+dy, yD+dy, yP+dy];
+          svg.append(S("polyline", {points: xs.map((t,i)=>(px(t)+","+ys[i])).join(" "), "class":"ldflow"}));
+          xs.forEach((t,i)=>svg.append(S("circle", {cx:px(t), cy:ys[i], r:1.5, "class":"ldpt"})));
+          const hit=S("rect",{x:px(x3)-3, y:yBase+1, width:6, height:23, fill:"transparent"});
+          hit.addEventListener("mousemove",e=>tip(
+            `<b>${r.u}</b> · LAYER_DONE 往返 round ${g.rnd+1} 批 layers=[${g.lay.join(",")}]<br>`+
+            `接收方 <b>${rankTag(w)}</b> · 本次往返含 ${wv.rows.length} 个发送方<br>`+
+            wv.rows.map(x=>`&nbsp;&nbsp;发送方 ⋯${x.snd}: 收 ${wallAt(r,x.t0)} · 回 ${wallAt(r,x.ack)} · pull ${FMT(x.pull,2)} + H2D(纯) ${FMT(x.h2d_only,2)}`).join("<br>")+
+            `<br>① P 发 → D 收(网络) <b>${FMT(x1-xs[0],2)}</b><br>`+
+            `② D 收 → D 回 ACK(该 rank: pull read + H2D) <b>${FMT(x2-x1,2)}</b><br>`+
+            `③ D 回 ACK → P 收齐 ACK <b>${FMT(x3-x2,2)}</b>`+
+            `<br>绝对 ${wallAt(r,xs[0])} → ${wallAt(r,x3)}`+
+            ((g.dh.frows||1)>1?`<br><span style="color:var(--text-2)">该批共 ${g.dh.frows} 个 D rank 各收一次(P 侧窗口为并集, 仅供参照)</span>`:""),
+            e.clientX,e.clientY));
+          hit.addEventListener("mouseleave",untip);
+          svg.append(hit);
         });
       });
     } else if (g.lw && g.dh && g.dh.fs!=null && g.dh.fa!=null) {
       // 老格式日志(无 per-rank 明细): 退回单条四点折线 —— P发 → D收 → D回ACK → P收齐.
-      const yP = yOf[LD_Y0]+6, yD = yOf[LD_Y0]+20;
+      const yP = yOf[7]+6, yD = yOf[7]+20;
       const x0 = g.lw[0];
       const x1 = Math.max(g.dh.fs, x0);
       const x2 = Math.max(g.dh.fa, x1);
@@ -1282,7 +1284,7 @@ function drawB() {
       const xs = [x0, x1, x2, x3], ys = [yP, yD, yD, yP];
       svg.append(S("polyline", {points: xs.map((t,i)=>(px(t)+","+ys[i])).join(" "), "class":"ldflow"}));
       xs.forEach((t,i)=>svg.append(S("circle", {cx:px(t), cy:ys[i], r:1.6, "class":"ldpt"})));
-      const hit=S("rect",{x:px(x0)-2, y:yOf[LD_Y0]+2, width:Math.max(3,px(x3)-px(x0)+4), height:22, fill:"transparent"});
+      const hit=S("rect",{x:px(x0)-2, y:yOf[7]+2, width:Math.max(3,px(x3)-px(x0)+4), height:22, fill:"transparent"});
       hit.addEventListener("mousemove",e=>tip(
         `<b>${r.u}</b> · LAYER_DONE 往返 round ${g.rnd+1} 批 layers=[${g.lay.join(",")}]<br>`+
         `① P 发 → D 收 <b>${FMT(x1-x0,2)}</b> · 绝对 ${wallAt(r,x0)} → ${wallAt(r,x1)}<br>`+
