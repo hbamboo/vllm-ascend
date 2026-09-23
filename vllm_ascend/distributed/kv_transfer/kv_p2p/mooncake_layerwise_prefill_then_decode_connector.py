@@ -201,6 +201,10 @@ class ReqMeta:
     # 注意不能用 remote_host/remote_port: 它们在发送路径上会被改写成某个具体
     # peer 的映射端口(见 start_load_kv 的兼容字段), 不再是基址。
     remote_recv_ports: list[tuple[str, int]] = field(default_factory=list)
+    # 对端发布的 remote_block_ids **原样**快照(未做块大小换算): _align_remote_block_ids
+    # 每次前向都会被调用, 必须从这份 raw 重算才是幂等的 —— 直接拿 remote_block_ids
+    # 再乘一遍会按 chunk 数累乘。见 _apply_decoder_params / _align_remote_block_ids。
+    remote_block_ids_raw: list[list[int]] | None = None
 
 
 @dataclass
@@ -2808,7 +2812,12 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
             return False
         if params is None:
             return not req_failed
-        req_meta.remote_block_ids = params.get("remote_block_ids", [])
+        # params 是参数通道的缓存对象(chunk/前向之间复用同一份): raw 快照与当前视图
+        # 都必须是拷贝, 否则 _align_remote_block_ids 的换算结果会写回缓存, 下一个 chunk
+        # 在同一份数据上再乘一次 —— 多 chunk 请求的 dst 越走越远(见该函数注释)。
+        raw_remote_block_ids = copy.deepcopy(params.get("remote_block_ids", []))
+        req_meta.remote_block_ids_raw = raw_remote_block_ids
+        req_meta.remote_block_ids = [list(block_ids) for block_ids in raw_remote_block_ids]
         req_meta.remote_block_size = params.get("remote_block_size", [])
         req_meta.remote_engine_id = params.get("remote_engine_id")
         req_meta.remote_host = params.get("remote_host")
@@ -3412,25 +3421,41 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         return transfer_mappings
 
     def _align_remote_block_ids(self, req_meta: ReqMeta):
+        """把对端 block id 从 D 的调度块口径换算到本端调度块口径(乘块大小比).
+
+        **幂等**: 每次都从 raw 快照重算并整体重建列表。上游 remote_block_ids 来自
+        D→P 参数通道的**缓存**(见 _apply_decoder_params), 而本函数每个 chunk/前向都会
+        被 start_load_kv 调一次 —— 若就地在已有值上再乘一次, 比值会按 chunk 数累乘:
+        2 个 chunk 的请求 remote id 变 4 倍(= 2 倍偏大) ⇒ dst = D base + 2×正确偏移,
+        高地址层(末层/MTP)直接越出对端 staging 报 "CPU staging addr ... not found in
+        region map", 低地址层静默写到错误的块(复读/乱码).
+        """
         remote_block_size = req_meta.remote_block_size
-        remote_block_ids = req_meta.remote_block_ids
+        if getattr(req_meta, "remote_block_ids_raw", None) is None:
+            # 非参数通道路径(对端信息随请求下发): 首次调用时把当前值当 raw。
+            req_meta.remote_block_ids_raw = [list(block_ids) for block_ids in req_meta.remote_block_ids]
+        raw_remote_block_ids = req_meta.remote_block_ids_raw
+        aligned_block_ids: list[list[int]] = []
         for i in range(self.num_kv_cache_groups):
-            if isinstance(self.kv_cache_specs[i], MambaSpec):
+            block_ids = raw_remote_block_ids[i]
+            if isinstance(self.kv_cache_specs[i], MambaSpec) or len(block_ids) == 0:
+                # mamba 状态块按 len(remote_block_ids)-num_spec-1 取下标, 展开会挪位.
+                aligned_block_ids.append(list(block_ids))
                 continue
-            if remote_block_size[i] != self.block_size[i] and len(req_meta.remote_block_ids[i]) > 0:
-                assert remote_block_size[i] > self.block_size[i] and remote_block_size[i] % self.block_size[i] == 0, (
-                    "Remote block size must be divisible by local block size."
-                )
-                assert self.pcp_size * self.dcp_size * req_meta.remote_pcp_size * req_meta.remote_dcp_size == 1, (
-                    "Context parallel does not support different P/D block size now."
-                )
-                pd_block_size_ratio = remote_block_size[i] // self.block_size[i]
-                remtote_block_ids_with_scale = [
-                    block_id * pd_block_size_ratio + j
-                    for block_id in remote_block_ids[i]
-                    for j in range(pd_block_size_ratio)
-                ]
-                req_meta.remote_block_ids[i] = remtote_block_ids_with_scale
+            if remote_block_size[i] == self.block_size[i]:
+                aligned_block_ids.append(list(block_ids))
+                continue
+            assert remote_block_size[i] > self.block_size[i] and remote_block_size[i] % self.block_size[i] == 0, (
+                "Remote block size must be divisible by local block size."
+            )
+            assert self.pcp_size * self.dcp_size * req_meta.remote_pcp_size * req_meta.remote_dcp_size == 1, (
+                "Context parallel does not support different P/D block size now."
+            )
+            pd_block_size_ratio = remote_block_size[i] // self.block_size[i]
+            aligned_block_ids.append(
+                [block_id * pd_block_size_ratio + j for block_id in block_ids for j in range(pd_block_size_ratio)]
+            )
+        req_meta.remote_block_ids = aligned_block_ids
 
     def _get_kernel_block_ids(self, block_ids):
         for i in range(self.num_kv_cache_groups):

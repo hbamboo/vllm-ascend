@@ -7,6 +7,7 @@
 到达则请求已被放行, 注入落空)。
 """
 
+import copy
 import importlib.util
 import sys
 import threading
@@ -67,6 +68,7 @@ def _make_recv_thread(tp_rank=0):
         local_engine_id="engineD",
         metadata=_make_agent_metadata(),
         ready_event=threading.Event(),
+        engine=MagicMock(),
     )
 
 
@@ -650,6 +652,106 @@ class TestDecoderParamsChannel(unittest.TestCase):
         scheduler._push_kv_transfer_params_to_prefiller({}, {"remote_block_ids": [[1]]}, "r1")
 
         scheduler.executor.submit.assert_not_called()
+
+
+class TestAlignRemoteBlockIdsIdempotent(unittest.TestCase):
+    """对端 block id 的块大小换算必须幂等。
+
+    上游 remote_block_ids 来自 D→P 参数通道的**缓存**, 而 start_load_kv 每个 chunk
+    都会重新 apply + 对齐一次; 一旦对齐就地改缓存, 比值按 chunk 数累乘 —— 2 个 chunk
+    的请求 remote id 变 4 倍(= 2 倍偏大), dst 越出对端 staging("not found in region
+    map")或静默写到错误的块。
+    """
+
+    def _align_worker(self, mamba=False, num_groups=1):
+        # MambaSpec 的构造需要字段, 用 __new__ 拿一个真正的实例给 isinstance 判.
+        spec = object.__new__(ptd.MambaSpec) if mamba else object()
+        return _make_worker(
+            num_kv_cache_groups=num_groups,
+            kv_cache_specs=[spec] * num_groups,
+            block_size=[8] * num_groups,  # 本端调度块 8 token, 对端 16 ⇒ ratio=2
+            pcp_size=1,
+            dcp_size=1,
+        )
+
+    def _req_meta(self):
+        return types.SimpleNamespace(
+            remote_block_ids=[],
+            remote_block_size=[],
+            remote_pcp_size=1,
+            remote_dcp_size=1,
+            reuse_prefilled_tokens=False,
+        )
+
+    def _apply(self, worker, params):
+        pull = MagicMock()
+        pull.get_kv_transfer_params.return_value = (params, False)
+        worker.pull_thread = pull
+
+    def test_align_expands_by_block_size_ratio(self):
+        worker = self._align_worker()
+        req_meta = self._req_meta()
+        req_meta.remote_block_ids = [[3, 5]]
+        req_meta.remote_block_size = [16]
+
+        worker._align_remote_block_ids(req_meta)
+
+        self.assertEqual(req_meta.remote_block_ids, [[6, 7, 10, 11]])
+
+    def test_align_is_idempotent(self):
+        worker = self._align_worker()
+        req_meta = self._req_meta()
+        req_meta.remote_block_ids = [[3, 5]]
+        req_meta.remote_block_size = [16]
+
+        worker._align_remote_block_ids(req_meta)
+        once = copy.deepcopy(req_meta.remote_block_ids)
+        worker._align_remote_block_ids(req_meta)  # 第二个 chunk 再对齐一次
+
+        self.assertEqual(req_meta.remote_block_ids, once)
+
+    def test_second_chunk_keeps_ids_when_params_are_cached(self):
+        """复现现场: 参数是缓存对象, 两个 chunk 各 apply+对齐一次。"""
+        worker = self._align_worker()
+        params = {
+            "remote_block_ids": [[3, 5]],
+            "remote_block_size": [16],
+            "remote_pcp_size": 1,
+            "remote_dcp_size": 1,
+        }
+        self._apply(worker, params)
+
+        chunk1 = self._req_meta()
+        worker._apply_decoder_params("r1-00000000", chunk1, False)
+        worker._align_remote_block_ids(chunk1)
+
+        chunk2 = self._req_meta()
+        worker._apply_decoder_params("r1-00000000", chunk2, True)
+        worker._align_remote_block_ids(chunk2)
+
+        self.assertEqual(chunk2.remote_block_ids, chunk1.remote_block_ids)
+        self.assertEqual(params["remote_block_ids"], [[3, 5]])  # 缓存未被写回
+
+    def test_mamba_group_ids_untouched(self):
+        worker = self._align_worker(mamba=True)
+        req_meta = self._req_meta()
+        req_meta.remote_block_ids = [[3, 5]]
+        req_meta.remote_block_size = [16]
+
+        worker._align_remote_block_ids(req_meta)
+
+        # 状态块按 len(remote_block_ids)-num_spec-1 取下标, 展开会挪位.
+        self.assertEqual(req_meta.remote_block_ids, [[3, 5]])
+
+    def test_equal_block_size_leaves_ids_unchanged(self):
+        worker = self._align_worker()
+        req_meta = self._req_meta()
+        req_meta.remote_block_ids = [[3, 5]]
+        req_meta.remote_block_size = [8]
+
+        worker._align_remote_block_ids(req_meta)
+
+        self.assertEqual(req_meta.remote_block_ids, [[3, 5]])
 
 
 if __name__ == "__main__":
