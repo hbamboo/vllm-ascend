@@ -67,6 +67,8 @@ import vllm_ascend.patch.worker.patch_cudagraph  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_mtp  # noqa
 import vllm_ascend.patch.worker.patch_deepseek_v2  # noqa
 import vllm_ascend.patch.worker.patch_gqa_c8  # noqa
+# H2H 时间线: MTP/draft 提案耗时(注意: 必须在编译区之外测, 见该文件头注释)
+import vllm_ascend.patch.worker.patch_spec_decode_perf  # noqa
 
 # vLLM's use_v2_model_runner may enable the v2 runner without the
 # VLLM_USE_V2_MODEL_RUNNER env var (e.g. based on model architecture).

@@ -61,6 +61,7 @@ from vllm_ascend.batch_invariant import init_batch_invariance
 from vllm_ascend.cpu_binding import bind_cpus
 from vllm_ascend.device_allocator.camem import CaMemAllocator
 from vllm_ascend.device_allocator.sleep_mem_optimized import SleepWakeupManager
+from vllm_ascend.distributed.kv_transfer.utils import h2h_perf
 from vllm_ascend.distributed.parallel_state import init_ascend_model_parallel
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.profiler.torch_npu_profiler import TorchNPUProfilerWrapper
@@ -613,9 +614,12 @@ class NPUWorker(WorkerBase):
         self,
         scheduler_output: "SchedulerOutput",
     ) -> ModelRunnerOutput | AsyncModelRunnerOutput | None:
-        if envs_ascend.ENABLE_PERF_DEBUG:
-            # perf: worker 收到 executor 下发批次的时刻; model_runner 在前向
-            # 开始处读取该值, 计算"收到请求→开始前向"耗时 (H2H 时延定位).
+        # perf: worker 收到 executor 下发批次的时刻; model_runner 在前向开始处读取
+        # 该值, 得到"收到批次→开始前向"段(含输入准备/同步/层数据等待). 这里只是
+        # 一次 perf_counter(无同步), 故 MC_TCP_PERF_LOG=1 时也要采 —— 否则时间线
+        # 上 fwd.recv 为空、该段消失. 需要精确的前向**结束**时刻另需 ENABLE_PERF_DEBUG
+        # (它才做 torch.npu.synchronize(), 见 model_runner).
+        if envs_ascend.ENABLE_PERF_DEBUG or h2h_perf.PERF_ON:
             self.model_runner.batch_recv_time = time.perf_counter()
         self.log_memory_stats()
         # enable msMonitor to monitor the performance of vllm-ascend

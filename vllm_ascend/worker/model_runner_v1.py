@@ -123,6 +123,7 @@ from vllm_ascend.compilation.acl_graph import (
     set_graph_params,
     update_full_graph_params,
 )
+from vllm_ascend.distributed.kv_transfer.utils import h2h_perf
 from vllm_ascend.eplb.adaptor.vllm_adaptor import VllmEplbAdaptor
 from vllm_ascend.eplb.core.eplb_device_transfer_loader import D2DExpertWeightLoader
 from vllm_ascend.eplb.core.eplb_worker import EplbProcess
@@ -497,6 +498,22 @@ class NPUModelRunner(GPUModelRunner):
         if vllm_config.kv_transfer_config is not None:
             self.is_kv_producer = vllm_config.kv_transfer_config.is_kv_producer
             self.is_kv_consumer = vllm_config.kv_transfer_config.is_kv_consumer
+        # perf: 请求级"首次/末次被调度"跟踪(由 MC_TCP_PERF_LOG 门控; P 侧给出
+        # 前向两点, D 侧给出首次 decode 前向 —— 见 h2h_perf.FirstLastTracker).
+        # perf 打点的 rank 选择: 用 **每个 DP 组的 TP0**(而不是全局 rank 0) ——
+        # dp>1 时每个 DP 组有各自的 rank 0, 全局 rank 0 只覆盖第一组, 另一组的
+        # 请求会完全没有前向打点(实测 dp=2 时只覆盖一半请求).
+        self._h2h_emit_rank = get_tp_group().rank_in_group == 0
+        if h2h_perf.PERF_ON:
+            self._h2h_tracker = h2h_perf.FirstLastTracker("producer" if self.is_kv_producer else "consumer")
+            if not ascend_envs.ENABLE_PERF_DEBUG:
+                # 启动提示: 只开打点不开同步时, 前向结束时刻是异步提交时刻, 前向
+                # 耗时会明显偏低(时间线上的前向块被压扁).
+                logger.warning(
+                    "MC_TCP_PERF_LOG=1 but ENABLE_PERF_DEBUG=0: forward-end timestamps are "
+                    "async-submit times (model forward durations will be understated). "
+                    "Set ENABLE_PERF_DEBUG=1 too if accurate forward timing is needed."
+                )
 
         set_cos_and_sin(vllm_config, self.max_num_reqs, self.uniform_decode_query_len, self.dtype, self.device)
         set_mc2_tokens_capacity(vllm_config, self.max_num_reqs, self.uniform_decode_query_len)
@@ -2323,30 +2340,45 @@ class NPUModelRunner(GPUModelRunner):
                 num_tokens_padded, input_ids, positions, intermediate_tensors, inputs_embeds, **model_kwargs
             )
 
-            if ascend_envs.ENABLE_PERF_DEBUG and torch.distributed.get_rank() == 0:
+            # perf: 前向结束时刻需要 torch.npu.synchronize() 才准, 而该同步仍只由
+            # ENABLE_PERF_DEBUG 控制(见 414f89a08, 避免落在热路径上) —— 与"是否
+            # 记录/打印"的 MC_TCP_PERF_LOG 解耦: 只开后者时 fe 是异步提交时刻
+            # (时间线上的前向块会被压扁), 两个都开才是精确的前向耗时.
+            if ascend_envs.ENABLE_PERF_DEBUG and self._h2h_emit_rank:
                 torch.npu.synchronize()
+            if h2h_perf.PERF_ON and self._h2h_emit_rank:
                 model_exec_end_time = time.perf_counter()
-                # reqs 为该批 external request id (如 chatcmpl-xxx), P/D 两侧
-                # 同 id 便于时间线对应.
-                reqs = ",".join(self.input_batch.req_ids)
-                # 配对 worker.execute_model 入口打点(batch_recv_time), 打印
-                # 收到批次 → 开始前向 的耗时 (含输入准备/同步/层数据等待).
-                batch_recv_time = getattr(self, "batch_recv_time", None)
-                if batch_recv_time is not None:
-                    logger.info(
-                        "reqs=%sRecv at %.6f, forward start at %.6f, "
-                        "Recv to forward time: %.6f ms Model forward time: %.6f ms",
+                # reqs 为该批的 external request id (如 chatcmpl-xxx), P/D 两侧
+                # 同 id 便于时间线对应: worker 侧 req_id 带 "-<8hex>" 后缀, 必须 strip.
+                reqs = [h2h_perf.external_id(r) for r in self.input_batch.req_ids]
+                # recv 来自 worker.execute_model 入口打点(ENABLE_PERF_DEBUG 下才有),
+                # 配对后即"收到批次 → 开始前向"的耗时(含输入准备/同步/层数据等待).
+                h2h_perf.emit(
+                    "fwd",
+                    ts=model_exec_start_time,
+                    role="producer" if self.is_kv_producer else "consumer",
+                    reqs=reqs,
+                    recv=getattr(self, "batch_recv_time", None),
+                    fs=model_exec_start_time,
+                    fe=model_exec_end_time,
+                    fwd_ms=(model_exec_end_time - model_exec_start_time) * 1e3,
+                    # sync=False 表示 fe 只是异步提交时刻(未做设备同步), 前向块会
+                    # 被压扁 —— 时间线据此标注, 避免把假耗时当真.
+                    sync=bool(ascend_envs.ENABLE_PERF_DEBUG),
+                )
+                # 把本 step 的请求上下文留给模块内 forward(MTP/draft 层)打点用:
+                # 那次前向拿不到 scheduler_output, 只能靠这份上下文归属请求.
+                h2h_perf.set_step_ctx(reqs, "producer" if self.is_kv_producer else "consumer")
+                # 请求级首次/末次: P 侧=前向两点(末次即 prefill+首 token 完成那步,
+                # 因 proxy 对 P 的派发带 max_tokens=1); D 侧=首次 decode 前向.
+                tracker = getattr(self, "_h2h_tracker", None)
+                if tracker is not None:
+                    tracker.step(
                         reqs,
-                        batch_recv_time,
                         model_exec_start_time,
-                        (model_exec_start_time - batch_recv_time) * 1000,
-                        (model_exec_end_time - model_exec_start_time) * 1000,
-                    )
-                else:
-                    logger.info(
-                        "Model forward time: %.6f ms reqs=%s",
-                        (model_exec_end_time - model_exec_start_time) * 1000,
-                        reqs,
+                        model_exec_end_time,
+                        "p_fwd_first" if self.is_kv_producer else "d_fwd_first",
+                        "p_fwd_last" if self.is_kv_producer else "d_fwd_last",
                     )
 
         with record_function_or_nullcontext("post process"):
@@ -2543,6 +2575,15 @@ class NPUModelRunner(GPUModelRunner):
                 req_ids_output_copy,
                 prefilled_token_ids,
             )
+            # perf: P 侧"prefill 完成 + 首 token 已产出"的时刻(校验点): 与
+            # p_fwd_last 应几乎重合, 与 p_first_token_send 之间的差即连接器内部
+            # 的汇合等待(层批末轮 + D 的 ACK).
+            if h2h_perf.PERF_ON and self._h2h_emit_rank:
+                h2h_perf.emit(
+                    "p_prefill_done",
+                    role="producer",
+                    reqs=[h2h_perf.external_id(r) for r in req_ids_output_copy],
+                )
 
         with record_function_or_nullcontext("draft_token"):
             if self.speculative_config:

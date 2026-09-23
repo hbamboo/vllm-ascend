@@ -7,6 +7,7 @@ import numpy as np
 import torch
 from vllm.logger import logger
 
+from vllm_ascend.distributed.kv_transfer.utils import h2h_perf
 from vllm_ascend.distributed.kv_transfer.utils.utils import iter_kv_cache_tensors
 
 _BG_SYNC_INTERVAL = float(os.getenv("MC_TCP_BG_SYNC_INTERVAL", "1.0"))
@@ -17,8 +18,9 @@ _BG_SYNC_INTERVAL = float(os.getenv("MC_TCP_BG_SYNC_INTERVAL", "1.0"))
 _CPU_BIND_ENABLED = os.getenv("MC_TCP_CPU_BIND", "0") == "1"
 
 # 性能观测开关(与 layerwise connector 同 env): 1=热路径(flush/H2D)耗时以
-# INFO 输出供逐批观测; 否则降为 DEBUG 避免每批刷屏.
-_PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
+# [h2h][perf] 结构化记录输出供逐批观测. 开关本身由 h2h_perf 统一读取(唯一
+# 读取点), 本文件只做别名以兼容既有代码路径.
+_PERF_LOG = h2h_perf.PERF_ON
 _cpu_bind_lock = threading.Lock()
 _cpu_bind_used: set[int] = set()
 
@@ -609,14 +611,15 @@ class GlobalTE:
             copied_bytes += actual_size
         # 一次 aclrtMemcpyBatchAsync 批量 D2H; 内部只同步专用拷贝流.
         self.submit_dma_copy(items, direction=_DIRECTION_D2H)
-        # 热路径日志门控: MC_TCP_PERF_LOG=1 时 INFO(供逐批观测), 否则 DEBUG 防刷屏.
-        log_fn = logger.info if _PERF_LOG else logger.debug
-        log_fn(
-            "[mooncake][TCP] flush for pull: ranges=%d bytes=%d skipped=%d elapsed=%.3fs",
-            len(cpu_addrs),
-            copied_bytes,
-            skipped,
-            time.perf_counter() - t0,
+        # perf: pull 模式下 P 侧按 staging 地址的 D2H flush(逐批观测).
+        h2h_perf.emit(
+            "te_d2h",
+            ts=t0,
+            src="pull_flush",
+            ranges=len(cpu_addrs),
+            nbytes=copied_bytes,
+            skipped=skipped,
+            ms=(time.perf_counter() - t0) * 1e3,
         )
         return copied_bytes
 
@@ -664,13 +667,15 @@ class GlobalTE:
             copied_bytes += actual_size
         # 一次 aclrtMemcpyBatchAsync 批量 D2H; 内部只同步专用拷贝流.
         self.submit_dma_copy(items, direction=_DIRECTION_D2H)
-        log_fn = logger.info if _PERF_LOG else logger.debug
-        log_fn(
-            "[mooncake][TCP] layerwise flush (NPU->CPU): ranges=%d bytes=%d skipped=%d elapsed=%.5f ms",
-            len(npu_addrs),
-            copied_bytes,
-            skipped,
-            (time.perf_counter() - t0) * 1000,
+        # perf: 逐层 H2H 的 D2H flush(per-view 路径).
+        h2h_perf.emit(
+            "te_d2h",
+            ts=t0,
+            src="layerwise",
+            ranges=len(npu_addrs),
+            nbytes=copied_bytes,
+            skipped=skipped,
+            ms=(time.perf_counter() - t0) * 1e3,
         )
         return copied_bytes
 
@@ -694,13 +699,15 @@ class GlobalTE:
             sizes.append(byte_size)
             copied_bytes += byte_size
         self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_D2H)
-        log_fn = logger.info if _PERF_LOG else logger.debug
-        log_fn(
-            "[mooncake][TCP] region flush (NPU->CPU): ranges=%d bytes=%d skipped=%d elapsed=%.5f ms",
-            len(npu_addrs),
-            copied_bytes,
-            skipped,
-            (time.perf_counter() - t0) * 1000,
+        # perf: 逐层 H2H 的 D2H flush(region 路径, hybrid/attn-mamba 默认走这条).
+        h2h_perf.emit(
+            "te_d2h",
+            ts=t0,
+            src="region",
+            ranges=len(npu_addrs),
+            nbytes=copied_bytes,
+            skipped=skipped,
+            ms=(time.perf_counter() - t0) * 1e3,
         )
         return copied_bytes
 
@@ -728,12 +735,15 @@ class GlobalTE:
             sizes.append(byte_size)
             total_bytes += byte_size
         self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_H2D)
-        log_fn = logger.info if _PERF_LOG else logger.debug
-        log_fn(
-            "[mooncake][TCP] region H2D (CPU->NPU): ranges=%d bytes=%d elapsed=%.5f ms",
-            len(cpu_addrs),
-            total_bytes,
-            (time.perf_counter() - t0) * 1000,
+        # perf: D 侧 H2D(region 路径). 与 connector 的 d_batch.h2d_only 互为独立
+        # 测量: 这里只含地址映射 + 批量 DMA + 拷贝流同步, 不含 pull read.
+        h2h_perf.emit(
+            "te_h2d",
+            ts=t0,
+            src="region",
+            ranges=len(cpu_addrs),
+            nbytes=total_bytes,
+            ms=(time.perf_counter() - t0) * 1e3,
         )
 
     def npu_addr_to_cpu_addr(self, npu_addr: int) -> int | None:
@@ -805,14 +815,16 @@ class GlobalTE:
         # 一次 aclrtMemcpyBatchAsync 批量 H2D; 内部只同步专用拷贝流.
         self.submit_dma_copy(items, direction=_DIRECTION_H2D)
         if synced:
-            # consumer 侧: TCP get 完成后把 staging 数据拷回 NPU (H2D)
-            log_fn = logger.info if _PERF_LOG else logger.debug
-            log_fn(
-                "[mooncake][TCP] H2D (CPU->NPU) after TCP get: regions=%d bytes=%d elapsed=%.5f ms tensors=%d",
-                len(src_addrs),
-                total_bytes,
-                (time.perf_counter() - t0) * 1000,
-                len(synced),
+            # perf: D 侧 H2D(per-view 路径): TCP get / pull read 完成后把 staging
+            # 数据拷回 NPU. 与 connector 的 d_batch.h2d_only 互为独立测量.
+            h2h_perf.emit(
+                "te_h2d",
+                ts=t0,
+                src="after_get",
+                ranges=len(src_addrs),
+                nbytes=total_bytes,
+                tensors=len(synced),
+                ms=(time.perf_counter() - t0) * 1e3,
             )
 
     def stop_bg_sync(self):

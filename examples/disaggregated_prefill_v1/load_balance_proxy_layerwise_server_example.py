@@ -117,6 +117,7 @@ import sys
 import time
 import uuid
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 import httpx
 from fastapi import FastAPI, Request
@@ -124,6 +125,35 @@ from fastapi.responses import StreamingResponse
 from vllm.logger import init_logger
 
 logger = init_logger(__name__)
+
+# perf: 与引擎侧同一套打点开关 + 同一套 JSON 行(权威实现在
+# vllm_ascend.distributed.kv_transfer.utils.h2h_perf)。
+# 刻意不复用那个模块: 它所在的包 import 时会注册 vllm_ascend 的 platform patch
+# (连带 torch_npu), 而 proxy 是纯前端进程, 不该背这份启动开销与副作用。
+# 需要 proxy.sh 也 export MC_TCP_PERF_LOG=1 才有输出。
+_H2H_PERF_ON = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
+
+
+def _emit_proxy_perf(request_id: str, st: dict) -> None:
+    """请求收尾时输出端到端分解时刻(与引擎日志 uuid 同源)。
+
+    in=proxy 受理 / meta=D 触发 remote prefill / pf=派发 P / tok=首 token 转发,
+    都是 CLOCK_MONOTONIC 绝对值, 与 P/D 引擎、前端、connector 的打点同一坐标系,
+    因此时间线可以直接按 req(uuid) join 出端到端闭环。
+    """
+    if not _H2H_PERF_ON or not st:
+        return
+    rec = {"kind": "proxy", "role": "proxy", "req": request_id, "ts": st.get("in", time.perf_counter())}
+    rec["wall"] = datetime.fromtimestamp(time.time() - time.perf_counter() + rec["ts"]).isoformat(
+        timespec="milliseconds"
+    )
+    for key, value in st.items():
+        # in 同时保留成字段(与 ts 同值): 下游解析器/时间线按 "in" 取受理时刻, 删掉
+        # 会让 lane0 的"受理→P"段整段消失(实测踩过)。
+        rec[key] = value
+    rec["done"] = time.perf_counter()
+    # nohup 下 vllm logger 行会缓冲, 用 print(flush=True) 直出.
+    print(f"[h2h][perf] {json.dumps(rec, separators=(',', ':'))}", flush=True)
 
 # Add uvloop for faster event loop if available
 try:
@@ -733,16 +763,7 @@ async def _handle_p_then_d(
             proxy_state.release_prefiller_kv(prefiller_idx, prefiller_score)
             proxy_state.release_decoder(decoder_idx, decoder_score)
             st = proxy_state.req_perf.pop(request_id, None)
-            if st:
-
-                def _f(k: str) -> str:
-                    return f"{st[k]:.6f}" if k in st else "-"
-
-                print(
-                    f"[h2h][perf] proxy req={request_id} in={_f('in')} meta={_f('meta')} "
-                    f"pf={_f('pf')} tok={_f('tok')} done={time.perf_counter():.6f}",
-                    flush=True,
-                )
+            _emit_proxy_perf(request_id, st)
 
     return StreamingResponse(
         generate_stream(),
@@ -888,17 +909,7 @@ async def _handle_completions(api: str, request: Request):
                 proxy_state.release_decoder(decoder_idx, decoder_score)
                 # perf: 请求收尾时打印端到端分解时刻 (与引擎日志 uuid 同源).
                 st = proxy_state.req_perf.pop(request_id, None)
-                if st:
-
-                    def _f(k: str) -> str:
-                        return f"{st[k]:.6f}" if k in st else "-"
-
-                    # nohup 下 vllm logger 行会缓冲, 改用 print(flush=True) 直出.
-                    print(
-                        f"[h2h][perf] proxy req={request_id} in={_f('in')} meta={_f('meta')} "
-                        f"pf={_f('pf')} tok={_f('tok')} done={time.perf_counter():.6f}",
-                        flush=True,
-                    )
+                _emit_proxy_perf(request_id, st)
 
         if stream_flag:
             return StreamingResponse(generate_stream(), media_type="text/event-stream")

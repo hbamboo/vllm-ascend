@@ -64,3 +64,8 @@ if vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_kv_connector  # noqa
     import vllm_ascend.patch.platform.patch_kv_utils  # noqa
     import vllm_ascend.patch.platform.patch_render_serving  # noqa
+
+# H2H 时间线: 前端侧两个时刻(api_arrive / first_token_out), 由 MC_TCP_PERF_LOG
+# 门控; 与 p_then_d 无关, 故不放在上面的 p_then_d 三件套里。
+if vllm_version_is("0.23.0"):
+    import vllm_ascend.patch.platform.patch_h2h_perf  # noqa

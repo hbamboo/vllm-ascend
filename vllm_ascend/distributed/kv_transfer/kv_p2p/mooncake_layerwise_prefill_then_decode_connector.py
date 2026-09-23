@@ -56,6 +56,7 @@ from vllm.v1.worker.utils import extract_layer_index
 from vllm_ascend import envs
 from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.distributed.kv_transfer.kv_p2p.mooncake_connector import GET_META_MSG
+from vllm_ascend.distributed.kv_transfer.utils import h2h_perf
 from vllm_ascend.distributed.kv_transfer.utils.mooncake_transfer_engine import (
     bind_current_thread_to_idle_cpu,
     global_te,
@@ -111,9 +112,10 @@ DEFAULT_PREFILL_TRANSFER_PARAMS_EXPIRE_SEC = 300  # default 5min
 # 1 = 逐层传输(旧行为); 层序号断裂(跨步/换批)或到达最后层时立即冲刷.
 _LAYER_BATCH = int(os.getenv("MC_TCP_LAYER_BATCH", "8"))
 
-# 性能观测开关: 1=开启后打印 [mooncake][perf] 阶段耗时日志(每批/每请求一条),
+# 性能观测开关: 1=开启后输出 [h2h][perf] 结构化记录(每批/每请求一条),
 # 用于定位 H2H 通路相对 D2D 的 TTFT 增量来源(攒批等待/事件/D2H/写/LAYER_DONE/H2D).
-_PERF_LOG = os.getenv("MC_TCP_PERF_LOG", "0") == "1"
+# 开关本身由 h2h_perf 统一读取(唯一读取点), 本文件只做别名以兼容既有代码路径。
+_PERF_LOG = h2h_perf.PERF_ON
 
 # H2H 写线程流水 A/B (仅 protocol=tcp 且非 reshard/量化路径): 1=发送线程只做
 # "等事件 + D2H flush", write 交给独立写线程连续占满数据面, LAYER_DONE 在对应
@@ -137,9 +139,13 @@ _TRANSPORT_MODE = os.getenv("VLLM_ASCEND_LAYERWISE_TRANSPORT_MODE", "pull")
 _PULL_MODE = _TRANSPORT_MODE == "pull"
 
 
-def _perf_ms(t0: float) -> float:
-    """perf_counter 差值的毫秒数."""
-    return (time.perf_counter() - t0) * 1e3
+# 复用 h2h_perf 的同一实现(历史上本文件与旧 connector 各有一份).
+_perf_ms = h2h_perf.perf_ms
+
+
+def _win_pair(a: float | None, b: float | None) -> list[float] | None:
+    """阶段绝对窗口 [起点,终点](秒, CLOCK_MONOTONIC); 该阶段未发生时返回 None."""
+    return None if a is None else [a, b]
 
 
 @dataclass
@@ -415,7 +421,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         torch.npu.set_device(device)
         # MC_TCP_CPU_BIND=1 时把本线程绑到进程允许核集中负载最低的核
         # (受 vllm-ascend cpu_binding taskset 约束, 在 main 核集内选取).
-        bind_current_thread_to_idle_cpu(f"kv-send-rank{local_rank}")
+        # bind_current_thread_to_idle_cpu(f"kv-send-rank{local_rank}")
         self.ready_event.set()
         if self.use_pipe_writer:
             # 启动独立写线程; 队列在 __init__ 已按 _PIPE_WRITER 创建.
@@ -879,14 +885,20 @@ class KVCacheSendingLayerThread(threading.Thread):
                         self.failed_reqs.add(failed_req_id)
                 else:
                     req_end_time = time.perf_counter()
-                    total_transfer_size = sum(transfer_meta.length) / 1024
-                    req_transfer_elapsed = (req_end_time - req_start_time) * 1000
-                    logger.debug(
-                        "Layers batch KV cache transfer task %dKB to remote_session_id [%s] took %.3f ms.",
-                        total_transfer_size,
-                        session_id,
-                        req_transfer_elapsed,
-                    )
+                    # perf: 逐 session(逐对端)一段; pull 模式下这里不写对端(TCP 写
+                    # 被跳过), 真正的 H2H 读发生在 D 侧(见 d_batch 的 pull 字段),
+                    # 故带上 pull 标志供时间线区分. 取值放在门控内, 关掉时零开销.
+                    if _PERF_LOG:
+                        h2h_perf.emit(
+                            "p_session",
+                            ts=req_start_time,
+                            role="producer",
+                            session=session_id,
+                            reqs=[get_external_request_id(r) for r in transfer_meta.req_ids],
+                            kb=sum(transfer_meta.length) / 1024,
+                            ms=(req_end_time - req_start_time) * 1e3,
+                            pull=_PULL_MODE,
+                        )
                     if global_te.use_tcp:
                         # 批传输完成后通知 D(该批全部层范围), D 完成 H2D 后回
                         # ACK 才处理下一批(同线程串行). 请求级完成信息(is_last /
@@ -964,30 +976,25 @@ class KVCacheSendingLayerThread(threading.Thread):
             # 本批实际写入对端的 payload 字节(去重后各 session ranges 长度和),
             # 用于吞吐与带宽利用率统计.
             batch_bytes = sum(sum(m.length) for m in session_meta.values())
-
-            def _win_str(a: float | None, b: float | None) -> str:
-                # 绝对窗口 [起点,终点] (秒, CLOCK_MONOTONIC); 无该阶段时为 "-".
-                return "-" if a is None else f"{a:.6f},{b:.6f}"
-
-            logger.info(
-                "[mooncake][perf] P batch=%d layers=%s reqs=%s wait=%.1f event=%.1f "
-                "flush=%.1f write=%.1f layerdone=%.1f misc=%.1f total=%.1f ms "
-                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s bytes=%d",
-                batch_id,
-                [t.layer_idx for t in tasks],
-                batch_ext_reqs,
-                batch_wait_ms,
-                event_ms,
-                flush_ms,
-                write_ms,
-                layerdone_ms,
-                misc_ms,
-                total_ms,
-                t_batch0,
-                _win_str(flush_win0, flush_win1),
-                _win_str(write_win0, write_win1),
-                _win_str(layerdone_win0, layerdone_win1),
-                batch_bytes,
+            h2h_perf.emit(
+                "p_batch",
+                ts=t_batch0,
+                role="producer",
+                batch=batch_id,
+                layers=[t.layer_idx for t in tasks],
+                reqs=batch_ext_reqs,
+                wait=batch_wait_ms,
+                event=event_ms,
+                flush=flush_ms,
+                write=write_ms,
+                layerdone=layerdone_ms,
+                misc=misc_ms,
+                total=total_ms,
+                flush_win=_win_pair(flush_win0, flush_win1),
+                write_win=_win_pair(write_win0, write_win1),
+                layerdone_win=_win_pair(layerdone_win0, layerdone_win1),
+                bytes=batch_bytes,
+                sender=self.sender_path,
             )
             # 请求级累计(批共享口径: flush/write/layerdone 是该批全部请求共享的
             # 墙钟, 每个请求都记全值; 单请求场景下即精确分解).
@@ -1029,18 +1036,17 @@ class KVCacheSendingLayerThread(threading.Thread):
                             if acc is not None:
                                 # 请求级汇总: t0=发送线程开始处理该请求首任务,
                                 # total=到 DONE 发出的墙钟跨度.
-                                logger.info(
-                                    "[mooncake][perf] P req=%s done batches=%d "
-                                    "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
-                                    "wait=%.1f total=%.1f ms",
-                                    ext_req,
-                                    int(acc["batches"]),
-                                    acc["event"],
-                                    acc["flush"],
-                                    acc["write"],
-                                    acc["layerdone"],
-                                    acc["wait"],
-                                    _perf_ms(acc["t0"]),
+                                h2h_perf.emit(
+                                    "p_req",
+                                    role="producer",
+                                    req=ext_req,
+                                    batches=int(acc["batches"]),
+                                    event=acc["event"],
+                                    flush=acc["flush"],
+                                    write=acc["write"],
+                                    layerdone=acc["layerdone"],
+                                    wait=acc["wait"],
+                                    total=_perf_ms(acc["t0"]),
                                 )
                         if req_id in self.failed_reqs:
                             # 失败仍走独立的请求级信号: 写失败的层批根本没有
@@ -1176,7 +1182,7 @@ class KVCacheSendingLayerThread(threading.Thread):
 
     def _pipe_writer_loop(self):
         local_rank = get_world_group().local_rank
-        bind_current_thread_to_idle_cpu(f"kv-write-rank{local_rank}")
+        # bind_current_thread_to_idle_cpu(f"kv-write-rank{local_rank}")
         while True:
             job = self._write_queue.get()  # type: ignore[union-attr]
             try:
@@ -1285,28 +1291,26 @@ class KVCacheSendingLayerThread(threading.Thread):
                 sum(meta.length) for sid, meta in job.sessions if len(meta.src) > 0 and sid not in job.failed
             )
 
-            def _win_str(a: float | None, b: float | None) -> str:
-                return "-" if a is None else f"{a:.6f},{b:.6f}"
-
-            logger.info(
-                "[mooncake][perf] P batch=%d layers=%s reqs=%s wait=%.1f event=%.1f "
-                "flush=%.1f write=%.1f layerdone=%.1f misc=%.1f total=%.1f ms "
-                "t0=%.6f flush_win=%s write_win=%s layerdone_win=%s bytes=%d",
-                job.batch_id,
-                [t.layer_idx for t in job.tasks],
-                batch_ext_reqs,
-                job.batch_wait_ms,
-                job.event_ms,
-                job.flush_ms,
-                job.write_ms,
-                layerdone_ms,
-                misc_ms,
-                total_ms,
-                job.t_batch0,
-                _win_str(job.flush_win0, job.flush_win1),
-                _win_str(job.write_win0, job.write_win1),
-                _win_str(layerdone_win0, layerdone_win1),
-                batch_bytes,
+            h2h_perf.emit(
+                "p_batch",
+                ts=job.t_batch0,
+                role="producer",
+                batch=job.batch_id,
+                layers=[t.layer_idx for t in job.tasks],
+                reqs=batch_ext_reqs,
+                wait=job.batch_wait_ms,
+                event=job.event_ms,
+                flush=job.flush_ms,
+                write=job.write_ms,
+                layerdone=layerdone_ms,
+                misc=misc_ms,
+                total=total_ms,
+                flush_win=_win_pair(job.flush_win0, job.flush_win1),
+                write_win=_win_pair(job.write_win0, job.write_win1),
+                layerdone_win=_win_pair(layerdone_win0, layerdone_win1),
+                bytes=batch_bytes,
+                sender=self.sender_path,
+                pipe=True,
             )
             for ext_req in batch_ext_reqs:
                 acc = self._perf_req.get(ext_req)
@@ -1346,18 +1350,17 @@ class KVCacheSendingLayerThread(threading.Thread):
                             ext_req = get_external_request_id(req_id)
                             acc = self._perf_req.pop(ext_req, None)
                             if acc is not None:
-                                logger.info(
-                                    "[mooncake][perf] P req=%s done batches=%d "
-                                    "event=%.1f flush=%.1f write=%.1f layerdone=%.1f "
-                                    "wait=%.1f total=%.1f ms",
-                                    ext_req,
-                                    int(acc["batches"]),
-                                    acc["event"],
-                                    acc["flush"],
-                                    acc["write"],
-                                    acc["layerdone"],
-                                    acc["wait"],
-                                    _perf_ms(acc["t0"]),
+                                h2h_perf.emit(
+                                    "p_req",
+                                    role="producer",
+                                    req=ext_req,
+                                    batches=int(acc["batches"]),
+                                    event=acc["event"],
+                                    flush=acc["flush"],
+                                    write=acc["write"],
+                                    layerdone=acc["layerdone"],
+                                    wait=acc["wait"],
+                                    total=_perf_ms(acc["t0"]),
                                 )
                         if req_id in self.failed_reqs:
                             # 失败仍走独立的请求级信号: 写失败的层批根本没有
@@ -1536,6 +1539,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self.first_tokens = dict[str, Any]()
         # pull 模式: D 侧反向 sync_read P 的 staging 需要本端 TE 实例.
         self.engine = engine
+        # perf: D 侧请求级累计(external req id -> 累计), 计完成时打印后清除.
+        # 仅在 recv 线程内访问, 无需额外锁. 必须在这里初始化 —— 历史上它写在
+        # requeue_done_requests 里, 未被 requeue 过的请求会在 update_done_task
+        # 里 AttributeError.
+        self._perf_d_req: dict[str, dict[str, float]] = {}
 
     def get_first_token(self, request_id: str) -> Any:
         with self.lock:
@@ -1556,9 +1564,6 @@ class KVCacheRecvingLayerThread(threading.Thread):
             return
         with self.lock:
             self.done_requests |= req_ids
-        # perf: D 侧请求级累计(external req id -> 累计), 会计完成时打印后清除.
-        # 仅在 recv 线程内访问, 无需额外锁.
-        self._perf_d_req: dict[str, dict[str, float]] = {}
 
     def get_and_clear_done_requests(self) -> set[str]:
         """
@@ -1629,15 +1634,17 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 self.task_tracker.pop(req_id)
                 self.done_requests.add(req_id)
                 if _PERF_LOG:
-                    # 请求级汇总: first2done = 首个 LAYER_DONE 到达 → 会计完成.
+                    # 请求级汇总: first2done = 首个 LAYER_DONE 到达 → 计完成.
                     acc = self._perf_d_req.pop(req_id, None)
                     if acc is not None:
-                        logger.info(
-                            "[mooncake][perf] D req=%s done layerdone=%d h2d_sum=%.1f first2done=%.1f ms",
-                            req_id,
-                            int(acc["n"]),
-                            acc["h2d"],
-                            _perf_ms(acc["t_first"]),
+                        h2h_perf.emit(
+                            "d_req",
+                            ts=acc["t_first"],
+                            role="consumer",
+                            req=req_id,
+                            layerdone=int(acc["n"]),
+                            h2d_sum=acc["h2d"],
+                            first2done=_perf_ms(acc["t_first"]),
                         )
 
     def run(self):
@@ -1651,7 +1658,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
         device = torch.device(f"npu:{local_rank}")
         torch.npu.set_device(device)
         # MC_TCP_CPU_BIND=1 时把本线程绑到进程允许核集中负载最低的核.
-        bind_current_thread_to_idle_cpu(f"kv-recv-rank{local_rank}")
+        # bind_current_thread_to_idle_cpu(f"kv-recv-rank{local_rank}")
         handshake_port = self.side_channel_port + self.tp_rank
         path = make_zmq_path("tcp", self.side_channel_host, handshake_port)
         logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
@@ -1700,6 +1707,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         external_request_id = msg[1]
                         first_token = msg[2]
                         logger.debug("receive first_token:%s, request_id:%s", first_token, external_request_id)
+                        # perf: "D 收到 P 的首 token" —— 请求级完成信号与首 token
+                        # 必须同步交给 scheduler, 该时刻即 D 侧可开始 decode 的前提.
+                        h2h_perf.emit("d_first_token_recv", role="consumer", req=external_request_id)
                         with self.lock:
                             self.first_tokens[external_request_id] = first_token
                         sock.send_multipart((identity, b"", b"ACK"))
@@ -1726,6 +1736,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(layer_dst_addrs))
                         t_recv0 = time.perf_counter()
                         pull_ms = 0.0
+                        # perf: H2H read(pull) 与 H2D 的绝对起点与耗时各自独立测量
+                        # (过去 h2d = recv→H2D 完成, 把 pull 也算进去了).
+                        t_pull0: float | None = None
+                        t_h2d0: float | None = None
+                        h2d_only_ms: float | None = None
                         layer_reply = b"ACK"
                         try:
                             if _PULL_MODE:
@@ -1760,7 +1775,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                                     "got pull-style LAYER_DONE (src/te_path 非空) but local mode is push; "
                                     "VLLM_ASCEND_LAYERWISE_TRASPORT_MODE 两端必须一致"
                                 )
+                            t_h2d0 = time.perf_counter()
                             global_te.sync_cpu_to_npu_for_transfer(layer_dst_addrs, layer_lengths)
+                            h2d_only_ms = _perf_ms(t_h2d0)
                             h2d_ms = _perf_ms(t_recv0)
                         except Exception as e:
                             logger.error(
@@ -1770,7 +1787,10 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             )
                             layer_reply = b"NAK"
                             h2d_ms = _perf_ms(t_recv0)
+                            # 失败路径没有可信的 H2D 段, 置 None 而不是用相减凑一个.
+                            h2d_only_ms = None
                         sock.send_multipart((identity, b"", layer_reply))
+                        ack_ts = time.perf_counter()
                         if layer_reply == b"ACK":
                             # 就地判定请求级完成/失败: 与 H2D 同一处理点, 省掉 P 侧
                             # 单独一次请求级 DONE/FAILED 往返. 失败时 P 侧不再补发,
@@ -1780,20 +1800,27 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             for ext_req in layer_req_ids:
                                 self.update_failed_task(ext_req)
                         if _PERF_LOG:
-                            # total 覆盖 收到消息 → H2D 完成 → ACK 发出 全程;
-                            # t0 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC),
-                            # H2D 阶段窗口 = [t0, t0 + h2d/1000], 供与 P 侧
-                            # write/layerdone 窗口在同机时间线上对齐. H2D 单独
-                            # 计时, 不计入 P 侧 H2H(write)统计.
-                            logger.info(
-                                "[mooncake][perf] D batch layerdone reqs=%s ranges=%d h2d=%.1f "
-                                "total=%.1f ms t0=%.6f pull=%.1f",
-                                layer_req_ids,
-                                len(layer_dst_addrs),
-                                h2d_ms,
-                                _perf_ms(t_recv0),
-                                t_recv0,
-                                pull_ms,
+                            # ts 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC);
+                            # pull = 本端从 P 的 staging 拉数据(属 H2H read, 起点
+                            # pull_t0), h2d_only = 拉完之后往 NPU 拷的那一段(起点
+                            # h2d_t0) —— 两段各自实测、互不包含; NAK 路径 h2d_only
+                            # 为 None. h2d 保留"recv0 → H2D 完成"的旧口径以便与历史
+                            # 日志对比. total 覆盖 收到消息 → H2D → ACK 发出(ack_ts).
+                            h2h_perf.emit(
+                                "d_batch",
+                                ts=t_recv0,
+                                role="consumer",
+                                reqs=list(layer_req_ids),
+                                ranges=len(layer_dst_addrs),
+                                pull=pull_ms,
+                                pull_t0=t_pull0,
+                                h2d_only=h2d_only_ms,
+                                h2d_t0=t_h2d0,
+                                h2d=h2d_ms,
+                                total=_perf_ms(t_recv0),
+                                ack_ts=ack_ts,
+                                ack=layer_reply == b"ACK",
+                                sender=sender_path,
                             )
                             # 请求级累计(批共享口径): 该批 h2d 计入消息内全部请求.
                             for ext_req in layer_req_ids:
@@ -1846,32 +1873,42 @@ class KVTransferParamsRecvingThread(threading.Thread):
         start_time = time.perf_counter()
         external_req_id = get_external_request_id(req_id)
         future = None
+        hit_ms = None
         with self.lock:
             if external_req_id in self.kv_transfer_params:
-                end_time = time.perf_counter()
-                req_kv_transfer_params_elapsed = (end_time - start_time) * 1000
-                logger.info(
-                    "Get KV transfer params of request id [%s] took %.3f ms.",
-                    external_req_id,
-                    req_kv_transfer_params_elapsed,
-                )
-                return self.get_not_expired_kv_transfer_params(external_req_id, chunk_finished)
+                hit_ms = _perf_ms(start_time)
             else:
                 future = Future()
                 self.kv_transfer_params_futures[external_req_id] = future
+        # 注意: 下面两处 emit 都在 self.lock 之外 —— emit 内部会 json.dumps 并走
+        # logger I/O, 而该锁与 ZMQ 收包线程(handle_kv_transfer_params_msg)争用.
+        if hit_ms is not None:
+            # perf: 参数已在缓存里的快路径(通常 ~0ms); 大头在下面的阻塞等待分支.
+            h2h_perf.emit(
+                "p_wait_params",
+                ts=start_time,
+                role="producer",
+                req=external_req_id,
+                mode="cache_hit",
+                ms=hit_ms,
+            )
+            return self.get_not_expired_kv_transfer_params(external_req_id, chunk_finished)
         if future is not None:
             try:
                 future.result(self.wait_transfer_params_timeout_sec)
                 with self.lock:
-                    self.kv_transfer_params_futures.pop(external_req_id)
-                    end_time = time.perf_counter()
-                    req_kv_transfer_params_elapsed = (end_time - start_time) * 1000
-                    logger.info(
-                        "Get KV transfer params of request id [%s] took %.3f ms.",
-                        external_req_id,
-                        req_kv_transfer_params_elapsed,
-                    )
-                    return self.get_not_expired_kv_transfer_params(external_req_id, chunk_finished)
+                    self.kv_transfer_params_futures.pop(external_req_id, None)
+                # perf: P 侧最长的一次单点停顿 —— 等 D 投递 block table;
+                # 时间线上的 p_wait_params 段即 [ts, ts+ms].
+                h2h_perf.emit(
+                    "p_wait_params",
+                    ts=start_time,
+                    role="producer",
+                    req=external_req_id,
+                    mode="blocking",
+                    ms=_perf_ms(start_time),
+                )
+                return self.get_not_expired_kv_transfer_params(external_req_id, chunk_finished)
             except TimeoutError as e:
                 raise TimeoutError(
                     f"KV transfer params for request {external_req_id} not received "
@@ -3138,6 +3175,14 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         for host, port in ports:
             path = make_zmq_path("tcp", host, port)
             logger.info("Sending first token for request %s to %s:%d", external_req_id, host, port)
+            # perf: P 侧把首 token 投给 D 各 rank 的时刻(逐 peer 一条, D 侧对应
+            # d_first_token_recv). ACK 回来后即"D 具备开始 decode 的前提".
+            h2h_perf.emit(
+                "p_first_token_send",
+                role="producer",
+                req=external_req_id,
+                peer=f"{host}:{port}",
+            )
             try:
                 for attempt in range(1, max_retries + 1):
                     try:
@@ -3221,6 +3266,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
             logger.info(
                 "Number of completed KV cache recv requests: %s, receive requests: %s", len(done_recving), done_recving
             )
+            # perf: D 侧"已在本地收齐并交给 scheduler"的时刻 —— 请求自此被放行,
+            # 下一个 step 会进入它的首次 decode 前向(见 d_fwd_first).
+            h2h_perf.emit("d_recv_done", role="consumer", n=len(done_recving), reqs=sorted(done_recving))
         return set(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
@@ -3664,15 +3712,17 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
 
             t_put0 = time.perf_counter()
             self.kv_send_layer_thread.send_queue.put(layer_send_task)
-            if _PERF_LOG:
-                put_block_ms = _perf_ms(t_put0)
-                if put_block_ms > 2.0:
-                    # 队列满导致模型前向被钳制(发送线程处理慢于模型产出)的信号.
-                    logger.info(
-                        "[mooncake][perf] P save_kv_layer put blocked layer=%s %.1f ms",
-                        layer_name,
-                        put_block_ms,
-                    )
+            # perf: 模型前向被发送队列背压钳制的时长 —— 唯一会直接拖慢 P 前向的
+            # 传输侧反压信号(staging/写流水打满时出现), 故 >2ms 才记一条.
+            put_block_ms = _perf_ms(t_put0)
+            if put_block_ms > 2.0:
+                h2h_perf.emit(
+                    "p_save_blocked",
+                    ts=t_put0,
+                    role="producer",
+                    layer=layer_name,
+                    ms=put_block_ms,
+                )
             self.current_layer += 1
 
     # NOTE: Due to the FIA operator constraints, the expected kv cache is ND format, NZ shape,
@@ -3889,7 +3939,7 @@ def ensure_zmq_recv(
                 raise RuntimeError(f"Failed to receive data from {path} after {max_retries} retries: {e}")
 
 
-def get_external_request_id(request_id: str):
-    # NOTE(zxr): vLLM PR #27987 add additional suffix
-    # to EngineCore request_id with len(suffix) == 9
-    return request_id[:-9]
+# NOTE(zxr): vLLM PR #27987 给 EngineCore 的 request_id 加了 9 字符后缀
+# ("-" + 8 位 hex); 统一走 h2h_perf.external_id(带长度/前缀保护), 避免同一件事
+# 在本仓库有第二份实现(打点侧也用同一个函数, 时间线才能 join 上).
+get_external_request_id = h2h_perf.external_id
