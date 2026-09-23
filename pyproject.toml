@@ -87,5 +87,9 @@ ignore = [
 ]
 logger-objects = ["vllm.logger.logger"]
 
+[tool.ruff.lint.per-file-ignores]
+# 内嵌 HTML/JS 模板(时间线页面), 行天然很长
+"tools/kv_timeline/*.py" = ["E501"]
+
 [tool.ruff.format]
 docstring-code-format = true
