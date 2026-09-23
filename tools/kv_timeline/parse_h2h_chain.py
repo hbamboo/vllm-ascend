@@ -586,8 +586,17 @@ def build(logs: Path, p_worker: str = "Worker_TP0", d_worker: str = "Worker_TP0"
         pull_t0s = [d.get("pull_t0") for d in matches if d.get("pull_t0") is not None]
         h2d_t0s = [d.get("h2d_t0") for d in matches if d.get("h2d_t0") is not None]
         # 每 rank 明细(按 DP 分泳道 / 泳道内按 TP 分行用): 落在本批窗口内且带回 ACK 的行.
+        # 要求**整段往返都在本批窗口内**(t0 与 ACK 都落在 [lw0,lw1]): 只按 t0 判会把
+        # 下一批的往返也收进来(t0 落在窗口重叠区、ACK 在窗口外), 画出来是一条冲出窗口
+        # 的长斜线, 且和下一批自己的折线重叠(实测: 每个 TP 泳道右侧那条长线).
         dh["rows"] = sorted(
-            (d for d in matches if d.get("ack_ts") is not None and lw[0] - 0.0005 <= d["t0"] <= lw[1] + 0.0005),
+            (
+                d
+                for d in matches
+                if d.get("ack_ts") is not None
+                and lw[0] - 0.0005 <= d["t0"] <= lw[1] + 0.0005
+                and lw[0] - 0.0005 <= d["ack_ts"] <= lw[1] + 0.0005
+            ),
             key=lambda x: x["t0"],
         )
         # LAYER_DONE 折线的参考行: 必须是**同一个 rank 的收/回时刻**。P 的
@@ -1237,42 +1246,43 @@ function drawB() {
       const l=S("line",{x1:px(g.lw[0]),x2:px(g.lw[1]),y1:yW+15,y2:yW+15,"class":"bchk"});
       svg.append(l);
     }
-    // LAYER_DONE 折线: 每条 = 一个 D rank 的一次往返(P发 → D收 → D回ACK → P收齐).
-    // 泳道按 rank 分(见上); 泳道内把"同一次往返"(t0 相差 ≤1ms 的行)聚成一条折线, 多条
-    // 之间错开 5px.
+    // LAYER_DONE 折线: **每个 lane(=一个 D rank) 每批只画一条** —— 取该 rank 在本批窗口内
+    // 最早的"整段往返"(t0/ACK 都在窗口内, 由解析器保证); 该 rank 若在本批另有落在窗口内
+    // 的往返(多个 P rank 各发一次), 不在图上重复画, 只写进悬停(避免同一 TP 出现两条线).
     const rows = (g.dh && g.dh.rows) || [];
     if (g.lw && rows.length) {
       reqRanks.forEach((w, ri) => {
         const rs = rows.filter(x => x.w === w);
         if (!rs.length) return;
         const yBase = yOf[7 + ri], yP = yBase + 6, yD = yBase + 20;
-        const waves = [];
-        rs.slice().sort((a,b)=>a.t0-b.t0).forEach(rr => {
-          const last = waves[waves.length-1];
-          if (last && rr.t0 - last.t0 <= 1) last.rows.push(rr);
-          else waves.push({t0: rr.t0, rows: [rr]});
-        });
-        waves.forEach((wv, wi) => {
-          const t0 = Math.min(...wv.rows.map(x=>x.t0)), ack = Math.max(...wv.rows.map(x=>x.ack));
-          const dy = (wi - (waves.length-1)/2) * 5;
-          const x1 = Math.max(t0, g.lw[0]), x2 = Math.max(ack, x1), x3 = Math.max(g.lw[1], x2);
-          const xs = [g.lw[0], x1, x2, x3], ys = [yP+dy, yD+dy, yD+dy, yP+dy];
-          svg.append(S("polyline", {points: xs.map((t,i)=>(px(t)+","+ys[i])).join(" "), "class":"ldflow"}));
-          xs.forEach((t,i)=>svg.append(S("circle", {cx:px(t), cy:ys[i], r:1.5, "class":"ldpt"})));
-          const hit=S("rect",{x:px(x3)-3, y:yBase+1, width:6, height:23, fill:"transparent"});
-          hit.addEventListener("mousemove",e=>tip(
-            `<b>${r.u}</b> · LAYER_DONE 往返 round ${g.rnd+1} 批 layers=[${g.lay.join(",")}]<br>`+
-            `接收方 <b>${rankTag(w)}</b> · 本次往返含 ${wv.rows.length} 个发送方<br>`+
-            wv.rows.map(x=>`&nbsp;&nbsp;发送方 ⋯${x.snd}: 收 ${wallAt(r,x.t0)} · 回 ${wallAt(r,x.ack)} · pull ${FMT(x.pull,2)} + H2D(纯) ${FMT(x.h2d_only,2)}`).join("<br>")+
-            `<br>① P 发 → D 收(网络) <b>${FMT(x1-xs[0],2)}</b><br>`+
-            `② D 收 → D 回 ACK(该 rank: pull read + H2D) <b>${FMT(x2-x1,2)}</b><br>`+
-            `③ D 回 ACK → P 收齐 ACK <b>${FMT(x3-x2,2)}</b>`+
-            `<br>绝对 ${wallAt(r,xs[0])} → ${wallAt(r,x3)}`+
-            ((g.dh.frows||1)>1?`<br><span style="color:var(--text-2)">该批共 ${g.dh.frows} 个 D rank 各收一次(P 侧窗口为并集, 仅供参照)</span>`:""),
-            e.clientX,e.clientY));
-          hit.addEventListener("mouseleave",untip);
-          svg.append(hit);
-        });
+        const rr = rs[0];                       // rows 已按 t0 排序
+        const t0 = rr.t0, ack = Math.max(rr.ack, t0);
+        const x0 = g.lw[0], x1 = Math.max(t0, x0), x2 = Math.max(ack, x1), x3 = Math.max(g.lw[1], x2);
+        // 绘制截断: P 侧窗口是**多 peer 并集**, 个别批会很长(实测 157ms, 因为 P 在等其它
+        // rank 的 ACK) —— 原样画会把折线拉成长斜线横穿后面几批. 这里把 ①/③ 两条腿的
+        // 绘制长度限制在 3×(该 rank 自己的往返) 或 15ms 内; **数值仍按真实值给**,
+        // 悬停里标注"绘制已截断".
+        const own = Math.max(x2 - x1, 1), cap = Math.max(own * 3, 15);
+        const x0d = Math.max(x0, x1 - cap), x3d = Math.min(x3, x2 + cap);
+        const clipped = (x0d > x0 + 1e-3) || (x3d < x3 - 1e-3);
+        const xs = [x0d, x1, x2, x3d], ys = [yP, yD, yD, yP];
+        svg.append(S("polyline", {points: xs.map((t,i)=>(px(t)+","+ys[i])).join(" "), "class":"ldflow"}));
+        xs.forEach((t,i)=>svg.append(S("circle", {cx:px(t), cy:ys[i], r:1.5, "class":"ldpt"})));
+        const hit=S("rect",{x:px(x3)-3, y:yBase+1, width:6, height:23, fill:"transparent"});
+        hit.addEventListener("mousemove",e=>tip(
+          `<b>${r.u}</b> · LAYER_DONE 往返 round ${g.rnd+1} 批 layers=[${g.lay.join(",")}]<br>`+
+          `接收方 <b>${rankTag(w)}</b>${rr.snd?` · 发送方 ⋯${rr.snd}`:""}<br>`+
+          `① P 发 → D 收(网络) <b>${FMT(x1-x0,2)}</b><br>`+
+          `② D 收 → D 回 ACK(该 rank: pull ${FMT(rr.pull,2)} + H2D(纯) ${FMT(rr.h2d_only,2)}) <b>${FMT(x2-x1,2)}</b><br>`+
+          `③ D 回 ACK → P 收齐 ACK <b>${FMT(x3-x2,2)}</b><br>`+
+          `绝对 ${wallAt(r,x0)} → ${wallAt(r,x3)}`+
+          (clipped?`<br><span style="color:var(--text-2)">(① / ③ 实际 ${FMT(x1-x0,2)} / ${FMT(x3-x2,2)} ms, 绘制已截断到 ${FMT(cap,1)} ms ×2)</span>`:"")+
+          (rs.length>1?`<br><span style="color:var(--text-2)">本批该 rank 另有 ${rs.length-1} 次落窗往返(未重复画): `+
+            rs.slice(1).map(x=>`收 ${wallAt(r,x.t0)}`).join(" / ")+`</span>`:"")+
+          ((g.dh.frows||1)>1?`<br><span style="color:var(--text-2)">该批共 ${g.dh.frows} 个 D rank 各收一次(P 侧窗口为并集, 仅供参照)</span>`:""),
+          e.clientX,e.clientY));
+        hit.addEventListener("mouseleave",untip);
+        svg.append(hit);
       });
     } else if (g.lw && g.dh && g.dh.fs!=null && g.dh.fa!=null) {
       // 老格式日志(无 per-rank 明细): 退回单条四点折线 —— P发 → D收 → D回ACK → P收齐.
