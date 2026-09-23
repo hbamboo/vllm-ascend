@@ -55,3 +55,8 @@ import vllm_ascend.patch.platform.patch_speculative_config  # noqa
 if not vllm_version_is("0.23.0"):
     import vllm_ascend.patch.platform.patch_fused_moe  # noqa
     import vllm_ascend.patch.platform.patch_dp_device_ids  # noqa
+
+# H2H 时间线: 前端侧两个时刻(api_arrive / first_token_out), 由 MC_TCP_PERF_LOG
+# 门控。
+if vllm_version_is("0.23.0"):
+    import vllm_ascend.patch.platform.patch_h2h_perf  # noqa

@@ -189,6 +189,10 @@ if Qwen3_5MultiTokenPredictor is not None:
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
 
+    # 注意: 不要在这个 forward 外加任何宿主侧打点 —— 它被 torch.compile
+    # (fullgraph=True) 编译, 区域内调用 time.perf_counter/日志会让 dynamo 直接
+    # 报 "Attempted to call function marked as skipped" 并使 D 侧编图失败.
+    # MTP 的耗时改在编译区之外测(见 patch/worker/patch_spec_decode_perf.py).
     Qwen3_5MultiTokenPredictor.forward = qwen3_5_mtp_forward
 
 
