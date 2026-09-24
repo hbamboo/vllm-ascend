@@ -24,6 +24,7 @@ import torch
 import torch_npu
 import zmq
 from mooncake.engine import TransferEngine  # type: ignore
+from vllm import envs as vllm_envs
 from vllm.config import VllmConfig
 from vllm.distributed import get_pcp_group
 from vllm.distributed.kv_transfer.kv_connector.v1.base import (
@@ -82,6 +83,7 @@ if TYPE_CHECKING:
     from vllm.v1.attention.backend import AttentionMetadata  # type: ignore
     from vllm.forward_context import ForwardContext
     from vllm.v1.core.kv_cache_manager import KVCacheBlocks
+    from vllm.v1.outputs import KVConnectorOutput
     from vllm.v1.request import Request
 # isort: on
 
@@ -350,12 +352,17 @@ class KVCacheSendingLayerThread(threading.Thread):
         sender_path: str,
         on_transfer_done: Callable[[str, "ReqMeta"], None] | None = None,
         on_request_failed: Callable[[str], None] | None = None,
+        on_send_done: Callable[[str], None] | None = None,
     ):
         super().__init__(daemon=True, name="KVCacheSendingLayerThread")
         # 先 P 后 D: 请求级完成/作废时回调 worker(登记首 token 的会合点 / 清状态)。
         # 发送线程与 worker 之间用回调注入, 不反向持引用。
         self.on_transfer_done = on_transfer_done
         self.on_request_failed = on_request_failed
+        # 本 rank 对该请求的最后一个带数据层已 flush(失败路径为请求已作废)时回调:
+        # 调度侧为此延迟释放的块这时候才能还给 free queue(见 scheduler 侧
+        # request_finished / worker 侧 get_and_clear_send_done)。
+        self.on_send_done = on_send_done
         self.engine = engine
         self.vllm_config = vllm_config
         self.kv_cache_config = kv_cache_config
@@ -489,6 +496,33 @@ class KVCacheSendingLayerThread(threading.Thread):
         return send_task.layer_idx == self.group_max_layer_idx.get(layer_group_idx, self.total_layers - 1), (
             layer_group_idx
         )
+
+    def _req_send_end_layer_idx(self, req_meta: ReqMeta) -> int:
+        """本 rank 对某请求最后一个带数据的层号(本 rank 没有该请求的数据时返回 -1)。
+
+        一个请求的 KV 可能分属多个 kv cache group(hybrid 的 attention / mamba),
+        每个 group 各有一条"末层"线, 且 mamba 组的末层早于 attention 组。只按本
+        任务所属 group 判"发完了"会在 mamba 组末层就把还没 flush 的 attention 层
+        当成已发完 —— 这里取"有数据的最高层组"的末层, 才是本 rank 对该请求的最后
+        一批数据(调度侧延迟释放的块以此为归还依据, 早了就是被覆写)。
+        """
+        return max(
+            (
+                self.group_max_layer_idx.get(group_idx, self.total_layers - 1)
+                for group_idx in range(len(self.kv_cache_specs))
+                if any(blocks["local_block_ids"][group_idx] for blocks in req_meta.peer_transfer.values())
+            ),
+            default=-1,
+        )
+
+    def _notify_send_done(self, send_task: SendTask, req_id: str, req_meta: ReqMeta) -> None:
+        """本 rank 对该请求的最后一批数据已处理完(含 D 的 LAYER_DONE ACK)时通知 worker。
+
+        成功批次经此处; 失败批次(请求已作废, 块同样可放)在其后同一批里也会走到 ——
+        两种情形都按"本 rank 不会再读这些块"处理。
+        """
+        if self.on_send_done is not None and send_task.layer_idx == self._req_send_end_layer_idx(req_meta):
+            self.on_send_done(req_id)
 
     def _request_sender_path_count(self, peer_blocks: dict) -> int:
         """本请求在该 peer 上期望的 P 侧发送方路径总数(各 group 取并集).
@@ -1033,7 +1067,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                     if req_meta.chunk_finish:
                         # 先 P 后 D: 首 token 必须先于请求级完成信号到达 D ——
                         # D 侧虽然会压住未凑齐的请求, 但早发能少等一个 step。
-                        self.register_transfer_done(req_id, req_meta)
+                        self._notify_send_done(send_task, req_id, req_meta)
+                        if self.on_transfer_done is not None:
+                            self.on_transfer_done(req_id, req_meta)
                         if _PERF_LOG and is_last_layer:
                             ext_req = get_external_request_id(req_id)
                             acc = self._perf_req.pop(ext_req, None)
@@ -1348,6 +1384,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                         continue
                     if req_meta.chunk_finish:
                         # 先 P 后 D: 首 token 必须先于请求级完成信号到达 D。
+                        self._notify_send_done(send_task, req_id, req_meta)
                         if self.on_transfer_done is not None:
                             self.on_transfer_done(req_id, req_meta)
                         if _PERF_LOG:
@@ -2009,6 +2046,10 @@ class MooncakeLayerwisePrefillThenDecodeConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
         self.requests: dict[str, ReqMeta] = {}
         self.send_task: SendTask = SendTask()
+        # 先 P 后 D: scheduler 已判定"延迟释放块, 等 worker 上报 finished_sending"
+        # 的请求(req_id -> 判定时刻)。每步重发(worker 侧按 req_id 幂等登记),
+        # worker 上报发完后由 scheduler 侧 update_connector_output 摘除。
+        self.requests_to_send: dict[str, float] = {}
 
     def add_new_req(
         self,
@@ -2115,6 +2156,11 @@ class MooncakeLayerwisePrefillThenDecodeConnector(KVConnectorBase_V1, SupportsHM
         assert self.connector_scheduler is not None
         return self.connector_scheduler.request_finished_all_groups(request, block_ids)
 
+    def update_connector_output(self, connector_output: "KVConnectorOutput"):
+        """worker 侧的上报回流到 scheduler: 延迟释放的块在这里了结。"""
+        if self.connector_scheduler is not None:
+            self.connector_scheduler.update_connector_output(connector_output)
+
     ############################################################
     # Worker Side Methods
     ############################################################
@@ -2208,6 +2254,13 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         # the scheduler. Used to make metadata passed to Worker.
         self._reqs_need_recv: dict[str, tuple[Request, list[int], list[list[int]]]] = {}
         self._reqs_need_send_layerwise: dict[str, SendReqInfo] = {}
+        # 末 chunk 已调度(其 KV 已进发送流水)、尚未结束的请求: 请求结束时据此决定
+        # 延迟释放 —— 发送线程的 D2H flush 还没做完就把块还给 free queue, 会被别的
+        # 请求覆写, D 读到脏 KV(见 request_finished)。
+        self._reqs_send_inflight: set[str] = set()
+        # 已判定延迟释放、等 worker 上报 finished_sending 的请求(req_id -> 判定
+        # 时刻): 每步经 metadata.requests_to_send 下发, 上报后摘除。
+        self._reqs_need_send: dict[str, float] = {}
         self.need_truncate = self._has_attn_mamba_hybrid_cache(kv_cache_config)
         self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
@@ -2552,6 +2605,13 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
                     add_transfer_task(req_id, send_req_info, chunk_finish=chunk_finish)
                     if chunk_finish:
                         self._reqs_need_send_layerwise.pop(req_id)
+                        # 末 chunk 的层任务就在本步前向里入队 —— 从这一刻起该请求的
+                        # 块要留到发送线程 flush 完(见 request_finished)。
+                        self._reqs_send_inflight.add(req_id)
+            # 已判定延迟释放的请求每步重发(worker 侧按 req_id 幂等登记, 只保留首次
+            # 登记时刻), 上报 finished_sending 后摘除: 单发一次的话, 该步 metadata
+            # 没走到 worker(空步/DP 空转)就永久丢单。
+            meta.requests_to_send = dict(self._reqs_need_send)
         return meta
 
     def _access_metaserver(self, url, message):
@@ -2652,9 +2712,13 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         """
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
+
+        layer_wise push 下块仍由本 rank 的发送线程读: 末 chunk 的层任务此刻刚入队
+        (或还在队列里), 发送线程要先把它 D2H flush 进 staging。这里延迟释放, 等
+        worker 在那批 LAYER_DONE 拿到 D 的 ACK 后经 finished_sending 上报
+        (worker 侧 get_and_clear_send_done)。
         """
-        # layer_wise push, not need delay_free_blocks
-        return False, None
+        return self._request_finished_delay_free(request)
 
     def request_finished_all_groups(
         self,
@@ -2665,8 +2729,22 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         Once a request is finished, determine whether request blocks
         should be freed now or will be sent asynchronously and freed later.
         """
-        # layer_wise push, not need delay_free_blocks
-        return False, None
+        return self._request_finished_delay_free(request)
+
+    def _request_finished_delay_free(self, request: "Request") -> tuple[bool, dict[str, Any] | None]:
+        req_id = request.request_id
+        if req_id not in self._reqs_send_inflight:
+            # 末 chunk 从未调度过(中途 abort / 无数据要发): 没有在飞的发送, 按时归还。
+            return False, None
+        self._reqs_send_inflight.discard(req_id)
+        self._reqs_need_send[req_id] = time.time()
+        logger.debug("Delaying free of KV blocks for request %s until its last send batch is acked", req_id)
+        return True, None
+
+    def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
+        """worker 上报发完后, 延迟释放的这些请求才真正归还给 free queue。"""
+        for req_id in connector_output.finished_sending or ():
+            self._reqs_need_send.pop(req_id, None)
 
 
 class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
@@ -2764,6 +2842,17 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         # req_id -> {"req_meta": ReqMeta|None, "token": int|None, "computed": int}
         self.req_send_done_tasks: dict[str, dict[str, Any]] = {}
         self.req_send_done_tasks_lock = threading.Lock()
+        # 先 P 后 D: 调度侧为"末批 KV 还在发送流水里"的请求延迟释放块, 等这里上报
+        # finished_sending 后才归还(见 scheduler 侧 request_finished)。
+        #   _send_obligations: 已登记、还没上报的 req_id -> 登记时刻(超时兜底用);
+        #   _send_completed:   发送线程已发完(或确认本 rank 无数据可发)的 req_id ——
+        #                      完成可能早于登记(末批在调度侧判定之前就 ACK 回来了)。
+        self._send_obligations: dict[str, float] = {}
+        self._send_completed: SizedDict = SizedDict()
+        self._send_done_lock = threading.Lock()
+        # 末 chunk 时本 rank 对该请求是否有数据要发: 无数据(mamba/attn 组都不落在本
+        # rank, 或对端参数拿不到)的请求在登记时直接了结 —— 不然块要干等到超时。
+        self._send_has_data: SizedDict = SizedDict()
         # 先 P 后 D: D 的 block table 经专线直投到 P 的这个通道 —— P 先受理时
         # 手里没有对端信息, 必须等 D 推过来才能建 peer 映射(见 start_load_kv)。
         self.pull_thread: KVTransferParamsRecvingThread | None = None
@@ -3075,6 +3164,7 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                 sender_path=f"{self.side_channel_host}:{self.handshake_port}",
                 on_transfer_done=self.register_transfer_done,
                 on_request_failed=self.drop_prefilled_token_state,
+                on_send_done=self.mark_send_done,
             )
             self.kv_send_layer_thread.start()
             ready_event.wait()
@@ -3233,6 +3323,64 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         with self.req_send_done_tasks_lock:
             self.req_send_done_tasks.pop(req_id, None)
 
+    def register_send_obligations(self, req_ids: dict[str, float]) -> None:
+        """登记"scheduler 已延迟释放块、等本 rank 上报发完"的请求。
+
+        req_ids: scheduler 侧 _reqs_need_send 的快照(req_id -> 判定时刻), 每步
+        重发 —— 已登记的保留首次登记时刻, 不刷新超时起点。
+        本 rank 对该请求没有数据要发的(末 chunk 时已记入 _send_has_data), 直接
+        判完成: 没有发送线程的完成信号可等。
+        """
+        if not req_ids:
+            return
+        now = time.time()
+        with self._send_done_lock:
+            for req_id in req_ids:
+                if req_id in self._send_obligations:
+                    continue
+                self._send_obligations[req_id] = now
+                if self._send_has_data.get(req_id) is False:
+                    self._send_completed[req_id] = True
+
+    def mark_send_done(self, req_id: str) -> None:
+        """发送线程回调: 本 rank 对该请求的最后一个带数据层已 flush 并拿到 ACK。"""
+        with self._send_done_lock:
+            self._send_completed[req_id] = True
+
+    @staticmethod
+    def _req_has_send_data(req_meta: ReqMeta) -> bool:
+        """本 rank 该请求是否有要发的数据(各 peer 的 block 表里是否有非空 group)。"""
+        return any(
+            any(group_block_ids for group_block_ids in blocks["local_block_ids"])
+            for blocks in req_meta.peer_transfer.values()
+        )
+
+    def get_and_clear_send_done(self) -> set[str]:
+        """已登记且本 rank 已发完的请求; 上报后 scheduler 才归还这些块。
+
+        超时兜底: 登记后迟迟等不到完成信号的(例如末层任务的 decoder 元信息一直
+        取不到), 强制上报并打错误日志 —— 宁可上传送作废重试, 也不能把块一直占着。
+        """
+        now = time.time()
+        with self._send_done_lock:
+            done = {req_id for req_id in self._send_obligations if req_id in self._send_completed}
+            for req_id in done:
+                self._send_obligations.pop(req_id, None)
+                self._send_completed.pop(req_id, None)
+            timeout = vllm_envs.VLLM_MOONCAKE_ABORT_REQUEST_TIMEOUT
+            for req_id, registered_at in list(self._send_obligations.items()):
+                if now - registered_at <= timeout:
+                    continue
+                self._send_obligations.pop(req_id, None)
+                done.add(req_id)
+                logger.error(
+                    "Force freed request %s: no KV send-done signal within %s seconds. "
+                    "Action: delayed-free blocks released to prevent pool exhaustion.",
+                    req_id,
+                    timeout,
+                )
+        return done
+
     def get_finished(self) -> tuple[set[str], set[str]]:
         done_recving = (
             self.kv_recv_layer_thread.get_and_clear_done_requests(  # type: ignore[union-attr]
@@ -3278,7 +3426,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
             # perf: D 侧"已在本地收齐并交给 scheduler"的时刻 —— 请求自此被放行,
             # 下一个 step 会进入它的首次 decode 前向(见 d_fwd_first).
             h2h_perf.emit("d_recv_done", role="consumer", n=len(done_recving), reqs=sorted(done_recving))
-        return set(), done_recving
+        # P 侧: 延迟释放的块在这里了结 —— scheduler 收到 finished_sending 才
+        # _free_blocks(见 get_and_clear_send_done)。
+        return self.get_and_clear_send_done(), done_recving
 
     def get_block_ids_with_load_errors(self) -> set[int]:
         """
@@ -3484,6 +3634,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                 if REUSE_PREFILLED_TOKENS and meta.reuse_prefilled_tokens:
                     self._expect_first_token.add(req_id)
         elif self.vllm_config.kv_transfer_config.is_kv_producer:
+            # 调度侧已判定延迟释放块的请求: 登记, 等本 rank 的发送完了结(见
+            # get_and_clear_send_done)。
+            self.register_send_obligations(metadata.requests_to_send)
             # update trans info
             update_metadata = {}
             for req_idx, (req_id, req_meta) in enumerate(metadata.requests.items()):
@@ -3495,6 +3648,9 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                     logger.error("No usable decoder params for request %s; skip transfer.", req_id)
                     req_meta.peer_transfer = {}
                     req_meta.local_block_ids = [[] for _ in range(self.num_kv_cache_groups)]
+                    if req_meta.chunk_finish:
+                        # 本 rank 不会发这个请求的任何数据: 延迟释放的块直接了结。
+                        self._send_has_data[req_id] = False
                     update_metadata[req_id] = req_meta
                     continue
                 self._align_remote_block_ids(req_meta)
@@ -3538,6 +3694,10 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                     update_req_meta.remote_block_ids = update_req_meta.peer_transfer[first_peer]["remote_block_ids"]
                     update_req_meta.trans_count = update_req_meta.peer_transfer[first_peer]["trans_count"]
                 update_metadata[req_id] = update_req_meta
+                if req_meta.chunk_finish:
+                    # 末 chunk: 记下本 rank 到底有没有这个请求要发的数据, 供登记
+                    # 延迟释放义务时判定(见 register_send_obligations)。
+                    self._send_has_data[req_id] = self._req_has_send_data(update_req_meta)
             metadata.requests = {}
             for req_id, req_meta in update_metadata.items():
                 metadata.requests[req_id] = update_metadata[req_id]
