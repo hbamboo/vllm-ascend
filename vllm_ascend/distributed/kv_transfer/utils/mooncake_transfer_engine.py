@@ -875,7 +875,8 @@ class GlobalTE:
                 # KV cache 的块, 异步调度下上一个请求的 decode 可能仍在飞, 不排序会与
                 # 在飞计算相互覆盖(表现为新请求首 token 就错/随批大小时序随机复现);
                 # 只等"当前点", 后续层计算仍可与拷贝并行, 不牺牲流水.
-                stream.wait_stream(torch.npu.default_stream())
+                # TODO: event机制
+                # stream.wait_stream(torch.npu.default_stream())
                 sizes = np.asarray([n for _, _, _, n in items], dtype=np.int64)
                 if direction == _DIRECTION_D2H:
                     # D2H: NPU 为源, CPU staging 为目的.
@@ -945,7 +946,11 @@ class GlobalTE:
         # KV cache 的块, 异步调度下上一个请求的 decode 可能仍在飞, 不排序会与
         # 在飞计算相互覆盖(表现为新请求首 token 就错/随批大小时序随机复现);
         # 只等"当前点", 后续层计算仍可与拷贝并行, 不牺牲流水.
-        stream.wait_stream(torch.npu.default_stream())
+        # TODO: 正常释放是ok的，客户端取消/抢占/中途丢块(滑窗 / mamba align) 导致的kv cache释放，
+        # 这里直接去掉不安全
+        # 原因是其处于前向状态时，还会写kv cache，存在污染kv cache的可能。
+        # 但是是极端情况，可以使用event机制
+        # stream.wait_stream(torch.npu.default_stream())
         src_t = torch.from_numpy(np.asarray(src_ptrs, dtype=np.int64))
         dst_t = torch.from_numpy(np.asarray(dst_ptrs, dtype=np.int64))
         size_t = torch.from_numpy(np.asarray(sizes, dtype=np.int64))
