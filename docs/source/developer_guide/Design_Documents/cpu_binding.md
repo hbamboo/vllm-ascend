@@ -146,6 +146,54 @@ fails for this rank and the worker logs a warning from the caller. The minimum
 is 5 CPUs per NPU for devices with IRQ binding. Ascend 950 requires one full
 cluster per worker.
 
+When `BIND_LAYERWISE_CONNECTOR=1`, the last two CPUs of the main range are moved
+to the layerwise KV connector transport threads, so the main range shrinks by
+two CPUs:
+
+| Role | CPUs |
+| --- | --- |
+| SQ/CQ IRQ | `pool[0]`, `pool[1]` |
+| Main worker process and subthreads | `pool[2:-4]` |
+| Layerwise KV connector transport threads | `pool[-4:-2]` |
+| ACL thread | `pool[-2]` |
+| Release thread | `pool[-1]` |
+
+On Ascend 950 the same reservation happens at the end of the assigned cluster:
+main keeps `cluster[:-2]` and the transport threads get the last two cluster
+CPUs. If the main range would be left with no CPU, the reservation is skipped
+with a warning and the previous split is kept, so enabling the switch never
+fails worker startup.
+
+#### Layerwise KV Connector Transport Threads
+
+The layerwise KV connectors move KV cache in worker-process Python threads:
+`KVCacheSendingLayerThread` (prefill side, D2H flush), `KVCacheRecvingLayerThread`
+(decode side, TCP pull plus H2D), `KVCachePipeWriter` (pipelined writes) and
+`KVTransferParamsRecvingThread` (prefill-then-decode parameter channel).
+Without a reservation these threads share the main CPU range with forward,
+HCCL and other runtime threads, so a busy host can preempt the send/receive
+thread exactly when a layer is in flight.
+
+Two properties of these threads shape the implementation:
+
+- They are started during `initialize_from_config` (`register_kv_caches`), which
+  runs before `compile_or_warm_up_model` where `bind_cpus` is called. A thread
+  that pins itself at startup would be overwritten by the bulk
+  `taskset -acp` of the main binding, so the transport threads must be pinned
+  *after* that bulk bind, not by themselves.
+- Their OS thread names are inherited from the creating thread, so all worker
+  threads look alike in `/proc/<pid>/task/*/comm` and `ps -Te`. They are matched
+  by Python thread name inside the worker process instead, and pinned by native
+  thread ID.
+
+The reservation is therefore applied in `bind_layerwise_connector_threads`,
+which runs after the main `taskset -acp`. Every matched thread receives the
+whole reserved set, and no other role includes those CPUs, so the send/receive
+threads never share a CPU with the other worker threads or with the ACL/release
+threads. If no matching thread exists (for example the flag was enabled on an
+engine that does not run the layerwise connector), the CPUs stay idle for that
+worker and a warning is logged.
+
 ## Conditional Host Tuning
 
 After CPU affinity is applied, CPU binding can also apply two host-side tuning
@@ -207,7 +255,10 @@ Concrete examples:
 | 15 | 15 | 600-639 | 600-601 | 602-637 | 638 | 639 |
 
 This layout remains deterministic even when different worker processes share
-the same cpuset, because slicing is based on the global logical NPU ID.
+the same cpuset, because slicing is based on the global logical NPU ID. With
+`BIND_LAYERWISE_CONNECTOR=1`, worker 0 keeps `2-35` for main and hands `36-37`
+to its layerwise KV connector transport threads; the other workers shift the
+same way inside their own slice.
 
 ### A2 topo_affinity with hidden same-affinity NPUs
 
@@ -253,6 +304,15 @@ Ascend 950 NPU0: worker=[...]
 [cpu_bind_ascend_950] uvb_poll_window_thread tids=[...] cpus=[...]
 ```
 
+With `BIND_LAYERWISE_CONNECTOR=1`, the plan line reports the reserved CPUs and
+the transport threads pinned to them:
+
+```text
+The CPU allocation plan is as follows:
+NPU0: main=[...]  acl=[...]  release=[...]  layerwise=[36 37]
+[cpu_bind_layerwise] NPU0: cpus=[36 37]  threads=[KVCacheRecvingLayerThread(tid=...)]
+```
+
 ## Limitations
 
 - CPU binding runs only on ARM. It is skipped on x86_64.
@@ -271,6 +331,11 @@ Ascend 950 NPU0: worker=[...]
   skipped. CPU affinity still applies, but performance may degrade because
   existing pages are not moved to the target NUMA node and may be read through
   higher-latency remote NUMA access.
+- Layerwise connector transport threads are matched by Python thread name in the
+  worker process. Threads created after `bind_cpus` runs are not covered, and
+  reserved CPUs stay idle on workers that run no layerwise connector. The two
+  reserved CPUs are a fixed split; `LAYERWISE_CONNECTOR_CPUS` in
+  `vllm_ascend/cpu_binding.py` is the single place to change it.
 - If an exception escapes the binding flow, `NPUWorker` logs a warning and skips CPU binding for that rank.
 
 ## References

@@ -4,12 +4,14 @@ import os
 import platform
 import shutil
 import subprocess
+import threading
 from collections import defaultdict
 
 import psutil
 import regex as re
 from vllm.logger import logger
 
+from vllm_ascend import envs
 from vllm_ascend.utils import AscendDeviceType, get_ascend_device_type
 
 MASK_BIT = 32  # Number of bits in a CPU affinity mask group
@@ -18,6 +20,20 @@ MIN_CPUS_PER_NPU_WITHOUT_IRQ = 3  # 1(main, at least 1 CPU) + 1(acl) + 1(release
 ASCEND_950_PHYSICAL_CPUS_PER_CLUSTER = 8
 ALLOWED_CPUS_PATH = "/proc/self/status"
 ASCEND_RT_VISIBLE_DEVICES = os.getenv("ASCEND_RT_VISIBLE_DEVICES")
+
+# 分层(layerwise)KV 连接器传输线程的专用核数(BIND_LAYERWISE_CONNECTOR=1):
+# 从 worker 的 main 核池末尾划出这么多核给下面的传输线程, 其余线程不再使用.
+LAYERWISE_CONNECTOR_CPUS = 2
+# 需要放到专用核上的线程名(threading.Thread.name), 取自两个分层连接器
+# (mooncake_layerwise_connector / mooncake_layerwise_prefill_then_decode_connector)
+# 里实际创建的传输线程. KVTransferParamsRecvingThread 是先 P 后 D 的参数通道,
+# 流量很小, 一并放进来避免它落在 forward 的核上.
+LAYERWISE_CONNECTOR_THREAD_NAMES = (
+    "KVCacheSendingLayerThread",
+    "KVCacheRecvingLayerThread",
+    "KVCachePipeWriter",
+    "KVTransferParamsRecvingThread",
+)
 
 TOPO_AFFINITY_MODE = "topo_affinity"
 GLOBAL_SLICE_MODE = "global_slice"
@@ -214,6 +230,7 @@ class CpuAlloc:
         self.assign_main: dict[int, list[int]] = {}
         self.assign_acl: dict[int, list[int]] = {}
         self.assign_rel: dict[int, list[int]] = {}
+        self.assign_layerwise: dict[int, list[int]] = {}
         self.uvb_cpu_pool: list[int] = []
 
     @staticmethod
@@ -598,10 +615,35 @@ class CpuAlloc:
             return
         self._allocate_default_roles()
 
+    @staticmethod
+    def _layerwise_connector_binding_enabled() -> bool:
+        return envs.BIND_LAYERWISE_CONNECTOR
+
+    def _reserve_layerwise_cores(self, main_cpus: list[int]) -> tuple[list[int], list[int]]:
+        """从 main 核池末尾划出分层连接器传输线程的专用核.
+
+        开关关闭时原样返回(专用核为空). 核不足(main 至少要留 1 个核)时也只告警,
+        退回原划分, 不改变原有行为.
+        """
+        if not self._layerwise_connector_binding_enabled():
+            return main_cpus, []
+        if len(main_cpus) <= LAYERWISE_CONNECTOR_CPUS:
+            logger.warning(
+                "[cpu_bind_layerwise] insufficient CPUs to reserve layerwise connector cores. "
+                "main_cpus=%s, required=%d. action: keep all CPUs for the worker.",
+                main_cpus,
+                LAYERWISE_CONNECTOR_CPUS,
+            )
+            return main_cpus, []
+        return main_cpus[:-LAYERWISE_CONNECTOR_CPUS], main_cpus[-LAYERWISE_CONNECTOR_CPUS:]
+
     def _allocate_ascend_950_roles(self) -> None:
-        self.assign_main = {npu: cpu_pool for npu, cpu_pool in self.npu_cpu_pool.items()}
         self.assign_acl = {npu: [] for npu in self.npu_cpu_pool}
         self.assign_rel = {npu: [] for npu in self.npu_cpu_pool}
+        for npu, cpu_pool in self.npu_cpu_pool.items():
+            main, layerwise = self._reserve_layerwise_cores(cpu_pool)
+            self.assign_main[npu] = main
+            self.assign_layerwise[npu] = layerwise
 
     def _allocate_default_roles(self) -> None:
         reserve_irq_cpus = self._reserve_irq_cpus()
@@ -618,9 +660,11 @@ class CpuAlloc:
                 raise RuntimeError(
                     f"The number of CPUs is insufficient. Each NPU requires at least {min_cpus_per_npu} CPUs."
                 )
+            main, layerwise = self._reserve_layerwise_cores(main)
             self.assign_main[npu] = main
             self.assign_acl[npu] = acl
             self.assign_rel[npu] = rel
+            self.assign_layerwise[npu] = layerwise
 
     def print_plan(self) -> None:
         logger.info("The CPU allocation plan is as follows:")
@@ -632,12 +676,27 @@ class CpuAlloc:
 
     def _print_ascend_950_plan(self, current_npu: int) -> None:
         main = " ".join(map(str, self.assign_main[current_npu]))
+        layerwise = " ".join(map(str, self.assign_layerwise.get(current_npu, [])))
+        if layerwise:
+            logger.info("Ascend 950 NPU%s: worker=[%s]  layerwise=[%s]", current_npu, main, layerwise)
+            return
         logger.info("Ascend 950 NPU%s: worker=[%s]", current_npu, main)
 
     def _print_default_plan(self, current_npu: int) -> None:
         main = " ".join(map(str, self.assign_main[current_npu]))
         acl = " ".join(map(str, self.assign_acl[current_npu]))
         rel = str(self.assign_rel[current_npu]) if self.assign_rel[current_npu] else ""
+        layerwise = " ".join(map(str, self.assign_layerwise.get(current_npu, [])))
+        if layerwise:
+            logger.info(
+                "NPU%s: main=[%s]  acl=[%s]  release=[%s]  layerwise=[%s]",
+                current_npu,
+                main,
+                acl,
+                rel,
+                layerwise,
+            )
+            return
         logger.info("NPU%s: main=[%s]  acl=[%s]  release=[%s]", current_npu, main, acl, rel)
 
     def bind_memory(self, pid: str, npu: int) -> None:
@@ -690,13 +749,66 @@ class CpuAlloc:
             self.bind(thread_id, self.assign_acl[current_npu], False)
         for thread_id in threads_map.get(main_pid, {}).get("release_thread", []):
             self.bind(thread_id, self.assign_rel[current_npu], False)
+        # 传输线程必须在上面的 taskset -acp 之后再绑, 否则会被一起绑回 main 核池.
+        self.bind_layerwise_connector_threads(current_npu)
         # Migrate memory once for the whole process, after all threads are pinned.
         self.bind_memory(main_pid, current_npu)
+
+    def bind_layerwise_connector_threads(self, npu: int) -> None:
+        """把分层连接器的传输线程绑到为它们保留的核上.
+
+        收发线程在 worker init(register_kv_caches, 见 worker/model_runner 的 KV
+        连接器初始化)阶段就启动, 早于本函数所在的 warmup 末尾, 所以先被
+        ``taskset -acp`` 连同其它线程一起绑到 main 核池; 这里再把它们单独挪到
+        layerwise 专用核, 保证与 forward/HCCL/acl 等线程不共享 CPU.
+
+        这些线程是 worker 进程内的 Python 线程(线程名见
+        LAYERWISE_CONNECTOR_THREAD_NAMES), 但从进程外看不到 Python 线程名,
+        因此在本进程内用 threading.enumerate() 按名字找、按 native id 绑.
+        """
+        layerwise_cpus = self.assign_layerwise.get(npu, [])
+        if not layerwise_cpus:
+            return
+        bound_threads = []
+        for thread in threading.enumerate():
+            if thread.name not in LAYERWISE_CONNECTOR_THREAD_NAMES:
+                continue
+            thread_id = thread.native_id if thread.native_id is not None else thread.ident
+            if thread_id is None:
+                continue
+            try:
+                self.bind(str(thread_id), layerwise_cpus, False)
+            except RuntimeError as e:
+                logger.warning(
+                    "[cpu_bind_layerwise] failed to bind %s to cpus=%s: %s",
+                    thread.name,
+                    layerwise_cpus,
+                    e,
+                )
+                continue
+            bound_threads.append(f"{thread.name}(tid={thread_id})")
+        if bound_threads:
+            logger.info(
+                "[cpu_bind_layerwise] NPU%s: cpus=[%s]  threads=[%s]",
+                npu,
+                " ".join(map(str, layerwise_cpus)),
+                " ".join(bound_threads),
+            )
+        else:
+            logger.warning(
+                "[cpu_bind_layerwise] BIND_LAYERWISE_CONNECTOR=1 but no layerwise connector thread found. "
+                "npu=%s, reserved_cpus=%s, expected_threads=%s. These CPUs stay idle for this worker.",
+                npu,
+                layerwise_cpus,
+                list(LAYERWISE_CONNECTOR_THREAD_NAMES),
+            )
 
     def bind_ascend_950_threads(self) -> None:
         main_pid = str(psutil.Process().pid)
         current_npu = self.device_info.running_npu_list[self.rank_id]
         self.bind(main_pid, self.assign_main[current_npu], True)
+        # 传输线程必须在上面的 taskset -acp 之后再绑, 否则会被一起绑回 main 核池.
+        self.bind_layerwise_connector_threads(current_npu)
         self.bind_memory(main_pid, current_npu)
 
     def bind_npu_irq(self) -> None:

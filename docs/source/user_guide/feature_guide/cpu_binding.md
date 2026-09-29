@@ -63,6 +63,55 @@ llm = LLM(
 )
 ```
 
+## Layerwise KV Connector Transfer Threads
+
+**This switch is off by default.** Turn it on only on engines that use a
+layerwise KV connector (the PD disaggregation path where KV cache is streamed
+layer by layer), and only when CPU binding is enabled.
+
+Layerwise KV transfer runs in worker threads (`KVCacheSendingLayerThread` on the
+prefill side, `KVCacheRecvingLayerThread` on the decode side, plus the pipelined
+write and parameter-channel threads). By default those threads share the same
+CPUs as the model forward and other runtime threads, so a busy host can preempt
+a send/receive thread while a layer is in flight.
+
+With `BIND_LAYERWISE_CONNECTOR=1`, CPU binding takes the **last two CPUs of the
+worker's main range** and gives them to those threads only. Every other thread
+of the worker keeps a mask without these two CPUs, so the transfer threads and
+the compute threads never run on the same CPU:
+
+```bash
+export BIND_LAYERWISE_CONNECTOR=1
+vllm serve <your-model> --kv-transfer-config '...'
+```
+
+On a 320-CPU host with 16 NPUs (20 CPUs per worker, 16 of which form the main
+range by default), one worker is split like this:
+
+```text
+20-CPU worker slice
+| IRQ  |            main range (14)          | layerwise | ACL | release |
+| c0-1 |              c2-c15                 |  c16-c17  | c18 |   c19   |
+```
+
+The allocation plan log shows the reserved CPUs, and a second line reports which
+threads were pinned to them:
+
+```text
+NPU0: main=[2 3 ... 15]  acl=[18]  release=[19]  layerwise=[16 17]
+[cpu_bind_layerwise] NPU0: cpus=[16 17]  threads=[KVCacheRecvingLayerThread(tid=...)]
+```
+
+Notes:
+
+- The two reserved CPUs leave the main range, so the worker has two fewer CPUs
+  for forward and other threads. If the remaining main range would be empty, the
+  reservation is skipped and the previous split is kept.
+- Reserved CPUs stay idle on workers that do not run a layerwise connector, so
+  do not set this switch globally for engines that use other KV connectors.
+- The decode side has one transfer thread that performs both receive and H2D
+  copy; it receives both reserved CPUs.
+
 ## Requirements
 
 Official vllm-ascend images have already included `util-linux` and `procps` /
@@ -147,3 +196,6 @@ sudo systemctl start irqbalance
 | `The 'migratepages' command is not available...` | Memory migration is skipped, while CPU thread binding still proceeds. | Install `numactl` if NUMA locality or performance is affected. |
 | `[irq] IRQ binding skipped on Ascend 950.` | Ascend 950 does not use the IRQ binding step. | No action needed. Worker main binding and memory migration still proceed. |
 | `Bind cpus failed in rank...` | A binding step failed and CPU binding was skipped for that rank. | Check `taskset`, `lscpu`, `npu-smi`, cpuset size, and `/proc/irq` permissions. |
+| `[cpu_bind_layerwise] insufficient CPUs to reserve layerwise connector cores.` | The main range is too small to give two CPUs to the transfer threads. | Expand the cpuset or reduce visible NPUs. CPU binding still applies without the reservation. |
+| `[cpu_bind_layerwise] BIND_LAYERWISE_CONNECTOR=1 but no layerwise connector thread found.` | The worker runs no layerwise KV connector, or the variable did not reach the worker process. | Set the variable only on engines that use a layerwise KV connector. The two reserved CPUs stay idle for this worker. |
+| `[cpu_bind_layerwise] failed to bind ...` | A matching transfer thread exited, or pinning was not permitted. | Check the worker log for the thread state; binding the remaining threads still proceeds. |

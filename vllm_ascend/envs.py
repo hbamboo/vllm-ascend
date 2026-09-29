@@ -127,6 +127,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
     "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
+    # 分层(layerwise)KV 连接器传输线程绑核: 1=开启. 开启后 cpu_binding 从 worker
+    # 的 main 核池末尾划出 2 个核, 专供 KVCacheSendingLayerThread(P 发) /
+    # KVCacheRecvingLayerThread(D 收) / KVCachePipeWriter 等传输线程; 其余线程
+    # (含 forward/HCCL)的 CPU 掩码不含这 2 个核, 收发线程因此不会与它们抢同一
+    # 颗 CPU. 只在跑分层连接器的引擎上生效, 且需要 CPU 绑核已开启
+    # (additional_config 的 enable_cpu_binding, 默认开).
+    "BIND_LAYERWISE_CONNECTOR": lambda: bool(int(os.getenv("BIND_LAYERWISE_CONNECTOR", "0"))),
     # 先 P 后 D (p_then_d): 1=开启首 token 复用. P 侧 prefill 完成后, 把本步
     # 采样出的首个 token 经侧信道 (FIRST_TOKEN_MSG) 随 DONE_SENDING 一起发给 D;
     # D 侧把该 token 追加到 prompt 末尾并只重算这一个 token 的 KV, 从而省掉

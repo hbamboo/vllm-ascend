@@ -13,7 +13,9 @@
 # This file is a part of the vllm-ascend project.
 #
 
+import os
 import subprocess
+import threading
 import unittest
 from collections import defaultdict
 from types import SimpleNamespace
@@ -40,6 +42,7 @@ def make_cpu_alloc(rank_id=0):
     cpu_alloc.assign_main = {}
     cpu_alloc.assign_acl = {}
     cpu_alloc.assign_rel = {}
+    cpu_alloc.assign_layerwise = {}
     cpu_alloc.uvb_cpu_pool = []
     return cpu_alloc
 
@@ -525,6 +528,120 @@ class TestCpuAlloc(unittest.TestCase):
         self.cpu_alloc.assign_rel = {0: [3]}
         self.cpu_alloc.bind_threads()
         mock_execute_command.assert_called()
+
+    def _start_named_thread(self, name: str) -> threading.Thread:
+        """起一个与连接器同名、只等事件不干活的真实线程, 测试结束自动回收."""
+        stop_event = threading.Event()
+        thread = threading.Thread(target=stop_event.wait, daemon=True, name=name)
+        thread.start()
+        # LIFO: 先 set 事件, 再 join.
+        self.addCleanup(thread.join, 5)
+        self.addCleanup(stop_event.set)
+        return thread
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    def test_allocate_reserves_layerwise_connector_cpus(self, _mock_get_device_type):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(20))}
+        with patch.dict(os.environ, {"BIND_LAYERWISE_CONNECTOR": "1"}):
+            self.cpu_alloc.allocate()
+        # 20 核池: 前 2 个留 IRQ, 末 2 个给 acl/release, 中间 16 个是 main;
+        # 开 BIND_LAYERWISE_CONNECTOR 后 main 的末尾 2 个划给连接器传输线程.
+        self.assertEqual(self.cpu_alloc.assign_main[0], list(range(2, 16)))
+        self.assertEqual(self.cpu_alloc.assign_layerwise[0], [16, 17])
+        self.assertEqual(self.cpu_alloc.assign_acl[0], [18])
+        self.assertEqual(self.cpu_alloc.assign_rel[0], [19])
+        for other in (self.cpu_alloc.assign_main[0], self.cpu_alloc.assign_acl[0], self.cpu_alloc.assign_rel[0]):
+            self.assertFalse(set(other) & set(self.cpu_alloc.assign_layerwise[0]))
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    def test_allocate_without_layerwise_flag_keeps_full_main_pool(self, _mock_get_device_type):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(20))}
+        with patch.dict(os.environ, {"BIND_LAYERWISE_CONNECTOR": "0"}):
+            self.cpu_alloc.allocate()
+        self.assertEqual(self.cpu_alloc.assign_main[0], list(range(2, 18)))
+        self.assertEqual(self.cpu_alloc.assign_layerwise[0], [])
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A2)
+    @patch("vllm_ascend.cpu_binding.logger.warning")
+    def test_allocate_keeps_main_cpus_when_too_few_for_layerwise(self, mock_logger_warning, _mock_get_device_type):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        # main 只剩 1 个核, 不够再划 2 个专用核.
+        self.cpu_alloc.npu_cpu_pool = {0: [0, 1, 2, 3, 4]}
+        with patch.dict(os.environ, {"BIND_LAYERWISE_CONNECTOR": "1"}):
+            self.cpu_alloc.allocate()
+        self.assertEqual(self.cpu_alloc.assign_main[0], [2])
+        self.assertEqual(self.cpu_alloc.assign_layerwise[0], [])
+        mock_logger_warning.assert_called()
+
+    @patch("vllm_ascend.cpu_binding.get_ascend_device_type", return_value=AscendDeviceType.A5)
+    def test_allocate_ascend_950_reserves_layerwise_connector_cpus(self, _mock_get_device_type):
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.npu_cpu_pool = {0: list(range(8))}
+        with patch.dict(os.environ, {"BIND_LAYERWISE_CONNECTOR": "1"}):
+            self.cpu_alloc.allocate()
+        self.assertEqual(self.cpu_alloc.assign_main[0], list(range(6)))
+        self.assertEqual(self.cpu_alloc.assign_layerwise[0], [6, 7])
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_bind_layerwise_connector_threads_binds_send_and_recv_threads(self, mock_execute_command):
+        mock_execute_command.return_value = ("", 0)
+        send_thread = self._start_named_thread("KVCacheSendingLayerThread")
+        recv_thread = self._start_named_thread("KVCacheRecvingLayerThread")
+        self._start_named_thread("VLLM::Worker_TP")
+        self.cpu_alloc.assign_layerwise = {0: [16, 17]}
+
+        self.cpu_alloc.bind_layerwise_connector_threads(0)
+
+        self.assertCountEqual(
+            mock_execute_command.call_args_list,
+            [
+                call(["taskset", "-cp", "16,17", str(send_thread.native_id)]),
+                call(["taskset", "-cp", "16,17", str(recv_thread.native_id)]),
+            ],
+        )
+
+    @patch("vllm_ascend.cpu_binding.logger.warning")
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_bind_layerwise_connector_threads_warns_without_matching_thread(
+        self, mock_execute_command, mock_logger_warning
+    ):
+        self.cpu_alloc.assign_layerwise = {0: [16, 17]}
+
+        self.cpu_alloc.bind_layerwise_connector_threads(0)
+
+        mock_execute_command.assert_not_called()
+        mock_logger_warning.assert_called()
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_bind_layerwise_connector_threads_noop_without_reserved_cpus(self, mock_execute_command):
+        self._start_named_thread("KVCacheRecvingLayerThread")
+        self.cpu_alloc.assign_layerwise = {0: []}
+
+        self.cpu_alloc.bind_layerwise_connector_threads(0)
+
+        mock_execute_command.assert_not_called()
+
+    @patch("vllm_ascend.cpu_binding.execute_command")
+    def test_bind_threads_rebinds_layerwise_threads_after_bulk_bind(self, mock_execute_command):
+        # 传输线程先被 taskset -acp 绑到 main 核池, 之后必须单独重绑到专用核.
+        thread_message = "1234 1234 ? 00:00:03 acl_thread"
+        mock_execute_command.return_value = (thread_message, 0)
+        self.cpu_alloc.device_info.running_npu_list = [0]
+        self.cpu_alloc.assign_main = {0: [0, 1]}
+        self.cpu_alloc.assign_acl = {0: [2]}
+        self.cpu_alloc.assign_rel = {0: [3]}
+        self.cpu_alloc.assign_layerwise = {0: [4, 5]}
+        recv_thread = self._start_named_thread("KVCacheRecvingLayerThread")
+
+        self.cpu_alloc.bind_threads()
+
+        commands = [c.args[0] for c in mock_execute_command.call_args_list]
+        self.assertLess(
+            commands.index(["taskset", "-acp", "0,1", str(os.getpid())]),
+            commands.index(["taskset", "-cp", "4,5", str(recv_thread.native_id)]),
+        )
 
     @patch("vllm_ascend.cpu_binding.get_ascend_device_type")
     @patch("vllm_ascend.cpu_binding.os.listdir")
