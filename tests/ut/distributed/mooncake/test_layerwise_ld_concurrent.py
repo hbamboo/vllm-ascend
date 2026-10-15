@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""P 侧逐层 LAYER_DONE 的并发发送路径(MC_TCP_LD_CONCURRENT=1)单测.
+"""P 侧逐层 LAYER_DONE 的"刷完即发 + 统一收 ACK"路径(MC_TCP_LD_CONCURRENT=1)单测.
 
 不依赖 NPU/引擎: ROUTER 假扮 D 侧侧信道接收线程, 只验证发送侧的协议与调度行为
-—— 先全发再全收(各对端并行开始)、连接常驻复用、失败后弃用重建。
+—— post 不等 ACK(因此 session 之间的发送与等待互相并行)、连接常驻复用、
+payload 线格式、失败后弃用重建。
 
 线程约定: **ZMQ socket 绝不跨线程使用**。假 D 端(ROUTER)全程在本用例线程创建、
 收发、关闭; 发送侧(REQ)在其自己的子线程里创建、收发 —— 每次调用都在同一个子
@@ -88,19 +89,27 @@ def _join(thread, box, timeout=5.0):
     return box["result"]
 
 
-class TestLayerDoneConcurrentSend(unittest.TestCase):
-    def test_sends_all_peers_before_waiting_any_ack(self):
-        """先全发再全收: A 尚未回 ACK 时 B 的消息必须已经在途.
+def _post_then_collect(sender, msgs):
+    """镜像调用点的顺序: 逐个 post(不等 ACK), 最后统一 collect."""
+    posted = [(m, sender._post_layer_done(m)) for m in msgs]
+    return [sender._collect_layer_done_ack(m, sock) for m, sock in posted]
 
+
+class TestLayerDonePostAndCollect(unittest.TestCase):
+    def test_post_does_not_wait_for_ack(self):
+        """post 不等 ACK: A 的 ACK 尚未回时, B 的信号必须已经发出.
+
+        这正是调用点依赖的性质 —— 每个 session 刷完自己的 staging 就发它的
+        LAYER_DONE, 不被别的 session 挡住(攒齐全批再发会退化成一道同步屏障)。
         串行实现(发 A → 等 A 的 ACK)下, B 的消息在 A 回 ACK 前根本发不出来,
         本用例的 `peer_b.recv()` 就会超时失败 —— 判据是确定性的, 不依赖掐表.
         """
         peer_a, peer_b = _FakeDecoderPeer(), _FakeDecoderPeer()
         try:
             sender = _make_sender()
-            thread, box = _run_in_thread(lambda: sender._send_layer_done_signals([_msg(peer_a), _msg(peer_b)]))
+            thread, box = _run_in_thread(lambda: _post_then_collect(sender, [_msg(peer_a), _msg(peer_b)]))
             self.assertIsNotNone(peer_a.recv(3000), "A 应在 3s 内收到 LAYER_DONE")
-            self.assertIsNotNone(peer_b.recv(2000), "B 的消息必须早于 A 的 ACK 到达(即两笔是并发发出的)")
+            self.assertIsNotNone(peer_b.recv(2000), "B 的消息必须不依赖 A 的 ACK 到达")
             peer_a.ack()
             peer_b.ack()
             self.assertEqual(_join(thread, box), [True, True])
@@ -117,8 +126,8 @@ class TestLayerDoneConcurrentSend(unittest.TestCase):
             def two_batches():
                 # 两批必须在同一线程内跑: 常驻 socket 不可跨线程复用.
                 return [
-                    sender._send_layer_done_signals([_msg(peer)]),
-                    sender._send_layer_done_signals([_msg(peer)]),
+                    _post_then_collect(sender, [_msg(peer)]),
+                    _post_then_collect(sender, [_msg(peer)]),
                 ]
 
             thread, box = _run_in_thread(two_batches)
@@ -136,7 +145,7 @@ class TestLayerDoneConcurrentSend(unittest.TestCase):
         peer = _FakeDecoderPeer()
         try:
             sender = _make_sender()
-            thread, box = _run_in_thread(lambda: sender._send_layer_done_signals([_msg(peer, ["ext-1"])]))
+            thread, box = _run_in_thread(lambda: _post_then_collect(sender, [_msg(peer, ["ext-1"])]))
             payload = peer.recv(3000)
             self.assertIsNotNone(payload)
             peer.ack()
@@ -160,13 +169,17 @@ class TestLayerDoneConcurrentSend(unittest.TestCase):
             sender = _make_sender()
             stale = sender._peer_req_socket("127.0.0.1", peer.port)
             stale.setsockopt(zmq.RCVTIMEO, 100)  # 免等 LAYER_DONE_TIMEOUT_S
+            msg = _msg(peer)
+            sock = sender._post_layer_done(msg)  # 同一线程内直接调用
+            self.assertIsNotNone(sock)
             t0 = time.perf_counter()
-            ok_list = sender._send_layer_done_signals([_msg(peer)])  # 同一线程内直接调用
-            self.assertEqual(ok_list, [False])
+            self.assertFalse(sender._collect_layer_done_ack(msg, sock))
             self.assertLess(time.perf_counter() - t0, 3.0)
             self.assertIsNotNone(peer.recv(1000), "消息仍应已送达对端")
             self.assertNotIn(("127.0.0.1", peer.port), sender._peer_socks)
             self.assertIsNot(sender._peer_req_socket("127.0.0.1", peer.port), stale)
+            # 发送就没成功(sock=None)时直接判失败, 不需要也不允许再收一次.
+            self.assertFalse(sender._collect_layer_done_ack(msg, None))
         finally:
             peer.close()
 

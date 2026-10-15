@@ -923,11 +923,11 @@ class KVCacheSendingLayerThread(threading.Thread):
                         )
 
         # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
-        # MC_TCP_LD_CONCURRENT=1 时 LAYER_DONE 不在本循环内发, 先攒进 pending_ld,
-        # 循环结束后一次性"全发 + 全收"(见 4b 与 _send_layer_done_signals):
-        # 各 session 的 flush 仍逐 session 串行 —— 它读 NPU、不占 H2H 链路, 要重叠的
-        # 是各对端收到信号后的 pull/H2D。
-        pending_ld: list[tuple] = []  # (transfer_meta, host, port, req_ids, addrs, lengths, done_list, src)
+        # MC_TCP_LD_CONCURRENT=1 时, 每个 session 在自己的 flush 完成后立即发出它的
+        # LAYER_DONE(见循环内), 只把 (meta, msg, sock) 记在 sent_ld 里, ACK 留到
+        # 循环结束后统一收(见 4b): 于是"各 session 的 D2H flush"与"已发出 session 的
+        # 远端 pull/H2D"互相重叠, 而全部 ACK 仍是推进下一批的前置条件。
+        sent_ld: list[tuple] = []  # (transfer_meta, msg, socket|None)
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 if global_te.use_tcp:
@@ -1017,7 +1017,10 @@ class KVCacheSendingLayerThread(threading.Thread):
                                         transfer_meta.src[req_start : req_start + req_count]
                                     )
                         if _LD_CONCURRENT:
-                            # 并发路径: 本循环内不发, 只攒消息(见 4b)。
+                            # 本 session 刷完立即发它的 LAYER_DONE —— 不等本批其它
+                            # session: 远端对本 session 的 pull 因此与本批后续 session
+                            # 的 D2H flush 重叠(攒齐全批再统一发 = 在 flush 后加一道
+                            # 同步屏障, 把这段重叠又丢了)。ACK 统一在后面收(见 4b)。
                             for (peer_host, peer_port), (
                                 peer_addrs,
                                 peer_lengths,
@@ -1025,18 +1028,22 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 peer_src,
                             ) in peer_layer_msgs.items():
                                 done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
-                                pending_ld.append(
-                                    (
-                                        transfer_meta,
-                                        peer_host,
-                                        peer_port,
-                                        peer_req_ids,
-                                        peer_addrs,
-                                        peer_lengths,
-                                        done_list,
-                                        peer_src,
-                                    )
+                                ld_msg = (
+                                    peer_host,
+                                    peer_port,
+                                    peer_req_ids,
+                                    peer_addrs,
+                                    peer_lengths,
+                                    done_list,
+                                    peer_src,
                                 )
+                                t_ld0 = time.perf_counter()
+                                ld_sock = self._post_layer_done(ld_msg)
+                                if _PERF_LOG:
+                                    layerdone_ms += _perf_ms(t_ld0)
+                                    if layerdone_win0 is None:
+                                        layerdone_win0 = t_ld0
+                                sent_ld.append((transfer_meta, ld_msg, ld_sock))
                         else:
                             for (peer_host, peer_port), (
                                 peer_addrs,
@@ -1069,27 +1076,24 @@ class KVCacheSendingLayerThread(threading.Thread):
                                 for failed_req_id in transfer_meta.req_ids:
                                     self.failed_reqs.add(failed_req_id)
 
-        # 4b) MC_TCP_LD_CONCURRENT=1: 本批全部 session 的 LAYER_DONE 统一"先全发、
-        #     再全收 ACK". 各对端一收到即各自 pull/H2D, 批内该段从 Σ_peer 降为
-        #     max_peer(窗口口径同旧路径: 起点=第一笔发出, 终点=最后一笔 ACK 回来)。
-        if pending_ld:
-            t_ld0 = time.perf_counter()
-            ok_list = self._send_layer_done_signals([ld[1:] for ld in pending_ld])
-            if _PERF_LOG:
-                layerdone_ms += _perf_ms(t_ld0)
-                if layerdone_win0 is None:
-                    layerdone_win0 = t_ld0
-                layerdone_win1 = time.perf_counter()
-            for (ld_meta, peer_host, peer_port, _ids, _addrs, _lens, _done, _src), ok in zip(pending_ld, ok_list):
-                if not ok:
+        # 4b) 统一收本批全部 ACK: 各 session 的等待互相重叠(各自的信号在它自己刷完时
+        #     就已发出), 全部收齐才推进下一批 —— staging 复用与请求级 done 的前置条件。
+        #     窗口口径仍与旧路径一致: 起点=第一笔发出, 终点=最后一笔 ACK 回来。
+        if sent_ld:
+            t_collect0 = time.perf_counter()
+            for ld_meta, ld_msg, ld_sock in sent_ld:
+                if not self._collect_layer_done_ack(ld_msg, ld_sock):
                     logger.error(
                         "Layer done signal failed for session %s:%d, reqs=%s",
-                        peer_host,
-                        peer_port,
+                        ld_msg[0],
+                        ld_msg[1],
                         ld_meta.req_ids,
                     )
                     for failed_req_id in ld_meta.req_ids:
                         self.failed_reqs.add(failed_req_id)
+            if _PERF_LOG:
+                layerdone_ms += _perf_ms(t_collect0)
+                layerdone_win1 = time.perf_counter()
 
         # 5) 请求级完成信号: 含最后层任务时在 session 聚合阶段记入
         #    TransferMeta.req_done, 随该批 LAYER_DONE 的 done_list 下发(见
@@ -1103,6 +1107,8 @@ class KVCacheSendingLayerThread(threading.Thread):
         if _PERF_LOG:
             total_ms = _perf_ms(t_batch0)
             event_ms = (t_event1 - t_event0) * 1e3
+            # MC_TCP_LD_CONCURRENT=1 时 flush 段与 LAYER_DONE 段**按设计重叠**(每个
+            # session 刷完就发), 相减可能为负 —— max(0) 兜底, 此时 misc 只作下界看.
             misc_ms = max(
                 0.0,
                 total_ms - batch_wait_ms - event_ms - flush_ms - write_ms - layerdone_ms,
@@ -1381,8 +1387,9 @@ class KVCacheSendingLayerThread(threading.Thread):
             self.failed_reqs.update(failed_ids)
         layerdone_ms = 0.0
         layerdone_win0 = layerdone_win1 = None
-        # MC_TCP_LD_CONCURRENT=1: LAYER_DONE 先攒后发(见循环后的统一收发块).
-        pending_ld: list[tuple] = []  # (transfer_meta, host, port, req_ids, addrs, lengths, done_list, src)
+        # MC_TCP_LD_CONCURRENT=1: 每个 session 在其 write 完成后立即发出 LAYER_DONE
+        # (见循环内), ACK 留到循环后统一收(见循环后的统一收 ACK 块).
+        sent_ld: list[tuple] = []  # (transfer_meta, msg, socket|None)
         for session_id, transfer_meta in job.sessions:
             if session_id in job.failed or len(transfer_meta.src) <= 0:
                 continue
@@ -1399,7 +1406,8 @@ class KVCacheSendingLayerThread(threading.Thread):
                     if _PULL_MODE:
                         peer_layer_msgs[peer_key][3].extend(transfer_meta.src[req_start : req_start + req_count])
             if _LD_CONCURRENT:
-                # 并发路径: 本循环内不发, 只攒消息(见循环后的统一收发块).
+                # 本 session 的 write 一完成就发它的 LAYER_DONE —— 不等本批其它
+                # session(它们的 write 可能还在飞); ACK 统一在后面收.
                 for (peer_host, peer_port), (
                     peer_addrs,
                     peer_lengths,
@@ -1407,18 +1415,22 @@ class KVCacheSendingLayerThread(threading.Thread):
                     peer_src,
                 ) in peer_layer_msgs.items():
                     done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
-                    pending_ld.append(
-                        (
-                            transfer_meta,
-                            peer_host,
-                            peer_port,
-                            peer_req_ids,
-                            peer_addrs,
-                            peer_lengths,
-                            done_list,
-                            peer_src,
-                        )
+                    ld_msg = (
+                        peer_host,
+                        peer_port,
+                        peer_req_ids,
+                        peer_addrs,
+                        peer_lengths,
+                        done_list,
+                        peer_src,
                     )
+                    t_ld0 = time.perf_counter()
+                    ld_sock = self._post_layer_done(ld_msg)
+                    if _PERF_LOG:
+                        layerdone_ms += _perf_ms(t_ld0)
+                        if layerdone_win0 is None:
+                            layerdone_win0 = t_ld0
+                    sent_ld.append((transfer_meta, ld_msg, ld_sock))
                 continue
             for (peer_host, peer_port), (
                 peer_addrs,
@@ -1439,25 +1451,22 @@ class KVCacheSendingLayerThread(threading.Thread):
                 if not ok:
                     self.failed_reqs.update(transfer_meta.req_ids)
 
-        # MC_TCP_LD_CONCURRENT=1: 本批全部 session 的 LAYER_DONE 统一"先全发、再全收
-        # ACK", 各对端一收到即各自 pull/H2D(批内该段 Σ_peer → max_peer).
-        if pending_ld:
-            t_ld0 = time.perf_counter()
-            ok_list = self._send_layer_done_signals([ld[1:] for ld in pending_ld])
-            if _PERF_LOG:
-                layerdone_ms += _perf_ms(t_ld0)
-                if layerdone_win0 is None:
-                    layerdone_win0 = t_ld0
-                layerdone_win1 = time.perf_counter()
-            for (ld_meta, peer_host, peer_port, _ids, _addrs, _lens, _done, _src), ok in zip(pending_ld, ok_list):
-                if not ok:
+        # MC_TCP_LD_CONCURRENT=1: 统一收本批全部 ACK —— 各 session 的信号在它自己的
+        # write 完成时就已发出, 等待因此互相重叠; 全部收齐才算本批结束.
+        if sent_ld:
+            t_collect0 = time.perf_counter()
+            for ld_meta, ld_msg, ld_sock in sent_ld:
+                if not self._collect_layer_done_ack(ld_msg, ld_sock):
                     logger.error(
                         "[mooncake][pipe] layer done signal failed for session %s:%d, reqs=%s",
-                        peer_host,
-                        peer_port,
+                        ld_msg[0],
+                        ld_msg[1],
                         ld_meta.req_ids,
                     )
                     self.failed_reqs.update(ld_meta.req_ids)
+            if _PERF_LOG:
+                layerdone_ms += _perf_ms(t_collect0)
+                layerdone_win1 = time.perf_counter()
 
         # perf 批级行与请求级累计(必须在 DONE 之前打印).
         if _PERF_LOG:
@@ -1703,7 +1712,7 @@ class KVCacheSendingLayerThread(threading.Thread):
         )
 
     def _peer_req_socket(self, peer_host: str, peer_port: int) -> Any:
-        """按 peer 常驻的 REQ 连接(仅发送线程访问, 无需加锁; 见 _send_layer_done_signals)."""
+        """按 peer 常驻的 REQ 连接(仅发送线程访问, 无需加锁; 见 _post_layer_done)."""
         if self._peer_ctx is None:
             self._peer_ctx = zmq.Context()  # type: ignore
         key = (peer_host, peer_port)
@@ -1731,40 +1740,44 @@ class KVCacheSendingLayerThread(threading.Thread):
             except Exception:  # noqa: BLE001
                 pass
 
-    def _send_layer_done_signals(self, msgs: list[tuple]) -> list[bool]:
-        """MC_TCP_LD_CONCURRENT=1: 本批全部 peer 的 LAYER_DONE 先统一发出, 再统一收 ACK.
+    def _post_layer_done(self, msg: tuple) -> Any:
+        """发出一条 LAYER_DONE(只 send, 不等 ACK), 返回该 peer 的 socket; 发送失败返回 None.
 
-        msgs: [(peer_host, peer_port, req_ids, dst_addrs, lengths, done_list, src_addrs), ...]
-        返回与 msgs 等长的 ok 列表。
+        msg: (peer_host, peer_port, req_ids, dst_addrs, lengths, done_list, src_addrs)
 
-        与旧路径(逐 peer 新建连接 + 串行 REQ-REP)相比: 各对端一收到信号就各自开始
-        pull/H2D, 批内该段从 Σ_peer 降为 max_peer; 连接常驻后也不再每批每 peer
-        一次 TCP 建连(ZMQ 每批换 identity 的怪相一并消失)。语义不变: 仍然等齐
-        本批**全部** peer 的 ACK 才返回, 调用方据此推进下一批(staging 复用与请求级
-        done 的前置条件)。失败不再提前 break —— 已发出的 peer 必须各收一次, 否则
-        该 REQ 套接字被永久污染; 判失败由调用方按 peer 归到对应请求。
+        拆成"发"与"收"两步是为了让**每个 session 各自刷完就发**: 远端对本 session 的
+        pull 因此能与本批其它 session 尚未完成的 D2H flush 重叠 —— 若攒齐全批再统一发,
+        等于在 flush 之后插了一道同步屏障, 把这段重叠又丢掉了。
         """
-        ok_list = [False] * len(msgs)
-        sent: list[tuple[int, Any]] = []  # (msgs 下标, socket)
-        for i, (peer_host, peer_port, req_ids, dst_addrs, lengths, done_list, src_addrs) in enumerate(msgs):
-            try:
-                sock = self._peer_req_socket(peer_host, peer_port)
-                sock.send(self._ld_payload(req_ids, dst_addrs, lengths, done_list, src_addrs))
-                sent.append((i, sock))
-            except zmq.ZMQError as e:  # type: ignore
-                logger.error("Layer done signal to %s:%d failed (send): %s", peer_host, peer_port, e)
-                self._drop_peer_req_socket(peer_host, peer_port)
-        for i, sock in sent:
-            peer_host, peer_port = msgs[i][0], msgs[i][1]
-            try:
-                resp = sock.recv()
-                ok_list[i] = resp == b"ACK"
-                if not ok_list[i]:
-                    logger.error("Layer done signal to %s:%d got unexpected reply %r", peer_host, peer_port, resp)
-            except zmq.ZMQError as e:  # type: ignore
-                logger.error("Layer done signal to %s:%d failed (recv): %s", peer_host, peer_port, e)
-                self._drop_peer_req_socket(peer_host, peer_port)
-        return ok_list
+        peer_host, peer_port, req_ids, dst_addrs, lengths, done_list, src_addrs = msg
+        try:
+            sock = self._peer_req_socket(peer_host, peer_port)
+            sock.send(self._ld_payload(req_ids, dst_addrs, lengths, done_list, src_addrs))
+            return sock
+        except zmq.ZMQError as e:  # type: ignore
+            logger.error("Layer done signal to %s:%d failed (send): %s", peer_host, peer_port, e)
+            self._drop_peer_req_socket(peer_host, peer_port)
+            return None
+
+    def _collect_layer_done_ack(self, msg: tuple, sock: Any) -> bool:
+        """等一条**已发出**的 LAYER_DONE 的 ACK.
+
+        必须对每个已发出的 peer 各收一次(REQ「已发未收」后套接字不可复用, 否则该连接
+        被永久污染); 超时/出错即弃用该连接, 下批复建。sock 为 None(发送就没成功)直接判失败。
+        """
+        if sock is None:
+            return False
+        peer_host, peer_port = msg[0], msg[1]
+        try:
+            resp = sock.recv()
+            ok = resp == b"ACK"
+            if not ok:
+                logger.error("Layer done signal to %s:%d got unexpected reply %r", peer_host, peer_port, resp)
+            return ok
+        except zmq.ZMQError as e:  # type: ignore
+            logger.error("Layer done signal to %s:%d failed (recv): %s", peer_host, peer_port, e)
+            self._drop_peer_req_socket(peer_host, peer_port)
+            return False
 
 
 class KVCacheRecvingLayerThread(threading.Thread):
