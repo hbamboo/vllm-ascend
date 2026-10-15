@@ -127,6 +127,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
     "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
+    # 逐层 LAYER_DONE(P→D 的每批控制信号)发送方式(仅 protocol=tcp 的 p_then_d 路径):
+    # 0=旧行为: 每 peer 新建一次 ZMQ REQ 连接, 逐 peer 串行阻塞完成 REQ-REP 往返;
+    # 1=按 peer 常驻 REQ 连接 + 本批先向全部 peer 发出、再统一收 ACK —— 各对端
+    # (不同 D rank)收到信号即各自开始 pull/H2D, 批内该段耗时从 Σ_peer 降为
+    # max_peer, 并省掉每批每 peer 一次 TCP 建连(ZMQ 建连也顺带从每批一次变为
+    # 每 peer 一次). 只改 P 侧发送方式, 两端协议与 ACK 语义不变.
+    "MC_TCP_LD_CONCURRENT": lambda: os.getenv("MC_TCP_LD_CONCURRENT", "0") == "1",
     # 分层(layerwise)KV 连接器传输线程绑核: 1=开启. 开启后 cpu_binding 从 worker
     # 的 main 核池末尾划出 2 个核, 专供 KVCacheSendingLayerThread(P 发) /
     # KVCacheRecvingLayerThread(D 收) / KVCachePipeWriter 等传输线程; 其余线程
