@@ -7,6 +7,7 @@ import logging
 import math
 import os
 import queue
+import socket
 import struct
 import threading
 import time
@@ -130,6 +131,16 @@ _PIPE_DEPTH = int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
 # (不同 D rank 的 pull/H2D 因此并行, 批内该段 Σ_peer → max_peer, 且不再每批
 # 新建连接). 0(默认)=保持旧的逐 peer 新建连接 + 串行往返. 详见 envs.py 注释.
 _LD_CONCURRENT = envs.MC_TCP_LD_CONCURRENT
+
+# D 侧 LAYER_DONE 执行线程数: 0(默认)=收线程内联执行 pull+H2D(旧行为);
+# >0=收线程只解析/回 ACK, 数据面交该数量的常驻 worker 并行执行(不同 session
+# 的 pull 与 H2D 因此互相重叠). 池化后同时在等 mooncake 的 worker 数≈并发
+# session 数, 每个忙等占 ~1 核, 故按 session 数开(当前部署 2 个 peer 即可, 建议
+# 2~4). 详见 envs.py 注释.
+_RECV_POOL = envs.MC_TCP_RECV_POOL
+# 池开启时收线程 poll 的超时(ms): 只兜底"完成事件丢唤醒"的极端情况 —— worker
+# 完成即写 socketpair 唤醒, 正常路径不受此值影响.
+_RECV_POLL_MS = 100
 
 # 逐层 H2H 的传输语义(仅 protocol=tcp 的 LAYER_DONE 路径):
 #   "push"(默认, 保持现设计) = P 把本端 staging 的字节用 TCP 写进 D 的 staging,
@@ -329,6 +340,33 @@ class _PipeJob:
     write_win1: float | None = None
     # session_id -> 该 session 写失败涉及的 req ids (与单线程版 ret<0 语义一致).
     failed: dict[str, list[str]] = field(default_factory=dict)
+
+
+@dataclass
+class _RecvJob:
+    """D 侧一条 LAYER_DONE 的数据面任务(一个 session 一条, REQ-REP 保证不重).
+
+    MC_TCP_RECV_POOL>0 时由收线程解析后交池执行; 关闭时收线程内联执行同一条路径
+    (见 _run_recv_job / _finish_recv_job), 两条路径共用同一份实现与打点口径.
+    前段由收线程填, 后段由执行方填, 完成项经 _recv_done 回收到收线程。
+    """
+
+    identity: bytes
+    sender_path: str
+    req_ids: list[str]
+    dst_addrs: list[int]
+    lengths: list[int]
+    done_list: Any
+    src_addrs: Any
+    sender_te_path: str
+    t_recv0: float
+    # 以下由执行方(池 worker 或内联)填充:
+    ok: bool = False
+    err: str = ""
+    pull_t0: float | None = None
+    pull_ms: float = 0.0
+    h2d_t0: float | None = None
+    h2d_only_ms: float | None = None
 
 
 class KVCacheSendingLayerThread(threading.Thread):
@@ -1764,6 +1802,14 @@ class KVCacheRecvingLayerThread(threading.Thread):
         # requeue_done_requests 里, 未被 requeue 过的请求会在 update_done_task
         # 里 AttributeError.
         self._perf_d_req: dict[str, dict[str, float]] = {}
+        # MC_TCP_RECV_POOL>0: 收线程只解析/回 ACK, pull+H2D 交常驻 worker 池.
+        # _recv_jobs 非 None 即池开启(两个消费点都据此分流).
+        self._recv_jobs: queue.Queue["_RecvJob"] | None = None
+        # 完成项回传: 队列传对象, socketpair 只作"叫醒"用(收线程 poll 在 ROUTER 上).
+        self._recv_done: queue.Queue["_RecvJob"] = queue.Queue()
+        self._wake_r: socket.socket | None = None
+        self._wake_w: socket.socket | None = None
+        self._recv_workers: list[threading.Thread] = []
 
     def get_first_token(self, request_id: str) -> Any:
         with self.lock:
@@ -1867,6 +1913,188 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             first2done=_perf_ms(acc["t_first"]),
                         )
 
+    # ---- MC_TCP_RECV_POOL>0: LAYER_DONE 数据面(反向 sync_read + H2D)线程池 ----
+    # 收线程仍是唯一碰 ZMQ 的线程(收包/回 ACK/簿记), 池只做数据面; 完成项经
+    # _recv_done 回收到收线程, 因此 done/failed 判定与打点保持单线程访问(无需加锁).
+    def _start_recv_pool(self) -> None:
+        """启动常驻 worker(daemon, 固定数量, 与 _pipe_writer 同风格)."""
+        self._recv_jobs = queue.Queue()
+        # 唤醒通道: worker 完成即写 1 字节, 收线程 poll 在 ROUTER 与读端上.
+        self._wake_r, self._wake_w = socket.socketpair()
+        self._wake_r.setblocking(False)
+        for idx in range(_RECV_POOL):
+            worker = threading.Thread(
+                target=self._recv_worker_loop,
+                args=(idx,),
+                daemon=True,
+                name=f"KVCacheRecvWorker{idx}",
+            )
+            worker.start()
+            self._recv_workers.append(worker)
+        logger.info(
+            "KVCacheRecvingLayerThread: LAYER_DONE recv pool started with %d workers (tp_rank=%d)",
+            _RECV_POOL,
+            self.tp_rank,
+        )
+
+    def _bind_worker_device(self) -> None:
+        """worker 线程的 NPU 设备绑定(线程级上下文, 见 run() 同因注释).
+
+        单测里替换为空实现即可在无 NPU 环境下驱动 _recv_worker_loop.
+        """
+        local_rank = get_world_group().local_rank
+        torch.npu.set_device(torch.device(f"npu:{local_rank}"))
+
+    def _recv_worker_loop(self, worker_idx: int) -> None:
+        # 与收线程同因: torch_npu 的设备/流上下文是线程级的, 每个 worker 必须
+        # 显式绑定本 rank 设备, 否则 H2D 的自定义 op 内 aclrtGetDevice 拿错设备
+        # (aclrtMemcpyBatchAsync 参数校验失败, 107000).
+        self._bind_worker_device()
+        while True:
+            job = self._recv_jobs.get()  # type: ignore[union-attr]
+            if job is None:  # 预留的停机哨兵(当前无停机路径, daemon 随进程退出)
+                return
+            try:
+                self._run_recv_job(job)
+            except Exception as e:  # noqa: BLE001
+                # _run_recv_job 自身已兜底; 这里只保证"任何意外都必须回一个完成项",
+                # 否则收线程永远收不到 ACK, P 侧只能等到 LAYER_DONE_TIMEOUT_S.
+                job.ok = False
+                job.err = f"{type(e).__name__}: {e}"
+            self._recv_done.put(job)
+            # 先入队再唤醒: 收线程被叫醒时必然能在队列里看到该项(见 _drain_wakeup).
+            # 注意是 socket.send 而不是 os.write(后者要 int fd, 传 socket 对象会
+            # TypeError —— 静默吞掉就退化成每次 ACK 都要等 _RECV_POLL_MS 超时).
+            try:
+                self._wake_w.send(b"\x01")  # type: ignore[union-attr]
+            except OSError as e:
+                logger.error("recv pool wakeup write failed (fallback: poll timeout): %s", e)
+
+    def _run_recv_job(self, job: "_RecvJob") -> None:
+        """执行一条 LAYER_DONE 的数据面: pull(反向 sync_read) → H2D.
+
+        失败不抛: 一律记进 job.ok/job.err, 由 _finish_recv_job 回 NAK 并作废重试.
+        内联与池两条路径共用本实现 —— 任何失败都必须回一个 reply, 否则对端只能
+        等 LAYER_DONE_TIMEOUT_S 才发现.
+        """
+        try:
+            if _PULL_MODE:
+                # pull: 主动从 P 的本端 staging 拉数据到本端 staging.
+                # sync_read 返回即字节已落本地 ⇒ push 路径上那个"信号跑在批量数据
+                # 前面"的竞态不存在, 不需要 crc 自校验.
+                if not job.src_addrs or not job.sender_te_path:
+                    raise RuntimeError(
+                        "pull mode requires src_addrs+sender_te_path in LAYER_DONE "
+                        f"(src={len(job.src_addrs)} te_path={job.sender_te_path!r}); "
+                        "P 侧是否也是 pull 模式?"
+                    )
+                if not (len(job.src_addrs) == len(job.lengths) == len(job.dst_addrs)):
+                    raise RuntimeError(
+                        f"pull range mismatch: dst={len(job.dst_addrs)} "
+                        f"len={len(job.lengths)} src={len(job.src_addrs)}"
+                    )
+                job.pull_t0 = time.perf_counter()
+                ret = self.engine.batch_transfer_sync_read(
+                    job.sender_te_path, job.dst_addrs, job.src_addrs, job.lengths
+                )
+                job.pull_ms = _perf_ms(job.pull_t0)
+                if ret < 0:
+                    raise RuntimeError(
+                        f"batch_transfer_sync_read failed ret={ret} peer={job.sender_te_path} reqs={job.req_ids}"
+                    )
+            elif job.sender_te_path or job.src_addrs:
+                # 两端模式不一致(P 是 pull, 本端是 push): 数据还在 P 的 staging 里
+                # 没发过来, 这里 H2D 只会拷到旧内容 —— 直接拒.
+                raise RuntimeError(
+                    "got pull-style LAYER_DONE (src/te_path 非空) but local mode is push; "
+                    "VLLM_ASCEND_LAYERWISE_TRASPORT_MODE 两端必须一致"
+                )
+            job.h2d_t0 = time.perf_counter()
+            global_te.sync_cpu_to_npu_for_transfer(job.dst_addrs, job.lengths)
+            job.h2d_only_ms = _perf_ms(job.h2d_t0)
+            job.ok = True
+        except Exception as e:  # noqa: BLE001
+            job.ok = False
+            job.err = f"{type(e).__name__}: {e}"
+            # 失败路径没有可信的 H2D 段, 置 None 而不是用相减凑一个.
+            job.h2d_only_ms = None
+
+    def _finish_recv_job(self, sock, job: "_RecvJob") -> None:
+        """回 ACK/NAK + 请求级簿记 + 打点(内联与池两条路径共用, 只在收线程执行)."""
+        if not job.ok:
+            logger.error(
+                "LAYER_DONE_SENDING_MSG pull/H2D failed: %s. reqs=%s ranges=%d",
+                job.err,
+                job.req_ids,
+                len(job.dst_addrs),
+            )
+        layer_reply = b"ACK" if job.ok else b"NAK"
+        try:
+            sock.send_multipart((job.identity, b"", layer_reply))
+        except Exception as e:  # noqa: BLE001
+            # 对端可能已超时/断开(REQ 套接字已销毁, ROUTER 会丢弃); 不能因此丢掉
+            # 簿记 —— 该请求仍要按结果作废或放行, P 侧会自行重试.
+            logger.error("Failed to reply %r to peer: %s", layer_reply, e)
+        ack_ts = time.perf_counter()
+        if job.ok:
+            # 就地判定请求级完成/失败: 与 H2D 同一处理点, 省掉 P 侧单独一次请求级
+            # DONE/FAILED 往返. 失败时 P 侧不再补发, 由这里(NAK 分支)直接作废重试.
+            self.apply_layer_done_meta(job.done_list, job.sender_path)
+        else:
+            for ext_req in job.req_ids:
+                self.update_failed_task(ext_req)
+        if _PERF_LOG:
+            # ts 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC); pull = 本端从 P 的
+            # staging 拉数据(起点 pull_t0), h2d_only = 拉完之后往 NPU 拷的那一段
+            # (起点 h2d_t0) —— 两段各自实测、互不包含; NAK 路径 h2d_only 为 None.
+            # h2d 保留"recv0 → H2D 完成"的旧口径以便与历史日志对比. total 覆盖
+            # 收到消息 → H2D → ACK 发出(ack_ts); 池化后 total 含在池内的排队等待,
+            # 与 h2d(同为 t_recv0 起算但止于完成) 的差即等待占比.
+            h2d_ms = _perf_ms(job.t_recv0)
+            h2h_perf.emit(
+                "d_batch",
+                ts=job.t_recv0,
+                role="consumer",
+                reqs=list(job.req_ids),
+                ranges=len(job.dst_addrs),
+                pull=job.pull_ms,
+                pull_t0=job.pull_t0,
+                h2d_only=job.h2d_only_ms,
+                h2d_t0=job.h2d_t0,
+                h2d=h2d_ms,
+                total=_perf_ms(job.t_recv0),
+                ack_ts=ack_ts,
+                ack=job.ok,
+                sender=job.sender_path,
+            )
+            # 请求级累计(批共享口径): 该批 h2d 计入消息内全部请求.
+            for ext_req in job.req_ids:
+                acc = self._perf_d_req.get(ext_req)
+                if acc is None:
+                    acc = {"n": 0.0, "h2d": 0.0, "t_first": job.t_recv0}
+                    self._perf_d_req[ext_req] = acc
+                acc["n"] += 1
+                acc["h2d"] += h2d_ms
+
+    def _drain_wakeup(self) -> None:
+        """清空唤醒通道. 先清唤醒再清完成队列: worker 先入队后写字节, 因此"清唤醒
+        时看到空"⇒ 此刻队列里不会有"已写字节却没被本趟看到"的完成项."""
+        try:
+            while True:
+                if not self._wake_r.recv(4096):  # type: ignore[union-attr]
+                    break
+        except BlockingIOError:
+            pass
+
+    def _complete_recv_jobs(self, sock) -> None:
+        """收线程: 消化池内已完成的 LAYER_DONE(回 ACK/NAK + 簿记 + 打点)."""
+        while True:
+            try:
+                job = self._recv_done.get_nowait()
+            except queue.Empty:
+                break
+            self._finish_recv_job(sock, job)
+
     def run(self):
         """Run the thread to handle KV cache transfer requests."""
         # LAYER_DONE H2D 在本线程执行 (sync_cpu_to_npu_for_transfer), 必须显式
@@ -1884,11 +2112,27 @@ class KVCacheRecvingLayerThread(threading.Thread):
         logger.info("KVCacheRecvingLayerThread listening on %s, tp_rank=%d", path, self.tp_rank)
         encoder = msgspec.msgpack.Encoder()
         encoded_data = encoder.encode(self.metadata)
+        if _RECV_POOL > 0:
+            self._start_recv_pool()
         with zmq_ctx(zmq.ROUTER, path) as sock:  # type: ignore
             self.ready_event.set()
             decoder = msgspec.msgpack.Decoder(type=tuple)
+            poller: zmq.Poller | None = None  # type: ignore
+            if self._recv_jobs is not None:
+                # 池开启: 收线程在"新消息"与"池内完成"两个事件源上等 —— 完成即被
+                # socketpair 叫醒, 因此 poll 超时只兜底"丢唤醒", 不参与 ACK 时延.
+                poller = zmq.Poller()
+                poller.register(sock, zmq.POLLIN)
+                poller.register(self._wake_r, zmq.POLLIN)  # type: ignore
             while True:
                 try:
+                    if poller is not None:
+                        events = dict(poller.poll(_RECV_POLL_MS))
+                        # 先清唤醒再清完成队列(顺序约定见 _drain_wakeup).
+                        self._drain_wakeup()
+                        self._complete_recv_jobs(sock)
+                        if sock not in events:
+                            continue
                     frames = sock.recv_multipart()
                     if len(frames) < 2:
                         logger.error(
@@ -1954,102 +2198,28 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         peer_src_addrs = msg[6] if len(msg) > 6 else ()
                         sender_te_path = msg[7] if len(msg) > 7 else ""
                         logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(layer_dst_addrs))
-                        t_recv0 = time.perf_counter()
-                        pull_ms = 0.0
-                        # perf: H2H read(pull) 与 H2D 的绝对起点与耗时各自独立测量
-                        # (过去 h2d = recv→H2D 完成, 把 pull 也算进去了).
-                        t_pull0: float | None = None
-                        t_h2d0: float | None = None
-                        h2d_only_ms: float | None = None
-                        layer_reply = b"ACK"
-                        try:
-                            if _PULL_MODE:
-                                # pull: 主动从 P 的本端 staging 拉数据到本端 staging.
-                                # sync_read 返回即字节已落本地 ⇒ push 路径上那个
-                                # "信号跑在批量数据前面"的竞态不存在, 不需要 crc 自校验.
-                                if not peer_src_addrs or not sender_te_path:
-                                    raise RuntimeError(
-                                        "pull mode requires src_addrs+sender_te_path in LAYER_DONE "
-                                        f"(src={len(peer_src_addrs)} te_path={sender_te_path!r}); "
-                                        "P 侧是否也是 pull 模式?"
-                                    )
-                                if not (len(peer_src_addrs) == len(layer_lengths) == len(layer_dst_addrs)):
-                                    raise RuntimeError(
-                                        f"pull range mismatch: dst={len(layer_dst_addrs)} "
-                                        f"len={len(layer_lengths)} src={len(peer_src_addrs)}"
-                                    )
-                                t_pull0 = time.perf_counter()
-                                ret = self.engine.batch_transfer_sync_read(
-                                    sender_te_path, layer_dst_addrs, peer_src_addrs, layer_lengths
-                                )
-                                pull_ms = _perf_ms(t_pull0)
-                                if ret < 0:
-                                    raise RuntimeError(
-                                        f"batch_transfer_sync_read failed ret={ret} peer={sender_te_path} "
-                                        f"reqs={layer_req_ids}"
-                                    )
-                            elif sender_te_path or peer_src_addrs:
-                                # 两端模式不一致(P 是 pull, 本端是 push): 数据还在 P 的
-                                # staging 里没发过来, 这里 H2D 只会拷到旧内容 —— 直接拒.
-                                raise RuntimeError(
-                                    "got pull-style LAYER_DONE (src/te_path 非空) but local mode is push; "
-                                    "VLLM_ASCEND_LAYERWISE_TRASPORT_MODE 两端必须一致"
-                                )
-                            t_h2d0 = time.perf_counter()
-                            global_te.sync_cpu_to_npu_for_transfer(layer_dst_addrs, layer_lengths)
-                            h2d_only_ms = _perf_ms(t_h2d0)
-                            h2d_ms = _perf_ms(t_recv0)
-                        except Exception as e:
-                            logger.error(
-                                "LAYER_DONE_SENDING_MSG H2D failed: %s. msg=%s",
-                                e,
-                                msg,
-                            )
-                            layer_reply = b"NAK"
-                            h2d_ms = _perf_ms(t_recv0)
-                            # 失败路径没有可信的 H2D 段, 置 None 而不是用相减凑一个.
-                            h2d_only_ms = None
-                        sock.send_multipart((identity, b"", layer_reply))
-                        ack_ts = time.perf_counter()
-                        if layer_reply == b"ACK":
-                            # 就地判定请求级完成/失败: 与 H2D 同一处理点, 省掉 P 侧
-                            # 单独一次请求级 DONE/FAILED 往返. 失败时 P 侧不再补发,
-                            # 由这里(NAK 分支)直接作废重试.
-                            self.apply_layer_done_meta(done_list, sender_path)
+                        job = _RecvJob(
+                            identity=identity,
+                            sender_path=sender_path,
+                            req_ids=layer_req_ids,
+                            dst_addrs=layer_dst_addrs,
+                            lengths=layer_lengths,
+                            done_list=done_list,
+                            src_addrs=peer_src_addrs,
+                            sender_te_path=sender_te_path,
+                            t_recv0=time.perf_counter(),
+                        )
+                        if self._recv_jobs is not None:
+                            # MC_TCP_RECV_POOL>0: 数据面(pull+H2D)交池, 本线程继续收包;
+                            # 完成项由 _complete_recv_jobs 回 ACK/NAK 并做簿记/打点.
+                            # 队列无上限: 在飞任务数被 REQ-REP 限死(= session 数),
+                            # 不会堆积.
+                            self._recv_jobs.put(job)
                         else:
-                            for ext_req in layer_req_ids:
-                                self.update_failed_task(ext_req)
-                        if _PERF_LOG:
-                            # ts 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC);
-                            # pull = 本端从 P 的 staging 拉数据(属 H2H read, 起点
-                            # pull_t0), h2d_only = 拉完之后往 NPU 拷的那一段(起点
-                            # h2d_t0) —— 两段各自实测、互不包含; NAK 路径 h2d_only
-                            # 为 None. h2d 保留"recv0 → H2D 完成"的旧口径以便与历史
-                            # 日志对比. total 覆盖 收到消息 → H2D → ACK 发出(ack_ts).
-                            h2h_perf.emit(
-                                "d_batch",
-                                ts=t_recv0,
-                                role="consumer",
-                                reqs=list(layer_req_ids),
-                                ranges=len(layer_dst_addrs),
-                                pull=pull_ms,
-                                pull_t0=t_pull0,
-                                h2d_only=h2d_only_ms,
-                                h2d_t0=t_h2d0,
-                                h2d=h2d_ms,
-                                total=_perf_ms(t_recv0),
-                                ack_ts=ack_ts,
-                                ack=layer_reply == b"ACK",
-                                sender=sender_path,
-                            )
-                            # 请求级累计(批共享口径): 该批 h2d 计入消息内全部请求.
-                            for ext_req in layer_req_ids:
-                                acc = self._perf_d_req.get(ext_req)
-                                if acc is None:
-                                    acc = {"n": 0.0, "h2d": 0.0, "t_first": t_recv0}
-                                    self._perf_d_req[ext_req] = acc
-                                acc["n"] += 1
-                                acc["h2d"] += h2d_ms
+                            # 默认: 本线程内联执行(与 _run_recv_job/_finish_recv_job
+                            # 同一份实现, 语义与历史上一致).
+                            self._run_recv_job(job)
+                            self._finish_recv_job(sock, job)
                     else:
                         logger.error(
                             "Unexpected message type: %s. expected GET_META_MSG, "

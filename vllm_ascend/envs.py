@@ -134,6 +134,15 @@ env_variables: dict[str, Callable[[], Any]] = {
     # max_peer, 并省掉每批每 peer 一次 TCP 建连(ZMQ 建连也顺带从每批一次变为
     # 每 peer 一次). 只改 P 侧发送方式, 两端协议与 ACK 语义不变.
     "MC_TCP_LD_CONCURRENT": lambda: os.getenv("MC_TCP_LD_CONCURRENT", "0") == "1",
+    # D 侧 KVCacheRecvingLayerThread 的 LAYER_DONE 执行线程数(仅 protocol=tcp 的
+    # p_then_d 路径): 0(默认)=收线程内联执行"反向 sync_read + H2D", 与旧行为一致;
+    # n>0=收线程只解析消息与回 ACK, 数据面交 n 个常驻 worker 执行 —— 不同 session
+    # 的 pull 与 H2D 因此互相重叠(一个 session 在等 H2D 时另一个可在传数据).
+    # 有效并发度受 REQ-REP 限制(= 同时在飞的 LAYER_DONE 条数 = 映射到本 rank 的
+    # P rank 数), 故按 session 数开即可(当前部署 2, 建议 2~4, 开大只有争抢).
+    # 代价: mooncake 的 sync_read 是忙等(GIL 已释放), 每个在等 transfer 的 worker
+    # 占 ~1 核 —— 需与 BIND_LAYERWISE_CONNECTOR 划出的传输核预算一起看.
+    "MC_TCP_RECV_POOL": lambda: int(os.getenv("MC_TCP_RECV_POOL", "0")),
     # 分层(layerwise)KV 连接器传输线程绑核: 1=开启. 开启后 cpu_binding 从 worker
     # 的 main 核池末尾划出 2 个核, 专供 KVCacheSendingLayerThread(P 发) /
     # KVCacheRecvingLayerThread(D 收) / KVCachePipeWriter 等传输线程; 其余线程
