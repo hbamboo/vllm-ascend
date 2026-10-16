@@ -55,6 +55,7 @@ def _make_scheduler() -> MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
     )
     scheduler._reqs_send_inflight = set()
     scheduler._reqs_need_send = {}
+    scheduler._send_promised = SizedDict()
     return scheduler
 
 

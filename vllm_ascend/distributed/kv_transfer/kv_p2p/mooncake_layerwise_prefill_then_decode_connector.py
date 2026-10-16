@@ -2003,8 +2003,7 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     )
                 if not (len(job.src_addrs) == len(job.lengths) == len(job.dst_addrs)):
                     raise RuntimeError(
-                        f"pull range mismatch: dst={len(job.dst_addrs)} "
-                        f"len={len(job.lengths)} src={len(job.src_addrs)}"
+                        f"pull range mismatch: dst={len(job.dst_addrs)} len={len(job.lengths)} src={len(job.src_addrs)}"
                     )
                 job.pull_t0 = time.perf_counter()
                 ret = self.engine.batch_transfer_sync_read(
@@ -2623,6 +2622,11 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
         # 已判定延迟释放、等 worker 上报 finished_sending 的请求(req_id -> 判定
         # 时刻): 每步经 metadata.requests_to_send 下发, 上报后摘除。
         self._reqs_need_send: dict[str, float] = {}
+        # 本 connector 承诺过延迟释放的 req_id(墓碑, 只增不减): 用来在
+        # update_connector_output 里辨认"本 connector 的过期上报"。scheduler 对未知
+        # req_id 的处理是直接 assert, 而超时强杀/复活登记可能上报一个早已了结的请求
+        # —— 一条簿记错乱不该把 EngineCore 打死(见 update_connector_output)。
+        self._send_promised: SizedDict = SizedDict()
         self.need_truncate = self._has_attn_mamba_hybrid_cache(kv_cache_config)
         self.executor = ThreadPoolExecutor(32)
         tls_config: dict[str, Any] = vllm_config.kv_transfer_config.get_from_extra_config("tls_config", {})
@@ -3100,11 +3104,34 @@ class MooncakeLayerwisePrefillThenDecodeConnectorScheduler:
             return False, None
         self._reqs_send_inflight.discard(req_id)
         self._reqs_need_send[req_id] = time.time()
+        self._send_promised[req_id] = True
         logger.debug("Delaying free of KV blocks for request %s until its last send batch is acked", req_id)
         return True, None
 
     def update_connector_output(self, connector_output: "KVConnectorOutput") -> None:
-        """worker 上报发完后, 延迟释放的这些请求才真正归还给 free queue。"""
+        """worker 上报发完后, 延迟释放的这些请求才真正归还给 free queue。
+
+        放行前先滤掉本 connector 的**过期上报**: 只丢弃"我承诺过延迟释放、但此刻
+        已不在等上报"的 req_id —— 即本步之前就已经了结的请求。scheduler 的
+        `_update_from_kv_xfer_finished` 对未知 req_id 是直接 assert, 而这类过期上报
+        是会真实发生的(async scheduling 下 scheduler 先为本步之后排新批、后应用本步
+        的 worker 上报; 超时强杀路径也会上报一个早已释放的请求), 一旦下发就会打死
+        EngineCore。只丢自己的、且只丢已经了结的, 其它 connector(MultiConnector
+        组合)的条目原样放行。
+        """
+        finished = connector_output.finished_sending
+        if finished:
+            stale = {
+                req_id for req_id in finished if req_id in self._send_promised and req_id not in self._reqs_need_send
+            }
+            if stale:
+                logger.warning(
+                    "Dropped %d stale finished_sending report(s) settled before this step (would trip the "
+                    "scheduler's unknown-req assertion): %s",
+                    len(stale),
+                    sorted(stale)[:8],
+                )
+                connector_output.finished_sending = finished - stale
         for req_id in connector_output.finished_sending or ():
             self._reqs_need_send.pop(req_id, None)
 
@@ -3692,6 +3719,11 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
         重发 —— 已登记的保留首次登记时刻, 不刷新超时起点。
         本 rank 对该请求没有数据要发的(末 chunk 时已记入 _send_has_data), 直接
         判完成: 没有发送线程的完成信号可等。
+
+        这里**不**对"已上报过的 id"设墓碑: 重发比上报晚到时(见 scheduler 侧
+        update_connector_output 的过期上报), 重新登记会让它超时强杀掉, 那次上报
+        在 scheduler 侧会被滤掉 —— 这正是"上报在半路丢了"时的兜底恢复路径
+        (超时强杀 => 再上报一次 => 块最终被归还), 不能掐掉。
         """
         if not req_ids:
             return
