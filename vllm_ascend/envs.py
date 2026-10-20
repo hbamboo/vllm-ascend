@@ -146,6 +146,13 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 代价: mooncake 的 sync_read 是忙等(GIL 已释放), 每个在等 transfer 的 worker
     # 占 ~1 核 —— 需与 BIND_LAYERWISE_CONNECTOR 划出的传输核预算一起看.
     "MC_TCP_RECV_POOL": lambda: int(os.getenv("MC_TCP_RECV_POOL", "0")),
+    # D 侧 H2D 的完成同步方式(仅 protocol=tcp 的逐层路径): 0(默认)=拷贝后
+    # stream.synchronize()(整条拷贝流); 1=提交后在拷贝流上记 event, 回 ACK 前
+    # event.synchronize()(只等本请求这一笔). 微基准(test_script/layerwise_parallel/
+    # kv_bw_probe, 30MiB/批, S=1..16)显示: 两者在 30MiB 批量下无差别 —— 拷贝流上
+    # 的 FIFO 排队决定了总时长, 而 event 每条多 ~0.15ms 开销, 故默认关闭; 线上
+    # H2D 被计算显著拖慢(单批 ~18ms)时可在真实负载上再评估.
+    "MC_TCP_H2D_EVENT": lambda: os.getenv("MC_TCP_H2D_EVENT", "0") == "1",
     # 分层(layerwise)KV 连接器传输线程绑核: 1=开启. 开启后 cpu_binding 从 worker
     # 的 main 核池末尾划出 2 个核, 专供 KVCacheSendingLayerThread(P 发) /
     # KVCacheRecvingLayerThread(D 收) / KVCachePipeWriter 等传输线程; 其余线程

@@ -138,6 +138,7 @@ _LD_CONCURRENT = envs.MC_TCP_LD_CONCURRENT
 # session 数, 每个忙等占 ~1 核, 故按 session 数开(当前部署 2 个 peer 即可, 建议
 # 2~4). 详见 envs.py 注释.
 _RECV_POOL = envs.MC_TCP_RECV_POOL
+_H2D_EVENT = envs.MC_TCP_H2D_EVENT
 # 池开启时收线程 poll 的超时(ms): 只兜底"完成事件丢唤醒"的极端情况 —— worker
 # 完成即写 socketpair 唤醒, 正常路径不受此值影响.
 _RECV_POLL_MS = 100
@@ -367,6 +368,8 @@ class _RecvJob:
     pull_ms: float = 0.0
     h2d_t0: float | None = None
     h2d_only_ms: float | None = None
+    # H2D 改为"提交 + event"后的完成凭据: 由执行方记录, 收线程在回 ACK 前 wait.
+    h2d_event: Any = None
 
 
 class KVCacheSendingLayerThread(threading.Thread):
@@ -2022,8 +2025,13 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     "VLLM_ASCEND_LAYERWISE_TRASPORT_MODE 两端必须一致"
                 )
             job.h2d_t0 = time.perf_counter()
-            global_te.sync_cpu_to_npu_for_transfer(job.dst_addrs, job.lengths)
-            job.h2d_only_ms = _perf_ms(job.h2d_t0)
+            if _H2D_EVENT:
+                # 提交 + event: 不在 worker 里等整条拷贝流, 由收线程回 ACK 前只等
+                # 本请求这一笔(见 _finish_recv_job). 默认关闭, 见 envs.MC_TCP_H2D_EVENT.
+                job.h2d_event = global_te.submit_cpu_to_npu_for_transfer(job.dst_addrs, job.lengths)
+            else:
+                global_te.sync_cpu_to_npu_for_transfer(job.dst_addrs, job.lengths)
+                job.h2d_only_ms = _perf_ms(job.h2d_t0)
             job.ok = True
         except Exception as e:  # noqa: BLE001
             job.ok = False
@@ -2033,6 +2041,15 @@ class KVCacheRecvingLayerThread(threading.Thread):
 
     def _finish_recv_job(self, sock, job: "_RecvJob") -> None:
         """回 ACK/NAK + 请求级簿记 + 打点(内联与池两条路径共用, 只在收线程执行)."""
+        if job.ok and job.h2d_event is not None:
+            # 只等本请求这一笔 H2D 写完(不是整条拷贝流): ACK 与请求级簿记都必须在
+            # 数据真正落到 NPU 之后, 否则 D 侧可能带着旧 KV 进入 decode.
+            try:
+                job.h2d_event.synchronize()
+                job.h2d_only_ms = _perf_ms(job.h2d_t0)
+            except Exception as e:  # noqa: BLE001
+                job.ok = False
+                job.err = f"h2d event wait failed: {type(e).__name__}: {e}"
         if not job.ok:
             logger.error(
                 "LAYER_DONE_SENDING_MSG pull/H2D failed: %s. reqs=%s ranges=%d",

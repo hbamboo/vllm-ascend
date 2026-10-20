@@ -711,7 +711,13 @@ class GlobalTE:
         )
         return copied_bytes
 
-    def _sync_cpu_to_npu_regions(self, cpu_addrs: list[int], lengths: list[int]) -> None:
+    def _sync_cpu_to_npu_regions(
+        self,
+        cpu_addrs: list[int],
+        lengths: list[int],
+        sync: bool = True,
+        event: "torch.npu.Event | None" = None,
+    ) -> None:
         """Region-mode H2D: map staging addrs back to NPU ranges and batch-copy."""
         t0 = time.perf_counter()
         # H2D 写入的是 D 端 KV cache 的块, 必须与计算流排序 —— 该排序已由拷贝提交处
@@ -734,7 +740,7 @@ class GlobalTE:
             dst_ptrs.append(npu_addr)
             sizes.append(byte_size)
             total_bytes += byte_size
-        self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_H2D)
+        self.submit_dma_copy_ptrs(src_ptrs, dst_ptrs, sizes, _DIRECTION_H2D, sync=sync, event=event)
         # perf: D 侧 H2D(region 路径). 与 connector 的 d_batch.h2d_only 互为独立
         # 测量: 这里只含地址映射 + 批量 DMA + 拷贝流同步, 不含 pull read.
         h2h_perf.emit(
@@ -778,11 +784,17 @@ class GlobalTE:
         _safe_copy_cpu_to_npu(npu_tensor, cpu_view, actual_size, 0)
         torch.npu.synchronize()
 
-    def sync_cpu_to_npu_for_transfer(self, src_addrs: list[int], lengths: list[int]):
+    def sync_cpu_to_npu_for_transfer(
+        self,
+        src_addrs: list[int],
+        lengths: list[int],
+        sync: bool = True,
+        event: "torch.npu.Event | None" = None,
+    ):
         if not self._cpu_tensors:
             return
         if self._region_mode:
-            self._sync_cpu_to_npu_regions(src_addrs, lengths)
+            self._sync_cpu_to_npu_regions(src_addrs, lengths, sync=sync, event=event)
             return
         cpu_tensor = self._cpu_tensors[0]
         cpu_base = cpu_tensor.data_ptr()
@@ -813,7 +825,7 @@ class GlobalTE:
                     synced.add(npu_ptr)
                     break
         # 一次 aclrtMemcpyBatchAsync 批量 H2D; 内部只同步专用拷贝流.
-        self.submit_dma_copy(items, direction=_DIRECTION_H2D)
+        self.submit_dma_copy(items, direction=_DIRECTION_H2D, sync=sync, event=event)
         if synced:
             # perf: D 侧 H2D(per-view 路径): TCP get / pull read 完成后把 staging
             # 数据拷回 NPU. 与 connector 的 d_batch.h2d_only 互为独立测量.
@@ -826,6 +838,19 @@ class GlobalTE:
                 tensors=len(synced),
                 ms=(time.perf_counter() - t0) * 1e3,
             )
+
+    def submit_cpu_to_npu_for_transfer(self, src_addrs: list[int], lengths: list[int]):
+        """提交 H2D 但**不等待**, 返回拷贝流上的 event(无 staging 时返回 None).
+
+        调用方在回 ACK / 做请求级簿记之前 `event.synchronize()`, 只等**本请求**
+        这一笔拷贝写完; 而 `stream.synchronize()` 会连拷贝流上其它 session 随后
+        提交的拷贝一起等, 多 session 并发时把互不相关的请求串行化.
+        """
+        if not self._cpu_tensors:
+            return None
+        ev = torch.npu.Event()
+        self.sync_cpu_to_npu_for_transfer(src_addrs, lengths, sync=False, event=ev)
+        return ev
 
     def stop_bg_sync(self):
         self._bg_sync_stop.set()
@@ -852,6 +877,7 @@ class GlobalTE:
         items: list[tuple[torch.Tensor, int, torch.Tensor, int]],
         direction: int,
         sync: bool = True,
+        event: "torch.npu.Event | None" = None,
     ) -> None:
         """批量提交 NPU<->CPU staging 区间拷贝.
 
@@ -893,6 +919,10 @@ class GlobalTE:
                         torch.from_numpy(sizes),
                         direction,
                     )
+                    if event is not None:
+                        # 在拷贝流上、紧跟本批拷贝记录: 等它 = 只等本批写完,
+                        # 不会被拷贝流上随后提交的其它 session 拷贝拖住.
+                        event.record(stream)
                 if sync:
                     stream.synchronize()
                 return
@@ -924,6 +954,7 @@ class GlobalTE:
         sizes: list[int],
         direction: int,
         sync: bool = True,
+        event: "torch.npu.Event | None" = None,
     ) -> None:
         """Region-mode batch NPU<->CPU staging copy over raw byte addresses.
 
@@ -956,6 +987,9 @@ class GlobalTE:
         size_t = torch.from_numpy(np.asarray(sizes, dtype=np.int64))
         with torch.npu.stream(stream):
             torch.ops._C_ascend.swap_blocks_batch(src_t, dst_t, size_t, direction)
+            if event is not None:
+                # 只等本批: 与 stream.synchronize 不同, 不包含随后提交的其它拷贝.
+                event.record(stream)
         if sync:
             stream.synchronize()
 
