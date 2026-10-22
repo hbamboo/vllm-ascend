@@ -127,16 +127,6 @@ env_variables: dict[str, Callable[[], Any]] = {
     "MC_TCP_PIPE_WRITER": lambda: os.getenv("MC_TCP_PIPE_WRITER", "0") == "1",
     # 写队列深度(允许在飞的 write 批数上限, 兼作背压).
     "MC_TCP_PIPE_DEPTH": lambda: int(os.getenv("MC_TCP_PIPE_DEPTH", "2")),
-    # 逐层 LAYER_DONE(P→D 的每批控制信号)发送方式(仅 protocol=tcp 的 p_then_d 路径):
-    # 0=旧行为: 每 peer 新建一次 ZMQ REQ 连接, 逐 peer 串行阻塞完成 REQ-REP 往返;
-    # 1=按 peer 常驻 REQ 连接 + 「每个 session 刷完自己的 D2H 就立即发它的 LAYER_DONE,
-    #   ACK 最后统一收」—— 各 session 的发送与等待因此互相并行: 远端对已发出 session
-    #   的 pull/H2D 与本批其它 session 尚未完成的 D2H flush 重叠, 也不再每批每 peer
-    #   一次 TCP 建连(ZMQ 建连从每批一次变为每 peer 一次).
-    #   (注意不要改成"攒齐全批再统一发": 那等于在 flush 之后插了一道同步屏障, 会把
-    #   上面这段重叠丢掉。)
-    # 只改 P 侧发送方式, 两端协议、payload 与 ACK 语义不变.
-    "MC_TCP_LD_CONCURRENT": lambda: os.getenv("MC_TCP_LD_CONCURRENT", "0") == "1",
     # D 侧 KVCacheRecvingLayerThread 的 LAYER_DONE 执行线程数(仅 protocol=tcp 的
     # p_then_d 路径): 0(默认)=收线程内联执行"反向 sync_read + H2D", 与旧行为一致;
     # n>0=收线程只解析消息与回 ACK, 数据面交 n 个常驻 worker 执行 —— 不同 session
