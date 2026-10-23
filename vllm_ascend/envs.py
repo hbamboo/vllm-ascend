@@ -136,6 +136,17 @@ env_variables: dict[str, Callable[[], Any]] = {
     # 代价: mooncake 的 sync_read 是忙等(GIL 已释放), 每个在等 transfer 的 worker
     # 占 ~1 核 —— 需与 BIND_LAYERWISE_CONNECTOR 划出的传输核预算一起看.
     "MC_TCP_RECV_POOL": lambda: int(os.getenv("MC_TCP_RECV_POOL", "0")),
+    # 逐层 LAYER_DONE 的 step 级 ACK（仅 protocol=tcp 的 p_then_d 路径）:
+    # 0(默认)=旧行为，每条 LAYER_DONE 同步 REQ-REP，P 逐批等待 ACK；
+    # 1=同一步内 P 连续发送（DEALER，不等中间 ACK），D 只在收到该 step 最后一条
+    # LAYER_DONE、且该 step 全部 job 完成后回一个 ACK；任一 job 失败立即回 NAK。
+    # 目标：让 D 的 pull/H2D 与 P 的后续 flush 跨批重叠，step 边界统一 drain。
+    # 注意：需要 P/D 两端同时升级；旧 D 会按旧协议逐条回 ACK，新 P 的 DEALER
+    # 无法与之间混部。
+    "MC_TCP_STEP_ACK": lambda: os.getenv("MC_TCP_STEP_ACK", "0") == "1",
+    # pull 模式下 D 侧 batch_transfer_sync_read 失败后的重试次数（不含首次）。
+    # 只在最终失败时回 NAK；重试前 staging 在整个 step 内保持稳定，可整段重读。
+    "MC_TCP_LD_RETRY": lambda: int(os.getenv("MC_TCP_LD_RETRY", "2")),
     # D 侧 H2D 的完成同步方式(仅 protocol=tcp 的逐层路径): 0(默认)=拷贝后
     # stream.synchronize()(整条拷贝流); 1=提交后在拷贝流上记 event, 回 ACK 前
     # event.synchronize()(只等本请求这一笔). 微基准(test_script/layerwise_parallel/

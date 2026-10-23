@@ -134,6 +134,11 @@ _PIPE_DEPTH = int(os.getenv("MC_TCP_PIPE_DEPTH", "2"))
 # 2~4). 详见 envs.py 注释.
 _RECV_POOL = envs.MC_TCP_RECV_POOL
 _H2D_EVENT = envs.MC_TCP_H2D_EVENT
+# step 级 ACK: 同一步内 P 连续发 LAYER_DONE(DEALER), 只在该 step 最后一条消息
+# 完成后由 D 回一个 ACK; 中间失败立即 NAK. 详见 envs.py 注释.
+_STEP_ACK = envs.MC_TCP_STEP_ACK
+# pull 失败后的 D 侧重试次数(不含首次).
+_LD_RETRY = envs.MC_TCP_LD_RETRY
 # 池开启时收线程 poll 的超时(ms): 只兜底"完成事件丢唤醒"的极端情况 —— worker
 # 完成即写 socketpair 唤醒, 正常路径不受此值影响.
 _RECV_POLL_MS = 100
@@ -335,6 +340,8 @@ class _PipeJob:
     write_win1: float | None = None
     # session_id -> 该 session 写失败涉及的 req ids (与单线程版 ret<0 语义一致).
     failed: dict[str, list[str]] = field(default_factory=dict)
+    # 本批是否是某一 step 的最后一批: True 时 finalize 后要 drain step ACK.
+    step_end: bool = False
 
 
 @dataclass
@@ -355,6 +362,10 @@ class _RecvJob:
     src_addrs: Any
     sender_te_path: str
     t_recv0: float
+    # step 级 ACK 扩展: 旧 P(8 元组)不带这些字段, 默认 "每条都 ACK" 的旧语义.
+    seq: int = -1
+    step_id: int = -1
+    step_last: bool = True
     # 以下由执行方(池 worker 或内联)填充:
     ok: bool = False
     err: str = ""
@@ -465,6 +476,27 @@ class KVCacheSendingLayerThread(threading.Thread):
         self._done_queue: queue.Queue[Any] | None = None
         self._pipe_inflight = 0
         self._pipe_writer: threading.Thread | None = None
+        # MC_TCP_STEP_ACK=1: 每 peer 一条常驻 DEALER, 同一步内连续发 LAYER_DONE,
+        # 不等中间 ACK; step 边界统一 drain. 只在发送线程内使用, 无需加锁.
+        self._ld_ctx: zmq.Context | None = None  # type: ignore
+        self._peer_dealers: dict[tuple[str, int], Any] = {}
+        # (host, port) -> [(seq, {external_req_id: internal_req_id}), ...]
+        # 本 step 已发未确认的消息; NAK 时用这张表把 external id 映射回内部 id.
+        self._ld_outstanding: dict[tuple[str, int], list[tuple[int, dict[str, str]]]] = {}
+        self._step_id = 0
+        # (host, port) -> 本 step 内下一条 LAYER_DONE 的序号.
+        self._step_seq: dict[tuple[str, int], int] = {}
+        # 当前是否还有未收尾的 step: 上一个 step 的末批可能因队列满而先发出,
+        # 下一 step 的第一个 task 到来时需要先 drain(pipe + step ACK).
+        self._step_open = False
+        self._last_task_layer_idx = -1
+        # step ACK: 首 token / on_send_done / on_transfer_done 必须等 step ACK
+        # (D 已 H2D)之后再发, 否则失败重算时 D 可能复用上一次的首 token.
+        # 元素: (send_task, req_id, req_meta, is_last_layer, layer_group_idx).
+        self._step_pending_done: list[tuple[Any, str, Any, bool, int]] = []
+        self._ld_encoder = msgspec.msgpack.Encoder()
+        # 本 step 中发送就失败过的 peer: 不再等它的 step ACK, 直接判失败.
+        self._ld_send_failed: set[tuple[str, int]] = set()
 
     def run(self):
         local_rank = get_world_group().local_rank
@@ -503,19 +535,36 @@ class KVCacheSendingLayerThread(threading.Thread):
                 send_task = self.send_queue.get()
             is_last = send_task.layer_idx == (self.total_layers - 1)
             if pending and send_task.layer_idx != pending[-1].layer_idx + 1:
-                self._handle_batch(pending)
+                # 层号断裂 = 上一个 step 结束(包括本 rank 没有末层数据的情况):
+                # 先把上一批按 step 末批处理, 等它的 step ACK, 再开始新 step.
+                self._handle_batch(pending, step_end=True)
                 pending = []
+                self._step_open = False
+            elif not pending and self._step_open and send_task.layer_idx != self._last_task_layer_idx + 1:
+                # 上一 step 的末批已经因队列满按 step_end=False 发出: 这里补收尾
+                # (先等 pipe 写完, 再给每个 peer 补空 step_last 标记并收 ACK).
+                if self.use_pipe_writer:
+                    self._pipe_drain(block=True)
+                if _STEP_ACK:
+                    self._close_step_with_markers()
+                self._step_open = False
             pending.append(send_task)
-            if is_last or len(pending) >= self.max_batch_layers:
-                self._handle_batch(pending)
+            self._step_open = True
+            self._last_task_layer_idx = send_task.layer_idx
+            if is_last:
+                self._handle_batch(pending, step_end=True)
+                pending = []
+                self._step_open = False
+            elif len(pending) >= self.max_batch_layers:
+                self._handle_batch(pending, step_end=False)
                 pending = []
 
-    def _handle_batch(self, tasks: list[SendTask]):
+    def _handle_batch(self, tasks: list[SendTask], step_end: bool = False):
         try:
             if self.use_pipe_writer:
-                self._transfer_kv_cache_batch_pipe(tasks)
+                self._transfer_kv_cache_batch_pipe(tasks, step_end=step_end)
             else:
-                self._transfer_kv_cache_batch(tasks)
+                self._transfer_kv_cache_batch(tasks, step_end=step_end)
         except Exception as e:
             logger.error(
                 "Failed to transfer KV cache batch. layer_idx=%s, error=%s. Check transfer engine and memory state.",
@@ -795,7 +844,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                 )
                 return
 
-    def _transfer_kv_cache_batch(self, tasks: list[SendTask]):
+    def _transfer_kv_cache_batch(self, tasks: list[SendTask], step_end: bool = False):
         """批量传输攒齐的多个层任务: 跨任务合并 ranges 后, 每 session 一次
         D2H flush + 一次 sync_write + 每 peer 一次 LAYER_DONE(携带批内全部层
         范围), 摊薄逐层传输的固定开销. tasks 为空时直接返回."""
@@ -915,6 +964,9 @@ class KVCacheSendingLayerThread(threading.Thread):
                         )
 
         # 4) 每 session: 一次 D2H flush → src 替换 → 一次 sync_write → LAYER_DONE
+        # step ACK: 记录本批真正发出 step_last 的 peer; 本 step 有更早数据、但
+        # 本批没有数据的 peer 需要在 step 末补一条空 LAYER_DONE 作为 step 结束标记.
+        ld_step_peers: set[tuple[str, int]] = set()
         for session_id, transfer_meta in session_meta.items():
             if len(transfer_meta.src) > 0:
                 if global_te.use_tcp:
@@ -1003,6 +1055,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                                     peer_layer_msgs[peer_key][3].extend(
                                         transfer_meta.src[req_start : req_start + req_count]
                                     )
+                        req_id_map = {get_external_request_id(r): r for r in transfer_meta.req_ids}
                         for (peer_host, peer_port), (
                             peer_addrs,
                             peer_lengths,
@@ -1011,28 +1064,74 @@ class KVCacheSendingLayerThread(threading.Thread):
                         ) in peer_layer_msgs.items():
                             done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                             t_ld0 = time.perf_counter()
-                            ok = self._send_layer_done_signal(
-                                peer_host,
-                                peer_port,
-                                peer_req_ids,
-                                peer_addrs,
-                                peer_lengths,
-                                done_list,
-                                src_addrs=peer_src,
-                            )
+                            if _STEP_ACK:
+                                ld_step_peers.add((peer_host, peer_port))
+                                # step 级 ACK: 本批只发不等; step_end 时由
+                                # _drain_step_acks 统一等每个 peer 的一个 ACK/NAK.
+                                ok = self._post_layer_done_async(
+                                    peer_host,
+                                    peer_port,
+                                    peer_req_ids,
+                                    peer_addrs,
+                                    peer_lengths,
+                                    done_list,
+                                    peer_src,
+                                    step_last=step_end,
+                                    req_id_map=req_id_map,
+                                )
+                            else:
+                                ok = self._send_layer_done_signal(
+                                    peer_host,
+                                    peer_port,
+                                    peer_req_ids,
+                                    peer_addrs,
+                                    peer_lengths,
+                                    done_list,
+                                    src_addrs=peer_src,
+                                )
                             if _PERF_LOG:
                                 layerdone_ms += _perf_ms(t_ld0)
-                                # LAYER_DONE REQ-REP 往返窗口(内含 D 侧 H2D
-                                # 与 ACK 传输), 与 D 侧 H2D 窗口做交叉校验.
+                                # 旧路径: REQ-REP 往返窗口(内含 D 侧 H2D 与 ACK 传输);
+                                # step ACK 路径: 仅 post 的耗时, 与 D 侧 H2D 窗口交叉校验.
                                 if layerdone_win0 is None:
                                     layerdone_win0 = t_ld0
                                 layerdone_win1 = time.perf_counter()
                             if not ok:
                                 layer_done_ok = False
+                                if _STEP_ACK:
+                                    # 单个 peer 发送失败不影响其它 peer 发送;
+                                    # 本批请求按失败处理.
+                                    continue
                                 break
                         if not layer_done_ok:
                             for failed_req_id in transfer_meta.req_ids:
                                 self.failed_reqs.add(failed_req_id)
+
+        if _STEP_ACK and step_end:
+            # 本批没有数据、但本 step 更早发过数据的 peer: 补一条空 LAYER_DONE
+            # 作为 step 结束标记, 否则 D 永远等不到 step_last、P 只能超时.
+            for key, pending in list(self._ld_outstanding.items()):
+                if not pending or key in ld_step_peers:
+                    continue
+                host, port = key
+                self._post_layer_done_async(
+                    host,
+                    port,
+                    [],
+                    [],
+                    [],
+                    None,
+                    [],
+                    step_last=True,
+                    req_id_map={},
+                )
+            # 本 step 所有 session 都已发出: 收齐每个 peer 的 step ACK, 再进入
+            # 下一 step(下一 step 的 layer 0 会复用 staging slot).
+            t_drain0 = time.perf_counter()
+            self._drain_step_acks()
+            if _PERF_LOG:
+                layerdone_ms += _perf_ms(t_drain0)
+                layerdone_win1 = time.perf_counter()
 
         # 5) 请求级完成信号: 含最后层任务时在 session 聚合阶段记入
         #    TransferMeta.req_done, 随该批 LAYER_DONE 的 done_list 下发(见
@@ -1095,6 +1194,14 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["write"] += write_ms
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += batch_wait_ms
+        if _STEP_ACK and step_end:
+            # step ACK 已收齐(失败信息已进 failed_reqs): 统一处理本 step 内
+            # 先前批遗留的请求级信号(首 token / on_send_done / on_transfer_done).
+            pending_done = self._step_pending_done
+            self._step_pending_done = []
+            for send_task, req_id, req_meta, is_last_layer, layer_group_idx in pending_done:
+                self._handle_request_done(send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+
         for send_task in tasks:
             is_group_end, layer_group_idx = self._group_end_of_task(send_task)
             if is_group_end:
@@ -1105,47 +1212,64 @@ class KVCacheSendingLayerThread(threading.Thread):
                     if req_id not in transferred_reqs:
                         continue
                     if req_meta.chunk_finish:
-                        # 先 P 后 D: 首 token 必须先于请求级完成信号到达 D ——
-                        # D 侧虽然会压住未凑齐的请求, 但早发能少等一个 step。
-                        self._notify_send_done(send_task, req_id, req_meta)
-                        if self.on_transfer_done is not None:
-                            self.on_transfer_done(req_id, req_meta)
-                        if _PERF_LOG and is_last_layer:
-                            ext_req = get_external_request_id(req_id)
-                            acc = self._perf_req.pop(ext_req, None)
-                            if acc is not None:
-                                # 请求级汇总: t0=发送线程开始处理该请求首任务,
-                                # total=到 DONE 发出的墙钟跨度.
-                                h2h_perf.emit(
-                                    "p_req",
-                                    role="producer",
-                                    req=ext_req,
-                                    batches=int(acc["batches"]),
-                                    event=acc["event"],
-                                    flush=acc["flush"],
-                                    write=acc["write"],
-                                    layerdone=acc["layerdone"],
-                                    wait=acc["wait"],
-                                    total=_perf_ms(acc["t0"]),
-                                )
-                        if req_id in self.failed_reqs:
-                            # 失败仍走独立的请求级信号: 写失败的层批根本没有
-                            # LAYER_DONE 到达 D, 只靠路径计数会让请求永远等不到
-                            # 完成 —— 必须显式通知 D 作废旧块并重试.
-                            self._send_failed_signal(req_id, req_meta, layer_group_idx)
-                            self.failed_reqs.discard(req_id)
-                            # 请求已作废, 首 token 不再有意义 (D 侧会重试整条请求).
-                            if self.on_request_failed is not None:
-                                self.on_request_failed(req_id)
-                        elif global_te.use_tcp:
-                            # TCP/H2H: 本请求的请求级完成信息已随末批 LAYER_DONE
-                            # 的 done_list 下发 (见 _req_done_list), 不再单独发一次
-                            # DONE 往返.
-                            pass
-                        else:
-                            # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
-                            # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
-                            self._send_done_signal(req_id, req_meta, layer_group_idx)
+                        if _STEP_ACK and not step_end:
+                            # 首 token/完成回调必须等 step ACK(D 已 H2D), 先攒着.
+                            self._step_pending_done.append(
+                                (send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+                            )
+                            continue
+                        self._handle_request_done(send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+
+    def _handle_request_done(
+        self,
+        send_task: SendTask,
+        req_id: str,
+        req_meta: ReqMeta,
+        is_last_layer: bool,
+        layer_group_idx: int,
+    ) -> None:
+        """请求级收尾: 首 token / delayed free / 失败作废. step ACK 后再调用."""
+        # delayed free 的会合点: 无论成败都要上报, 否则调度侧永远等不到块归还.
+        self._notify_send_done(send_task, req_id, req_meta)
+        if req_id in self.failed_reqs:
+            # 失败: 不发首 token(D 侧会重算, 旧 token 不能复用), 只显式作废.
+            # 写失败的层批根本没有 LAYER_DONE 到达 D, 只靠路径计数会让请求
+            # 永远等不到完成 —— 必须显式通知 D 作废旧块并重试.
+            self._send_failed_signal(req_id, req_meta, layer_group_idx)
+            self.failed_reqs.discard(req_id)
+            if self.on_request_failed is not None:
+                self.on_request_failed(req_id)
+            return
+        # 先 P 后 D: 首 token 必须先于请求级完成信号到达 D ——
+        # D 侧虽然会压住未凑齐的请求, 但早发能少等一个 step。
+        if self.on_transfer_done is not None:
+            self.on_transfer_done(req_id, req_meta)
+        if _PERF_LOG and is_last_layer:
+            ext_req = get_external_request_id(req_id)
+            acc = self._perf_req.pop(ext_req, None)
+            if acc is not None:
+                # 请求级汇总: t0=发送线程开始处理该请求首任务,
+                # total=到 DONE 发出的墙钟跨度.
+                h2h_perf.emit(
+                    "p_req",
+                    role="producer",
+                    req=ext_req,
+                    batches=int(acc["batches"]),
+                    event=acc["event"],
+                    flush=acc["flush"],
+                    write=acc["write"],
+                    layerdone=acc["layerdone"],
+                    wait=acc["wait"],
+                    total=_perf_ms(acc["t0"]),
+                )
+        if global_te.use_tcp:
+            # TCP/H2H: 本请求的请求级完成信息已随末批 LAYER_DONE
+            # 的 done_list 下发 (见 _req_done_list), 不再单独发一次
+            # DONE 往返.
+            return
+        # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
+        # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
+        self._send_done_signal(req_id, req_meta, layer_group_idx)
 
     # ---- 写线程流水路径 (MC_TCP_PIPE_WRITER=1, protocol=tcp 且非 reshard/量化) ----
     # 阶段归属: 发送线程 = 等事件 + D2H flush + 攒批; 写线程 = TCP write(数据面
@@ -1153,7 +1277,7 @@ class KVCacheSendingLayerThread(threading.Thread):
     # 完成信息. 不变式与单线程版一致: LAYER_DONE g 只在 write g 完成后发出;
     # 请求级完成信息由含最后层的批随其 LAYER_DONE 下发 (阻塞 drain 保证);
     # 发送线程空闲时持续 drain, LAYER_DONE 不再等下一次攒批触发.
-    def _transfer_kv_cache_batch_pipe(self, tasks: list[SendTask]):
+    def _transfer_kv_cache_batch_pipe(self, tasks: list[SendTask], step_end: bool = False):
         if not tasks:
             return
         # 先发掉已完成 write 的 LAYER_DONE(与本次 等事件/flush 重叠).
@@ -1253,11 +1377,12 @@ class KVCacheSendingLayerThread(threading.Thread):
             flush_ms=flush_ms,
             flush_win0=flush_win0,
             flush_win1=flush_win1,
+            step_end=step_end,
         )
         self._pipe_push(job)
-        if job.contains_last:
-            # 请求最后一批: 阻塞 drain 至其 write 完成并发出 LAYER_DONE,
-            # 保证下一请求 flush 前数据面清空、请求级完成信息不早于全层 H2D.
+        if step_end:
+            # step 最后一批: 阻塞 drain 至其 write 完成、LAYER_DONE 发出并收齐
+            # step ACK, 保证下一 step 的 layer 0 flush 前 staging 已释放.
             self._pipe_drain(block=True)
 
     def _pipe_writer_loop(self):
@@ -1324,6 +1449,7 @@ class KVCacheSendingLayerThread(threading.Thread):
             self.failed_reqs.update(failed_ids)
         layerdone_ms = 0.0
         layerdone_win0 = layerdone_win1 = None
+        ld_step_peers: set[tuple[str, int]] = set()
         for session_id, transfer_meta in job.sessions:
             if session_id in job.failed or len(transfer_meta.src) <= 0:
                 continue
@@ -1339,6 +1465,7 @@ class KVCacheSendingLayerThread(threading.Thread):
                     peer_layer_msgs[peer_key][1].extend(transfer_meta.length[req_start : req_start + req_count])
                     if _PULL_MODE:
                         peer_layer_msgs[peer_key][3].extend(transfer_meta.src[req_start : req_start + req_count])
+            req_id_map = {get_external_request_id(r): r for r in transfer_meta.req_ids}
             for (peer_host, peer_port), (
                 peer_addrs,
                 peer_lengths,
@@ -1347,9 +1474,23 @@ class KVCacheSendingLayerThread(threading.Thread):
             ) in peer_layer_msgs.items():
                 done_list = self._req_done_list(transfer_meta, peer_host, peer_port)
                 t_ld0 = time.perf_counter()
-                ok = self._send_layer_done_signal(
-                    peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list, src_addrs=peer_src
-                )
+                if _STEP_ACK:
+                    ld_step_peers.add((peer_host, peer_port))
+                    ok = self._post_layer_done_async(
+                        peer_host,
+                        peer_port,
+                        peer_req_ids,
+                        peer_addrs,
+                        peer_lengths,
+                        done_list,
+                        peer_src,
+                        step_last=job.step_end,
+                        req_id_map=req_id_map,
+                    )
+                else:
+                    ok = self._send_layer_done_signal(
+                        peer_host, peer_port, peer_req_ids, peer_addrs, peer_lengths, done_list, src_addrs=peer_src
+                    )
                 if _PERF_LOG:
                     layerdone_ms += _perf_ms(t_ld0)
                     if layerdone_win0 is None:
@@ -1357,6 +1498,30 @@ class KVCacheSendingLayerThread(threading.Thread):
                     layerdone_win1 = time.perf_counter()
                 if not ok:
                     self.failed_reqs.update(transfer_meta.req_ids)
+
+        if _STEP_ACK and job.step_end:
+            # 本批没有数据、但本 step 更早发过数据的 peer: 补空 step_last 标记.
+            for key, pending in list(self._ld_outstanding.items()):
+                if not pending or key in ld_step_peers:
+                    continue
+                host, port = key
+                self._post_layer_done_async(
+                    host,
+                    port,
+                    [],
+                    [],
+                    [],
+                    None,
+                    [],
+                    step_last=True,
+                    req_id_map={},
+                )
+            # 本 step 最后一批: 收齐每个 peer 的 step ACK/NAK 后再收尾.
+            t_drain0 = time.perf_counter()
+            self._drain_step_acks()
+            if _PERF_LOG:
+                layerdone_ms += _perf_ms(t_drain0)
+                layerdone_win1 = time.perf_counter()
 
         # perf 批级行与请求级累计(必须在 DONE 之前打印).
         if _PERF_LOG:
@@ -1411,6 +1576,13 @@ class KVCacheSendingLayerThread(threading.Thread):
                 acc["write"] += job.write_ms
                 acc["layerdone"] += layerdone_ms
                 acc["wait"] += job.batch_wait_ms
+        if _STEP_ACK and job.step_end:
+            # step ACK 已收齐: 统一处理先前批遗留的请求级信号.
+            pending_done = self._step_pending_done
+            self._step_pending_done = []
+            for send_task, req_id, req_meta, is_last_layer, layer_group_idx in pending_done:
+                self._handle_request_done(send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+
         for send_task in job.tasks:
             # 请求级信号(首 token / DONE / 作废)由**每个参与发送的 rank 在各自的
             # group 末层**下发, 不能只看最后一层: 不等分 P/D 切分下 attention 组
@@ -1419,48 +1591,18 @@ class KVCacheSendingLayerThread(threading.Thread):
             # 客户端就此挂死(2026-09-17 实测 P TP4→D TP2 约 6% 请求命中)。
             is_group_end, layer_group_idx = self._group_end_of_task(send_task)
             if is_group_end:
+                is_last_layer = send_task.layer_idx == (self.total_layers - 1)
                 for req_id, req_meta in send_task.send_request.items():
                     if req_id not in job.transferred_reqs:
                         continue
                     if req_meta.chunk_finish:
-                        # 先 P 后 D: 首 token 必须先于请求级完成信号到达 D。
-                        self._notify_send_done(send_task, req_id, req_meta)
-                        if self.on_transfer_done is not None:
-                            self.on_transfer_done(req_id, req_meta)
-                        if _PERF_LOG:
-                            ext_req = get_external_request_id(req_id)
-                            acc = self._perf_req.pop(ext_req, None)
-                            if acc is not None:
-                                h2h_perf.emit(
-                                    "p_req",
-                                    role="producer",
-                                    req=ext_req,
-                                    batches=int(acc["batches"]),
-                                    event=acc["event"],
-                                    flush=acc["flush"],
-                                    write=acc["write"],
-                                    layerdone=acc["layerdone"],
-                                    wait=acc["wait"],
-                                    total=_perf_ms(acc["t0"]),
-                                )
-                        if req_id in self.failed_reqs:
-                            # 失败仍走独立的请求级信号: 写失败的层批根本没有
-                            # LAYER_DONE 到达 D, 只靠路径计数会让请求永远等不到
-                            # 完成 —— 必须显式通知 D 作废旧块并重试.
-                            self._send_failed_signal(req_id, req_meta, layer_group_idx)
-                            self.failed_reqs.discard(req_id)
-                            # 请求已作废, 首 token 不再有意义 (D 侧会重试整条请求).
-                            if self.on_request_failed is not None:
-                                self.on_request_failed(req_id)
-                        elif global_te.use_tcp:
-                            # TCP/H2H: 本请求的请求级完成信息已随末批 LAYER_DONE
-                            # 的 done_list 下发 (见 _req_done_list), 不再单独发一次
-                            # DONE 往返.
-                            pass
-                        else:
-                            # D2D(protocol=ascend): 数据直达 D 的 NPU, 两端之间
-                            # 没有 LAYER_DONE 可搭车 —— 沿用独立的请求级 DONE.
-                            self._send_done_signal(req_id, req_meta, layer_group_idx)
+                        if _STEP_ACK and not job.step_end:
+                            # 首 token/完成回调必须等 step ACK(D 已 H2D), 先攒着.
+                            self._step_pending_done.append(
+                                (send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+                            )
+                            continue
+                        self._handle_request_done(send_task, req_id, req_meta, is_last_layer, layer_group_idx)
         if _PERF_LOG:
             # 批"处理结束"以 LAYER_DONE 全部发出计(与单线程版语义对齐).
             self._last_batch_end_at = time.perf_counter()
@@ -1529,6 +1671,188 @@ class KVCacheSendingLayerThread(threading.Thread):
             for (d_host, d_port, rid), (is_last, trans_count) in transfer_meta.req_done.items()
             if is_last and d_host == peer_host and d_port == peer_port
         ]
+
+    def _peer_dealer(self, remote_host: str, remote_port: int) -> Any:
+        """每 peer 一条常驻 DEALER(仅发送线程访问), 用于 step 级 ACK.
+
+        同一步内可以连续 send 多条 LAYER_DONE, 不必逐条收 ACK; D 侧只在收到该
+        step 的最后一条、且全部 job 完成后回一个 ACK/NAK。
+        """
+        if self._ld_ctx is None:
+            self._ld_ctx = zmq.Context()  # type: ignore
+        key = (remote_host, remote_port)
+        sock = self._peer_dealers.get(key)
+        if sock is None:
+            sock = make_zmq_socket(
+                ctx=self._ld_ctx,  # type: ignore
+                path=make_zmq_path("tcp", remote_host, remote_port),
+                socket_type=zmq.DEALER,  # type: ignore
+                bind=False,
+            )
+            timeout_ms = int(LAYER_DONE_TIMEOUT_S * 1000)
+            sock.setsockopt(zmq.SNDTIMEO, timeout_ms)  # type: ignore
+            sock.setsockopt(zmq.RCVTIMEO, timeout_ms)  # type: ignore
+            self._peer_dealers[key] = sock
+        return sock
+
+    def _drop_peer_dealer(self, remote_host: str, remote_port: int) -> None:
+        sock = self._peer_dealers.pop((remote_host, remote_port), None)
+        if sock is not None:
+            with contextlib.suppress(Exception):
+                sock.close(linger=0)
+
+    def _ld_payload(
+        self,
+        req_ids: list[str],
+        dst_addrs: list[int],
+        lengths: list[int],
+        done_list: list[tuple[str, bool, int, bool]] | None,
+        src_addrs: list[int] | None,
+        seq: int,
+        step_id: int,
+        step_last: bool,
+    ) -> bytes:
+        """step 级 ACK 的 LAYER_DONE payload(旧 8 元组 + seq/step_id/step_last)."""
+        return self._ld_encoder.encode(
+            (
+                LAYER_DONE_SENDING_MSG,
+                req_ids,
+                dst_addrs,
+                lengths,
+                self.sender_path,
+                done_list or [],
+                list(src_addrs) if (_PULL_MODE and src_addrs) else [],
+                self.sender_te_path,
+                seq,
+                step_id,
+                step_last,
+            )
+        )
+
+    def _post_layer_done_async(
+        self,
+        remote_host: str,
+        remote_port: int,
+        req_ids: list[str],
+        dst_addrs: list[int],
+        lengths: list[int],
+        done_list: list[tuple[str, bool, int, bool]] | None,
+        src_addrs: list[int] | None,
+        step_last: bool,
+        req_id_map: dict[str, str],
+    ) -> bool:
+        """只发送 LAYER_DONE, 不等 ACK; step 末由 _drain_step_acks 统一收. """
+        key = (remote_host, remote_port)
+        seq = self._step_seq.get(key, 0)
+        try:
+            sock = self._peer_dealer(remote_host, remote_port)
+            payload = self._ld_payload(
+                req_ids, dst_addrs, lengths, done_list, src_addrs, seq, self._step_id, step_last
+            )
+            sock.send_multipart((b"", payload))
+        except zmq.ZMQError as e:  # type: ignore
+            logger.error("Layer done async send to %s:%d failed: %s", remote_host, remote_port, e)
+            self._drop_peer_dealer(remote_host, remote_port)
+            self._ld_send_failed.add(key)
+            return False
+        self._step_seq[key] = seq + 1
+        self._ld_outstanding.setdefault(key, []).append((seq, req_id_map))
+        return True
+
+    def _close_step_with_markers(self) -> None:
+        """上一个 step 的末批已发出(但没有 step_last 标记)时补收尾.
+
+        给当前所有有 outstanding 的 peer 各补一条空 LAYER_DONE(step_last=True),
+        让 D 在全部 job 完成后回 step ACK, 再统一 drain.
+        """
+        for key, pending in list(self._ld_outstanding.items()):
+            if not pending:
+                continue
+            host, port = key
+            self._post_layer_done_async(
+                host,
+                port,
+                [],
+                [],
+                [],
+                None,
+                [],
+                step_last=True,
+                req_id_map={},
+            )
+        self._drain_step_acks()
+        # 本 step 内攒下的请求级信号, 现在 D 已 ACK, 可以安全下发.
+        pending_done = self._step_pending_done
+        self._step_pending_done = []
+        for send_task, req_id, req_meta, is_last_layer, layer_group_idx in pending_done:
+            self._handle_request_done(send_task, req_id, req_meta, is_last_layer, layer_group_idx)
+
+    def _drain_step_acks(self) -> None:
+        """step 末等每个 peer 的唯一 ACK/NAK, 清空 outstanding 并进入下一 step.
+
+        D 侧只在收到该 step 最后一条 LAYER_DONE、且该 step 所有 job 都完成/失败后
+        回一个 reply: ACK, 或 NAK(带失败的 external req ids)。没拿到 ACK 的 peer
+        按整个 step 失败处理, 走请求级重算。
+        """
+        for key, pending in list(self._ld_outstanding.items()):
+            if not pending:
+                continue
+            host, port = key
+            last_seq = pending[-1][0]
+            all_map: dict[str, str] = {}
+            for _seq, mapping in pending:
+                all_map.update(mapping)
+            ok = False
+            sock = None if key in self._ld_send_failed else self._peer_dealers.get(key)
+            if sock is not None:
+                try:
+                    while True:
+                        frames = sock.recv_multipart()
+                        reply = msgspec.msgpack.Decoder(type=tuple).decode(frames[-1])
+                        # 超时后到达的上一 step reply 不能当成本 step 的结果.
+                        if not reply or len(reply) < 2 or reply[1] != self._step_id:
+                            logger.warning(
+                                "Discarding stale step reply from %s:%d: %r (current step=%d)",
+                                host,
+                                port,
+                                reply,
+                                self._step_id,
+                            )
+                            continue
+                        if reply[0] == b"ACK":
+                            ok = len(reply) < 3 or reply[2] == last_seq
+                            break
+                        if reply[0] == b"NAK":
+                            failed_ext = reply[3] if len(reply) > 3 else []
+                            if not failed_ext:
+                                failed_ext = list(all_map)
+                            for ext in failed_ext:
+                                internal = all_map.get(ext)
+                                if internal is not None:
+                                    self.failed_reqs.add(internal)
+                            logger.error(
+                                "Step ACK NAK from %s:%d step=%d failed=%s",
+                                host,
+                                port,
+                                self._step_id,
+                                failed_ext,
+                            )
+                            # NAK 是明确答复: 只把 NAK 里的请求判失败, 不要再走
+                            # "没收到 ACK 就把整个 step 判失败" 的兜底.
+                            ok = True
+                            break
+                except zmq.Again:  # type: ignore
+                    logger.error("Step ACK timeout from %s:%d step=%d", host, port, self._step_id)
+                except Exception as e:  # noqa: BLE001
+                    logger.error("Step ACK decode/send error from %s:%d: %s", host, port, e)
+                    self._drop_peer_dealer(host, port)
+            if not ok:
+                for _seq, mapping in pending:
+                    self.failed_reqs.update(mapping.values())
+            self._ld_outstanding.pop(key, None)
+        self._step_id += 1
+        self._step_seq.clear()
+        self._ld_send_failed.clear()
 
     def _send_layer_done_signal(
         self,
@@ -1633,6 +1957,12 @@ class KVCacheRecvingLayerThread(threading.Thread):
         self._wake_r: socket.socket | None = None
         self._wake_w: socket.socket | None = None
         self._recv_workers: list[threading.Thread] = []
+        # step 级 ACK: (sender_path, step_id) -> last_seq/accounted/failed/replied.
+        # 只有收线程读写(解析消息与完成回收都在收线程), 无需额外加锁.
+        self._ld_step_state: dict[tuple[str, int], dict[str, Any]] = {}
+        self._ld_reply_encoder = msgspec.msgpack.Encoder()
+        # 本 step 已判失败的 external req id: 后续批的 done_list 不再把它们置完成.
+        self._failed_reqs_step: set[str] = set()
 
     def get_first_token(self, request_id: str) -> Any:
         with self.lock:
@@ -1705,8 +2035,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 # 失败): 撤回已置的完成标记, 避免 scheduler 抢在作废前接纳.
                 with self.lock:
                     self.done_requests.discard(ext_req)
+                self._failed_reqs_step.add(ext_req)
                 self.update_failed_task(ext_req)
-            elif is_last:
+            elif is_last and ext_req not in self._failed_reqs_step:
+                # 本 step 内已因 pull/H2D 失败作废的请求不再置完成; 失败由 NAK
+                # 路径交给 P 重算. 新的请求尝试会在 start_load_kv 清掉墓碑.
                 self.update_done_task(ext_req, trans_count, sender_path)
 
     def update_done_task(self, req_id, trans_count, side_channel_path):
@@ -1793,6 +2126,50 @@ class KVCacheRecvingLayerThread(threading.Thread):
             except OSError as e:
                 logger.error("recv pool wakeup write failed (fallback: poll timeout): %s", e)
 
+    def _ld_step_state_for(self, sender_path: str, step_id: int) -> dict[str, Any]:
+        key = (sender_path, step_id)
+        state = self._ld_step_state.get(key)
+        if state is None:
+            state = {"last_seq": -1, "accounted": set(), "failed": [], "replied": False}
+            self._ld_step_state[key] = state
+        return state
+
+    def _ld_note_last(self, job: "_RecvJob") -> None:
+        """收到 step 最后一条消息时先记下 last_seq(可能比它先完成)."""
+        if job.seq < 0 or not job.step_last:
+            return
+        state = self._ld_step_state_for(job.sender_path, job.step_id)
+        state["last_seq"] = max(state["last_seq"], job.seq)
+
+    def _send_ld_reply(self, sock, identity: bytes, reply: tuple) -> None:
+        try:
+            sock.send_multipart((identity, b"", self._ld_reply_encoder.encode(reply)))
+        except Exception as e:  # noqa: BLE001
+            logger.error("Failed to reply %r to peer: %s", reply[0], e)
+
+    def _ld_finish_step(self, sock, job: "_RecvJob") -> None:
+        """记一条 job 的完成; 当该 step 全部 job 完成/失败后回唯一 ACK/NAK."""
+        if job.seq < 0:
+            return
+        state = self._ld_step_state_for(job.sender_path, job.step_id)
+        if not job.ok:
+            state["failed"].extend(job.req_ids)
+        state["accounted"].add(job.seq)
+        last_seq = state["last_seq"]
+        if last_seq < 0 or state["replied"]:
+            return
+        if len(state["accounted"]) < last_seq + 1:
+            return
+        if not all(seq in state["accounted"] for seq in range(last_seq + 1)):
+            return
+        if state["failed"]:
+            reply = (b"NAK", job.step_id, last_seq, sorted(set(state["failed"])))
+        else:
+            reply = (b"ACK", job.step_id, last_seq)
+        self._send_ld_reply(sock, job.identity, reply)
+        state["replied"] = True
+        self._ld_step_state.pop((job.sender_path, job.step_id), None)
+
     def _run_recv_job(self, job: "_RecvJob") -> None:
         """执行一条 LAYER_DONE 的数据面: pull(反向 sync_read) → H2D.
 
@@ -1801,6 +2178,12 @@ class KVCacheRecvingLayerThread(threading.Thread):
         等 LAYER_DONE_TIMEOUT_S 才发现.
         """
         try:
+            if not job.dst_addrs and not job.lengths and not job.src_addrs:
+                # step 级 ACK 的纯结束标记(dst/length/src 全空): 没有数据要搬,
+                # 直接记成功, 由 _ld_finish_step 统一回 step ACK.
+                job.ok = True
+                job.h2d_only_ms = 0.0
+                return
             if _PULL_MODE:
                 # pull: 主动从 P 的本端 staging 拉数据到本端 staging.
                 # sync_read 返回即字节已落本地 ⇒ push 路径上那个"信号跑在批量数据
@@ -1815,11 +2198,26 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     raise RuntimeError(
                         f"pull range mismatch: dst={len(job.dst_addrs)} len={len(job.lengths)} src={len(job.src_addrs)}"
                     )
-                job.pull_t0 = time.perf_counter()
-                ret = self.engine.batch_transfer_sync_read(
-                    job.sender_te_path, job.dst_addrs, job.src_addrs, job.lengths
-                )
-                job.pull_ms = _perf_ms(job.pull_t0)
+                attempts = max(1, _LD_RETRY + 1)
+                ret = -1
+                for attempt in range(attempts):
+                    job.pull_t0 = time.perf_counter()
+                    ret = self.engine.batch_transfer_sync_read(
+                        job.sender_te_path, job.dst_addrs, job.src_addrs, job.lengths
+                    )
+                    job.pull_ms = _perf_ms(job.pull_t0)
+                    if ret >= 0:
+                        break
+                    if attempt + 1 < attempts:
+                        logger.warning(
+                            "batch_transfer_sync_read failed ret=%d (attempt %d/%d) peer=%s reqs=%s; retrying",
+                            ret,
+                            attempt + 1,
+                            attempts,
+                            job.sender_te_path,
+                            job.req_ids,
+                        )
+                        time.sleep(min(0.05 * (attempt + 1), 0.2))
                 if ret < 0:
                     raise RuntimeError(
                         f"batch_transfer_sync_read failed ret={ret} peer={job.sender_te_path} reqs={job.req_ids}"
@@ -1864,13 +2262,17 @@ class KVCacheRecvingLayerThread(threading.Thread):
                 job.req_ids,
                 len(job.dst_addrs),
             )
-        layer_reply = b"ACK" if job.ok else b"NAK"
-        try:
-            sock.send_multipart((job.identity, b"", layer_reply))
-        except Exception as e:  # noqa: BLE001
-            # 对端可能已超时/断开(REQ 套接字已销毁, ROUTER 会丢弃); 不能因此丢掉
-            # 簿记 —— 该请求仍要按结果作废或放行, P 侧会自行重试.
-            logger.error("Failed to reply %r to peer: %s", layer_reply, e)
+            # 本 step 内该请求已失败: 后续批的 done_list 不再把它置完成.
+            self._failed_reqs_step.update(job.req_ids)
+        if job.seq < 0:
+            # 旧协议(旧 P 的 8 元组): 每条消息一个 ACK/NAK, 行为与改动前一致.
+            layer_reply = b"ACK" if job.ok else b"NAK"
+            try:
+                sock.send_multipart((job.identity, b"", layer_reply))
+            except Exception as e:  # noqa: BLE001
+                # 对端可能已超时/断开(REQ 套接字已销毁, ROUTER 会丢弃); 不能因此丢掉
+                # 簿记 —— 该请求仍要按结果作废或放行, P 侧会自行重试.
+                logger.error("Failed to reply %r to peer: %s", layer_reply, e)
         ack_ts = time.perf_counter()
         if job.ok:
             # 就地判定请求级完成/失败: 与 H2D 同一处理点, 省掉 P 侧单独一次请求级
@@ -1878,7 +2280,13 @@ class KVCacheRecvingLayerThread(threading.Thread):
             self.apply_layer_done_meta(job.done_list, job.sender_path)
         else:
             for ext_req in job.req_ids:
+                # 本批之前可能已经因 done_list 置过完成; 失败后必须撤回.
+                with self.lock:
+                    self.done_requests.discard(ext_req)
                 self.update_failed_task(ext_req)
+        if job.seq >= 0:
+            # step 级 ACK: 本消息只记完成; 该 step 全部 job 完成后回唯一 ACK/NAK.
+            self._ld_finish_step(sock, job)
         if _PERF_LOG:
             # ts 为收到 LAYER_DONE 的绝对时刻(CLOCK_MONOTONIC); pull = 本端从 P 的
             # staging 拉数据(起点 pull_t0), h2d_only = 拉完之后往 NPU 拷的那一段
@@ -1998,6 +2406,9 @@ class KVCacheRecvingLayerThread(threading.Thread):
                     elif msg[0] == FAILED_SENDING_MSG:
                         request_id = msg[1]
                         logger.error("Got FAILED_SENDING_MSG for request. request_id=%s. ", msg[1])
+                        # 可能已经因 step 内的 done_list 置过完成: 作废时撤回.
+                        with self.lock:
+                            self.done_requests.discard(request_id)
                         self.update_failed_task(request_id)
                         sock.send_multipart((identity, b"", b"ACK"))
                     elif msg[0] == FIRST_TOKEN_MSG:
@@ -2033,6 +2444,11 @@ class KVCacheRecvingLayerThread(threading.Thread):
                         done_list = msg[5] if len(msg) > 5 else ()
                         peer_src_addrs = msg[6] if len(msg) > 6 else ()
                         sender_te_path = msg[7] if len(msg) > 7 else ""
+                        # step 级 ACK 扩展(旧 P 的 8 元组没有): seq<0 表示旧协议,
+                        # 每条消息一个 ACK; 新协议只在 step 末回一个 ACK/NAK.
+                        seq = msg[8] if len(msg) > 8 else -1
+                        step_id = msg[9] if len(msg) > 9 else -1
+                        step_last = msg[10] if len(msg) > 10 else True
                         logger.debug("Got LAYER_DONE_SENDING_MSG for %d ranges", len(layer_dst_addrs))
                         job = _RecvJob(
                             identity=identity,
@@ -2044,7 +2460,13 @@ class KVCacheRecvingLayerThread(threading.Thread):
                             src_addrs=peer_src_addrs,
                             sender_te_path=sender_te_path,
                             t_recv0=time.perf_counter(),
+                            seq=seq,
+                            step_id=step_id,
+                            step_last=step_last,
                         )
+                        if job.seq >= 0:
+                            # 先记 last_seq: 即使最后一条先完成, 也要等前面的 job.
+                            self._ld_note_last(job)
                         if self._recv_jobs is not None:
                             # MC_TCP_RECV_POOL>0: 数据面(pull+H2D)交池, 本线程继续收包;
                             # 完成项由 _complete_recv_jobs 回 ACK/NAK 并做簿记/打点.
@@ -3847,6 +4269,8 @@ class MooncakeLayerwisePrefillThenDecodeConnectorWorker:
                     continue
                 external_req_id = get_external_request_id(req_id)
                 assert self.kv_recv_layer_thread is not None
+                # 新的一次请求尝试: 清掉上一次失败留下的墓碑, 允许本次正常完成.
+                self.kv_recv_layer_thread._failed_reqs_step.discard(external_req_id)
                 self.request_map[external_req_id] = req_id
                 self._recving_metadata[req_id] = meta
                 if REUSE_PREFILLED_TOKENS and meta.reuse_prefilled_tokens:

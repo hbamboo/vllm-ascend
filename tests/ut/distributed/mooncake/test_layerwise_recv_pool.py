@@ -13,6 +13,7 @@ import time
 import unittest
 from unittest import mock
 
+import msgspec
 import zmq
 
 from vllm_ascend.distributed.kv_transfer.kv_p2p import mooncake_layerwise_prefill_then_decode_connector as conn
@@ -66,6 +67,9 @@ def _make_recv_thread(engine) -> conn.KVCacheRecvingLayerThread:
     thread._wake_r = None
     thread._wake_w = None
     thread._recv_workers = []
+    thread._failed_reqs_step = set()
+    thread._ld_step_state = {}
+    thread._ld_reply_encoder = msgspec.msgpack.Encoder()
     thread._bind_worker_device = lambda: None  # type: ignore[method-assign]
     return thread
 
