@@ -256,6 +256,15 @@ class AscendMetadata:
     pcp_local_num_input_tokens: int | None = None
 
 
+# Filled once per build_attn_metadata call: values that only change between
+# steps but are recomputed by every KV cache group's builder.
+_BUILD_STEP_CACHE: dict[str, Any] = {}
+
+
+def begin_build_step() -> None:
+    _BUILD_STEP_CACHE.clear()
+
+
 class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
     """
     Builder for constructing AscendMetadata from CommonAttentionMetadata.
@@ -382,10 +391,29 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
         attn_mask = self.attn_mask_builder.get_attention_mask(common_attn_metadata.causal, self.model_config)
 
         # TODO: Yet another unnecessary H2D while we already have a query_start_loc on device
-        query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+        # Every KV cache group of a step shares the batch-wide inputs; build once.
+        _shared = _BUILD_STEP_CACHE
+        _qsl_src = common_attn_metadata.query_start_loc_cpu
+        _qsl_entry = _shared.get("qsl")
+        if (
+            _qsl_entry is None
+            or _qsl_entry[0] is not _qsl_src
+            or _qsl_entry[1] != num_reqs
+        ):
+            query_start_loc = query_start_loc_cpu.pin_memory().to(self.device, non_blocking=True)
+            actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
+            _shared["qsl"] = (_qsl_src, num_reqs, query_start_loc, actual_seq_lengths_q)
+        else:
+            query_start_loc = _qsl_entry[2]
+            actual_seq_lengths_q = _qsl_entry[3]
 
-        actual_seq_lengths_q = query_start_loc_cpu[1:].tolist()
-        seq_lens_list = seq_lens.tolist()
+        _sl_key = (seq_lens.data_ptr(), seq_lens.numel())
+        _sl_entry = _shared.get("seq_lens")
+        if _sl_entry is None or _sl_entry[0] != _sl_key:
+            seq_lens_list = seq_lens.tolist()
+            _shared["seq_lens"] = (_sl_key, seq_lens_list)
+        else:
+            seq_lens_list = _sl_entry[1]
         # Sequence-parallel (or cudagraph) padding makes the model runner insert a
         # dummy padding request into query_start_loc to satisfy the FIA TND-layout
         # constraint (sum of q lengths == hidden_states.shape[0]), bumping the

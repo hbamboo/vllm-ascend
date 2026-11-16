@@ -488,7 +488,26 @@ class IQuestQ1Attention(nn.Module):
             # FullAttentionSpec.merge rejects a second distinct window value
             # next to the target's promoted SWA window. Allocation is full
             # either way; clearing the module attr only changes the spec view.
-            self.attn.sliding_window = None
+            # Under the hybrid KV cache manager the merge does not happen, and
+            # clearing it would give this single layer a spec bucket of its own,
+            # which collapses grouping to one group per layer (89 instead of 4).
+            if vllm_config.scheduler_config.disable_hybrid_kv_cache_manager:
+                self.attn.sliding_window = None
+            else:
+                # Under the hybrid KV cache manager the draft keeps a
+                # sliding-window spec, but it must use the target model's
+                # window: groups are formed by exact spec equality, and the
+                # draft checkpoint's own window (512) leaves it as a singleton
+                # bucket, whose size drives group_size = min(buckets) = 1, i.e.
+                # one KV cache group per layer (89 instead of 4).
+                _target_hf = getattr(
+                    vllm_config.speculative_config.target_model_config,
+                    "hf_config",
+                    None,
+                )
+                target_sw = getattr(_target_hf, "sliding_window", None)
+                if target_sw:
+                    self.attn.sliding_window = target_sw
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)
