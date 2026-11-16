@@ -712,36 +712,19 @@ class NPUWorker(WorkerBase):
         model_runner = getattr(self, "model_runner", None)
         layout = self.vllm_config.cache_config.get_resolved_kv_cache_layout()
         shares_attention_pool = False
-        aliased_attention_groups = False
         if getattr(self, "use_v2_model_runner", False):
             # Load V2 helpers only for V2 workers; V1 retains private allocation
             # and must keep its original multi-group budget scaling.
-            from vllm_ascend.utils import is_hidden_state_cache_spec
             from vllm_ascend.worker.v2.attn_utils import can_share_full_and_sliding_kv_cache
 
             shares_attention_pool = can_share_full_and_sliding_kv_cache(self.vllm_config, per_layer_specs)
-            # v2 _allocate_kv_cache overlays every group on ONE common backing
-            # whenever all descriptors share the same size (aliased_multi_group),
-            # so the engine's num_blocks already sizes that pool exactly. A
-            # multi-group pure-attention model (MXFP8 full attention next to a
-            # BF16 sliding-window group) must not be scaled down as if every
-            # layer owned a private buffer: max_group_pages/sum_pages is 0.28
-            # for IQuest-Q1, which shrinks the usable KV pool 3.6x.
-            aliased_attention_groups = (
-                len(kv_cache_groups) > 1
-                and has_attention
-                and not has_mamba
-                and not getattr(model_runner, "use_sparse", False)
-                and not getattr(model_runner, "use_compress", False)
-                and not any(is_hidden_state_cache_spec(spec) for spec in per_layer_specs)
-            )
         # TODO: The Step-3.5/3.7 models will be sunset in the future. Once they
         # are, remove this is_step_model exemption: this line and the
         # `or is_step_model` budget gate below.
         is_step_model = self.model_config.hf_text_config.model_type in ("step3p5", "step3p7")
         if (
             has_attention
-            and (has_mamba or is_step_model or shares_attention_pool or aliased_attention_groups)
+            and (has_mamba or is_step_model or shares_attention_pool)
             and layout.is_layer_compact
             and layout.is_block_compact
             and getattr(model_runner, "supports_standardized_shared_kv_backing", False)

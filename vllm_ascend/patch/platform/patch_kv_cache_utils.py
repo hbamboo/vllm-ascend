@@ -5,7 +5,6 @@ from collections import defaultdict
 from dataclasses import replace
 
 import vllm.v1.core.kv_cache_utils
-from vllm.v1.kv_cache_interface import AttentionSpec
 from vllm.config import VllmConfig
 from vllm.logger import logger
 from vllm.utils.math_utils import cdiv, round_up
@@ -99,7 +98,6 @@ def _ascend_resolve_kv_cache_block_sizes(
     cache_config = vllm_config.cache_config
     dcp = vllm_config.parallel_config.decode_context_parallel_size
     groups = kv_cache_config.kv_cache_groups
-
     cacheable_groups = [group for group in groups if is_prefix_cacheable(group.kv_cache_spec)]
     filtered_private_groups = bool(cacheable_groups) and len(cacheable_groups) != len(groups)
     if filtered_private_groups and not is_deepseek_v41_cache(groups):
@@ -675,81 +673,3 @@ vllm.v1.core.kv_cache_utils._pool_bytes_per_block = _ascend_pool_bytes_per_block
 import vllm.v1.engine.core  # noqa: E402
 
 vllm.v1.engine.core.resolve_kv_cache_block_sizes = _ascend_resolve_kv_cache_block_sizes
-
-
-# ---- Ascend: KV page unification tolerant of pre-padded specs -------------
-# ``AttentionSpec.page_size_bytes`` returns ``page_size_padded`` whenever it is
-# set, so vLLM's ratio branch (which only scales ``block_size``) can never reach
-# ``max_page_size`` for an already padded spec and its trailing assert fires.
-# Ascend pre-pads sliding-window layers to the shared page while a bf16 MTP
-# layer can hold the largest page - exactly that case. Drop the stale padding
-# and scale ``block_size`` instead: same bytes per token, no pool inflation.
-_orig_unify_kv_cache_spec_page_size = (
-    vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size
-)
-
-
-def _ascend_unify_kv_cache_spec_page_size(
-    kv_cache_spec: dict[str, KVCacheSpec],
-) -> dict[str, KVCacheSpec]:
-    """Replaces vLLM's ``unify_kv_cache_spec_page_size`` for Ascend."""
-    page_sizes = {layer.page_size_bytes for layer in kv_cache_spec.values()}
-    if len(page_sizes) <= 1:
-        return kv_cache_spec
-
-    max_page_size = max(page_sizes)
-    new_kv_cache_spec: dict[str, KVCacheSpec] = {}
-    for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
-            new_kv_cache_spec[layer_name] = layer_spec
-            continue
-        if isinstance(layer_spec, MambaSpec):
-            new_kv_cache_spec[layer_name] = replace(
-                layer_spec, page_size_padded=max_page_size
-            )
-            continue
-
-        layer_page_size = layer_spec.page_size_bytes
-        padded = getattr(layer_spec, "page_size_padded", None) is not None
-        new_spec: KVCacheSpec
-        if padded:
-            # The stale padding hides the natural page size; unpad first when
-            # the ratio branch can then land exactly on ``max_page_size``.
-            unpadded_spec = replace(layer_spec, page_size_padded=None)
-            natural = unpadded_spec.page_size_bytes
-            if natural > 0 and max_page_size % natural == 0:
-                new_spec = replace(
-                    unpadded_spec,
-                    block_size=unpadded_spec.block_size * (max_page_size // natural),
-                )
-            else:
-                new_spec = replace(layer_spec, page_size_padded=max_page_size)
-        elif max_page_size % layer_page_size == 0:
-            new_spec = replace(
-                layer_spec,
-                block_size=layer_spec.block_size * (max_page_size // layer_page_size),
-            )
-        elif isinstance(layer_spec, AttentionSpec) and not isinstance(
-            layer_spec, MLAAttentionSpec
-        ):
-            new_spec = replace(layer_spec, page_size_padded=max_page_size)
-        else:
-            raise NotImplementedError(
-                f"Layer {layer_name}: page size is not divisible by the "
-                "maximum page size and cannot be padded."
-            )
-        assert new_spec.page_size_bytes == max_page_size, (
-            layer_name,
-            type(layer_spec).__name__,
-            layer_spec.page_size_bytes,
-            getattr(layer_spec, "page_size_padded", None),
-            max_page_size,
-        )
-        new_kv_cache_spec[layer_name] = new_spec
-    return new_kv_cache_spec
-
-
-vllm.v1.core.kv_cache_utils.unify_kv_cache_spec_page_size = (
-    _ascend_unify_kv_cache_spec_page_size
-)
-# ---------------------------------------------------------------------------

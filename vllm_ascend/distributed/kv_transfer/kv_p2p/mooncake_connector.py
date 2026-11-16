@@ -2600,23 +2600,7 @@ class MooncakeConnectorWorker:
             ptrs.append(base_addr)
             lengths.append(kv_cache_tensor.size)
 
-        # HMA / aliased multi-group KV: several KVCacheTensors can cover (parts
-        # of) the same underlying allocation, so the raw ranges overlap and
-        # Mooncake rejects the second registration with "does not support
-        # overlapped memory region". Merge overlapping / adjacent ranges; the
-        # per-layer metadata built above is unaffected.
-        order = sorted(range(len(ptrs)), key=lambda i: ptrs[i])
-        m_ptrs: list[int] = []
-        m_lens: list[int] = []
-        for i in order:
-            start, nbytes = ptrs[i], lengths[i]
-            end = start + nbytes
-            if m_ptrs and start <= m_ptrs[-1] + m_lens[-1]:
-                m_lens[-1] = max(m_ptrs[-1] + m_lens[-1], end) - m_ptrs[-1]
-            else:
-                m_ptrs.append(start)
-                m_lens.append(nbytes)
-        return m_ptrs, m_lens
+        return ptrs, lengths
 
     def _get_registered_layer_buffers(self, kv_caches: dict[str, torch.Tensor]) -> tuple[list[int], list[int]]:
         ptrs: list[int] = []

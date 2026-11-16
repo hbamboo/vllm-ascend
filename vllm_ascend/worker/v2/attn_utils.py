@@ -18,7 +18,6 @@
 #
 
 import math
-import os
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -102,7 +101,6 @@ from vllm_ascend.quantization.methods.kv_cache.turboquant import TURBOQUANT_CACH
 from vllm_ascend.quantization.methods.kv_cache.turboquant.cache import uses_turboquant_groups
 from vllm_ascend.quantization.utils import enable_fa_quant
 from vllm_ascend.utils import (
-    A5_C8_MXFP_KV_CACHE_BLOCK_SIZE,
     calc_split_factor,
     enable_sfa,
     enable_sfa_dcp_replicated_indexer,
@@ -359,49 +357,6 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
                 mamba_specs[layer_name] = replace(spec, page_size_padded=common_page_size)
         kv_cache_spec.update(mamba_specs)
 
-    # C8 mxfp8 KV lives in whole 512-token kernel packets, and the scheduler
-    # takes its block size from min() over the KV cache groups. A sliding
-    # window spec otherwise keeps its own 128-token kernel block (page padded
-    # up to the mxfp8 page), which drags the global block size down to 128 and
-    # breaks the mxfp8 layout as soon as one request spans two blocks. Keep
-    # every attention layer on the same 1024-token scheduler block and drop
-    # the padding that only existed to fit the smaller SW block into an
-    # mxfp8-sized page; unify then pads the mxfp8 page instead.
-    if is_c8_mxfp_kv_quant(vllm_config):
-        c8_block = int(os.environ.get("VLLM_C8_KV_BLOCK", 2 * A5_C8_MXFP_KV_CACHE_BLOCK_SIZE))
-        for layer_name, layer_kv_spec in list(kv_cache_spec.items()):
-            if not isinstance(layer_kv_spec, AttentionSpec):
-                continue
-            if layer_kv_spec.block_size == c8_block and getattr(layer_kv_spec, "page_size_padded", None) is None:
-                continue
-            kv_cache_spec[layer_name] = replace(layer_kv_spec, block_size=c8_block, page_size_padded=None)
-
-    if os.environ.get("VLLM_SPEC_DUMP") == "1":
-        print(
-            "[SPEC] cache_block=%s skip_page=%s dcp=%s layers=%d"
-            % (
-                vllm_config.cache_config.block_size,
-                getattr(vllm_config.cache_config, "skip_page_size_padded", None),
-                vllm_config.parallel_config.decode_context_parallel_size,
-                len(kv_cache_spec),
-            ),
-            flush=True,
-        )
-        for layer_name, layer_kv_spec in kv_cache_spec.items():
-            print(
-                "[SPEC] %s %s block=%s page=%s padded=%s sw=%s dtype=%s"
-                % (
-                    layer_name,
-                    type(layer_kv_spec).__name__,
-                    layer_kv_spec.block_size,
-                    layer_kv_spec.page_size_bytes,
-                    getattr(layer_kv_spec, "page_size_padded", None),
-                    getattr(layer_kv_spec, "sliding_window", None),
-                    getattr(layer_kv_spec, "dtype", None),
-                ),
-                flush=True,
-            )
-
     return kv_cache_spec
 
 
@@ -461,9 +416,6 @@ def build_attn_metadata(
     draft_layer_names: set[str] | None = None,
 ) -> dict[str, Any]:
     """Build attention metadata for Ascend NPUs."""
-    from vllm_ascend.attention.attention_v1 import begin_build_step
-
-    begin_build_step()
     if skip_ring_state_update is None:
         skip_ring_state_update = ring_state_update_skipped()
     if seq_lens_np is None:
@@ -1163,17 +1115,7 @@ def _allocate_kv_cache(
         return kv_cache_raw_tensors
     has_mamba = any(isinstance(spec, MambaSpec) for spec in layer_kv_cache_spec.values())
     has_attention = any(isinstance(spec, AttentionSpec) for spec in layer_kv_cache_spec.values())
-    # Multi-group pure-attention models (e.g. an mxfp8 full-attention group
-    # plus a higher-precision sliding-window group under HMA) receive the
-    # same aliased descriptors as hybrid models: every KVCacheTensor is a
-    # view into one common backing of identical size, and a block ID belongs
-    # to one group at a time. Allocate that backing once; allocating
-    # tensor.size per descriptor duplicates the whole pool and OOMs.
-    aliased_multi_group = (
-        len(kv_cache_config.kv_cache_groups) > 1
-        and len({tensor.size for tensor in kv_cache_config.kv_cache_tensors}) == 1
-    )
-    use_hybrid_layout = (has_mamba and has_attention) or aliased_multi_group
+    use_hybrid_layout = has_mamba and has_attention
     is_glm5_next = any(getattr(spec, "model_version", None) == "glm5_next" for spec in layer_kv_cache_spec.values())
 
     # The restored DeepSeek-V4 planner on main computes capacity for one
