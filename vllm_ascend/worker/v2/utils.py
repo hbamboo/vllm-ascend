@@ -1,3 +1,4 @@
+import os
 from collections.abc import Callable, Iterable
 from contextlib import contextmanager
 from dataclasses import replace
@@ -120,6 +121,8 @@ class C8KVBlockZeroer:
         self.delegate = delegate
         self.entries = entries
         self.fill = fill
+        self._batch_restore = os.environ.get("VLLM_ZERO_BATCH", "1") != "0"
+        self._rows_cache: dict[int, tuple[torch.Tensor, torch.Tensor, int]] = {}
 
     def __getattr__(self, name: str) -> Any:
         return getattr(self.delegate, name)
@@ -129,6 +132,30 @@ class C8KVBlockZeroer:
         warmup = getattr(self.delegate, "warmup", None)
         if warmup is not None:
             warmup(num_kv_blocks)
+
+    def _rows(self, block_ids: list[int], ratio: int, device: torch.device) -> torch.Tensor:
+        """Physical rows ``b * ratio .. b * ratio + ratio`` for every block id."""
+        cap = max(64, 2 * len(block_ids))
+        cur = self._rows_cache.get(ratio)
+        if cur is None or cur[2] < len(block_ids):
+            ids_gpu = torch.empty(cap, dtype=torch.int64, device=device)
+            ids_cpu = torch.empty(cap, dtype=torch.int64, pin_memory=False)
+            cur = self._rows_cache[ratio] = (ids_cpu, ids_gpu, cap)
+        ids_cpu, ids_gpu, _ = cur
+        n = len(block_ids)
+        ids_cpu[:n] = torch.tensor(block_ids, dtype=torch.int64)
+        ids_gpu[:n].copy_(ids_cpu[:n], non_blocking=True)
+        offs = torch.arange(ratio, dtype=torch.int64, device=device)
+        return (ids_gpu[:n, None] * ratio + offs).reshape(-1)
+
+    def _restore_v_scales(self, block_ids: list[int]) -> None:
+        """Broadcast each entry's checkpoint V scale over its assigned pages."""
+        if not self.entries:
+            return
+        for value_scale, cache, ratio in self.entries:
+            rows = self._rows(block_ids, ratio, cache.device)
+            src = value_scale.view(cache.shape[1], cache.shape[2], 1, cache.shape[4], 1)
+            cache.view(-1, *cache.shape[1:])[rows] = src
 
     def zero_block_ids(self, block_ids: list[int]) -> None:
         if not block_ids:
@@ -141,10 +168,13 @@ class C8KVBlockZeroer:
                     raise IndexError(f"C8 physical block ID out of range: {block_id}")
         if self.delegate is not None:
             self.delegate.zero_block_ids(block_ids)
-        for value_scale, value_scale_cache, ratio in self.entries:
-            for block_id in block_ids:
-                start = block_id * ratio
-                self.fill(value_scale, value_scale_cache[start : start + ratio])
+        if self._batch_restore:
+            self._restore_v_scales(block_ids)
+        else:
+            for value_scale, value_scale_cache, ratio in self.entries:
+                for block_id in block_ids:
+                    start = block_id * ratio
+                    self.fill(value_scale, value_scale_cache[start : start + ratio])
 
 
 if TYPE_CHECKING:
