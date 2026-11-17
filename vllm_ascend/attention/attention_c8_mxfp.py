@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
 # reference: quant_flash_attn_golden.py "PA_NZ: fp8=[Bn,N,D//32,Bs,32],
 # Kscale=[Bn,N,Bs//16,D//64,16,2], Vscale=[Bn,N,D//16,Bs//64,16,2]"). The
@@ -76,6 +75,25 @@ MXFP_V_SCALE_NZ_DIM_FRAG = 16
 MXFP8_GROUP_SIZE = 32
 # E8M0 scale elements are always 1 byte in KV cache budgeting.
 MXFP_SCALE_DTYPE_SIZE = 1
+FP32_MANTISSA_BITS = 23
+E8M0_MIN_FP32_BITS = 0x00400000  # 2^-127, an FP32 subnormal.
+E8M0_NAN_CODE = 0xFF
+FP32_QNAN_BITS = 0x7FC00000
+
+
+def _dequantize_mxfp8_query(query: torch.Tensor, query_scale: torch.Tensor) -> torch.Tensor:
+    """Restore the QFA query values in FP32 using each 32-element MX scale."""
+    # Decode E8M0 bytes without an E8M0 Cast kernel. Both native E8M0 and
+    # byte-backed scales use the same encoding: code 0 is 2^-127, 255 is NaN.
+    exponent = query_scale.view(torch.uint8).to(torch.int32)
+    scale_bits = exponent << FP32_MANTISSA_BITS
+    scale_bits = torch.where(exponent == 0, E8M0_MIN_FP32_BITS, scale_bits)
+    scale_bits = torch.where(exponent == E8M0_NAN_CODE, FP32_QNAN_BITS, scale_bits)
+    # [T, N, D/64, 2] enumerates consecutive 32-element blocks along D.
+    num_groups = query.shape[-1] // MXFP8_GROUP_SIZE
+    scale = scale_bits.view(torch.float32).reshape(*query.shape[:-1], num_groups, 1)
+    grouped_query = query.float().reshape(*query.shape[:-1], num_groups, MXFP8_GROUP_SIZE)
+    return (grouped_query * scale).reshape(query.shape)
 
 
 def validate_mxfp_k_scale_head_dim(head_dim: int) -> None:
@@ -938,8 +956,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # value, so it only rescales the softmax denominator. QFA owns the
         # cache read, so request its LSE and fold the correction in _run_qfa
         # (same formula as the FIA path in vllm_ascend.models.iquest_q1.
-        # attention). sink_logit = scale * (q . sink_k[kv head]) on the raw
-        # bf16 query, computed before dynamic quantization.
+        # attention). Compute sink_logit = scale * (q . sink_k[kv head])
+        # using the same MXFP8 query and per-block scales consumed by QFA.
         # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
         # LSE convention).
         sink_key = getattr(layer, "sink_key", None)
@@ -962,6 +980,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             query[: attn_metadata.num_actual_tokens],
             dst_type=torch.float8_e4m3fn,
         )
+
+        if sink_key is not None:
+            num_actual_tokens = attn_metadata.num_actual_tokens
+            group = self.num_heads // self.num_kv_heads
+            q = _dequantize_mxfp8_query(query_mxfp8, query_scale).reshape(
+                num_actual_tokens, self.num_kv_heads, group, self.head_size
+            )
+            sink_logits = ((q * sink_key.float().unsqueeze(1)).sum(-1) * self.scale).reshape(
+                num_actual_tokens, self.num_heads
+            )
 
         # KV-sharing consumer layers reuse another layer's cache; writing
         # their (dummy) K/V would corrupt the shared slots, so only the
