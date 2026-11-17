@@ -292,6 +292,15 @@ class TestC8FIAPseudo(unittest.TestCase):
             impl.forward(layer, q, k, v, cache, meta, out)
         self.scatter.assert_not_called()
 
+    def test_single_query_sequences_use_default_mask(self):
+        impl, _, meta, cache, q, _, _, _ = self.setup_forward()
+        for q_ends, expected_mode in (([1], 0), ([1, 2], 0), ([1, 3], 3), ([2], 3)):
+            with self.subTest(q_ends=q_ends):
+                meta.actual_seq_lengths_q = q_ends
+                kwargs = impl._fia_kwargs(q, cache, meta)
+                self.assertEqual(kwargs["sparse_mode"], expected_mode)
+                self.assertIs(kwargs["atten_mask"], meta.attn_mask if expected_mode else None)
+
     def quant_method_namespace(self):
         namespace = {
             "torch": torch,

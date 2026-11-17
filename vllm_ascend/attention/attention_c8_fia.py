@@ -159,7 +159,10 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
         return output
 
     def _fia_kwargs(self, query, kv_cache, metadata):
-        causal = metadata.causal
+        q_ends = metadata.actual_seq_lengths_q
+        # FIA V5 requires defaultMask for single-query sequences. Their KV
+        # lengths already exclude future tokens, so a causal mask is redundant.
+        causal = metadata.causal and any(end - start > 1 for start, end in zip([0, *q_ends[:-1]], q_ends))
         return {
             "query": query,
             "key": kv_cache[0],
