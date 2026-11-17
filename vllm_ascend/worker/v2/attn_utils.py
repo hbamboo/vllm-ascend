@@ -1590,7 +1590,13 @@ def _reshape_kv_cache_v2(
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
-                kv_caches[layer_name] = mxfp_cache_views_for_spec(raw_cache, kv_cache_spec, kernel_block_size)
+                additional_config = getattr(vllm_config, "additional_config", None) or {}
+                kv_caches[layer_name] = mxfp_cache_views_for_spec(
+                    raw_cache,
+                    kv_cache_spec,
+                    kernel_block_size,
+                    fia_pseudo=additional_config.get("c8_mxfp_backend", "qfa") == "fia_pseudo",
+                )
                 continue
 
             if layer_name in layer_tuple_strides:

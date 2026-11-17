@@ -75,6 +75,7 @@ MXFP_V_SCALE_NZ_DIM_FRAG = 16
 MXFP8_GROUP_SIZE = 32
 # E8M0 scale elements are always 1 byte in KV cache budgeting.
 MXFP_SCALE_DTYPE_SIZE = 1
+FIA_SCALE_DTYPE_SIZE = 4
 FP32_MANTISSA_BITS = 23
 E8M0_MIN_FP32_BITS = 0x00400000  # 2^-127, an FP32 subnormal.
 E8M0_NAN_CODE = 0xFF
@@ -270,7 +271,9 @@ def mxfp_paged_cache_views(
     return tuple(views)
 
 
-def mxfp_cache_views_for_spec(raw_tensor: torch.Tensor, spec: "FullAttentionSpec", kernel_block_size: int):
+def mxfp_cache_views_for_spec(
+    raw_tensor: torch.Tensor, spec: "FullAttentionSpec", kernel_block_size: int, *, fia_pseudo: bool = False
+):
     """Translate scheduler pages (including padding) into kernel block views."""
     if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
         raise ValueError("MXFP scheduler block must contain a whole number of kernel blocks.")
@@ -278,6 +281,14 @@ def mxfp_cache_views_for_spec(raw_tensor: torch.Tensor, spec: "FullAttentionSpec
     page_bytes = spec.page_size_bytes
     if page_bytes % ratio or raw_tensor.numel() % page_bytes:
         raise ValueError("MXFP raw allocation and physical pitch must contain whole pages.")
+    if fia_pseudo:
+        return fia_pseudo_cache_views(
+            raw_tensor,
+            raw_tensor.numel() // page_bytes * ratio,
+            spec,
+            kernel_block_size,
+            page_stride_bytes=page_bytes // ratio,
+        )
     return mxfp_paged_cache_views(
         raw_tensor,
         raw_tensor.numel() // page_bytes * ratio,
@@ -287,6 +298,52 @@ def mxfp_cache_views_for_spec(raw_tensor: torch.Tensor, spec: "FullAttentionSpec
         kernel_block_size,
         page_stride_bytes=page_bytes // ratio,
     )
+
+
+def fia_pseudo_cache_views(
+    raw_tensor: torch.Tensor, num_blocks: int, spec, block_size: int, *, page_stride_bytes: int | None = None
+):
+    """Paged ND FP8 K/V plus FP32 per-token scales for FIA mode 4.
+
+    Each physical kernel page owns [K | V | K_scale | V_scale | padding].
+    All four views retain that page pitch, so zeroing or reassigning a hybrid
+    scheduler page cannot overwrite another page's data or scales. FIA V5
+    permits an axis-0 stride for BnBsH data and mode-4 scale caches.
+    """
+    if raw_tensor.ndim != 1 or raw_tensor.dtype != torch.int8 or not raw_tensor.is_contiguous():
+        raise ValueError("FIA FP8 cache requires a contiguous flat int8 allocation.")
+    if num_blocks <= 0:
+        raise ValueError("FIA FP8 cache requires at least one kernel block.")
+    if spec.head_size != spec.head_size_v:
+        raise ValueError("FIA FP8 pseudo cache requires equal K/V head dimensions.")
+    k_bytes, _, v_bytes, _ = mxfp_packet_section_sizes(spec.num_kv_heads, block_size, spec.head_size, spec.head_size_v)
+    scale_bytes = block_size * FIA_SCALE_DTYPE_SIZE
+    payload_bytes = k_bytes + v_bytes + 2 * scale_bytes
+    pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
+    if pitch < payload_bytes or raw_tensor.numel() < num_blocks * pitch:
+        raise ValueError("FIA FP8 cache page is too small for FP8 KV and FP32 per-token scales.")
+    if any(size % FIA_SCALE_DTYPE_SIZE for size in (pitch, raw_tensor.numel(), raw_tensor.storage_offset())):
+        raise ValueError("FIA FP32 scale cache requires a 4-byte-aligned allocation and page pitch.")
+    kv_shape = (num_blocks, block_size, spec.num_kv_heads * spec.head_size)
+    scale_shape = (num_blocks, block_size)
+    sections = (
+        (kv_shape, 0, torch.float8_e4m3fn, 1),
+        (kv_shape, k_bytes, torch.float8_e4m3fn, 1),
+        (scale_shape, k_bytes + v_bytes, torch.float32, FIA_SCALE_DTYPE_SIZE),
+        (scale_shape, k_bytes + v_bytes + scale_bytes, torch.float32, FIA_SCALE_DTYPE_SIZE),
+    )
+    views = []
+    for shape, offset, dtype, element_size in sections:
+        strides = (pitch // element_size, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
+        views.append(
+            torch.as_strided(
+                raw_tensor.view(dtype),
+                shape,
+                strides,
+                storage_offset=(raw_tensor.storage_offset() + offset) // element_size,
+            )
+        )
+    return tuple(views)
 
 
 def scatter_mxfp_pa_nz_kv_cache(

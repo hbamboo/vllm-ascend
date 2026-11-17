@@ -57,9 +57,12 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     checkpoint. Enabled with ``--kv-cache-dtype mxfp8``.
     """
 
-    def __init__(self, quant_description: dict, prefix: str):
+    def __init__(self, quant_description: dict, prefix: str, attention_backend: str = "qfa"):
         self.quant_description = quant_description
         self.prefix = prefix
+        if attention_backend not in ("qfa", "fia_pseudo"):
+            raise ValueError(f"Unsupported C8 attention backend: {attention_backend}")
+        self.attention_backend = attention_backend
 
     def create_weights(self, layer: torch.nn.Module) -> None:
         layer.kv_cache_torch_dtype = torch.float8_e4m3fn
@@ -69,13 +72,28 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
                 AscendC8MXFPAttentionBackendImpl,
             )
 
-            layer.attn_backend = AscendC8MXFPAttentionBackend
-            layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+            if getattr(self, "attention_backend", "qfa") == "fia_pseudo":
+                config = get_current_vllm_config()
+                if config.kv_transfer_config is not None:
+                    raise ValueError("c8_mxfp_backend=fia_pseudo does not support PD KV transfer.")
+                if config.model_config.dtype != torch.bfloat16:
+                    raise ValueError("c8_mxfp_backend=fia_pseudo requires --dtype bfloat16.")
+                from vllm_ascend.attention.attention_c8_fia import (
+                    AscendC8FIAPseudoAttentionBackend,
+                    AscendC8FIAPseudoAttentionBackendImpl,
+                )
+
+                layer.attn_backend = AscendC8FIAPseudoAttentionBackend
+                layer.impl.__class__ = AscendC8FIAPseudoAttentionBackendImpl
+            else:
+                layer.attn_backend = AscendC8MXFPAttentionBackend
+                layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
             # Changing __class__ does not invoke the new class's __init__, so
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
 
-        # The checkpoint supplies the static V-cache scale.
+        # Accept the checkpoint's V scale in both modes. FIA uses dynamic
+        # per-token scales instead, but must still load the original weights.
         hidden_size = layer.num_kv_heads * layer.head_size_v
         weight_param = torch.nn.Parameter(
             torch.full((hidden_size,), 127, dtype=torch.uint8),
@@ -88,6 +106,11 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
         vllm_config = get_current_vllm_config()
         target_dtype = vllm_config.model_config.dtype
+        if getattr(self, "attention_backend", "qfa") == "fia_pseudo":
+            if target_dtype != torch.bfloat16:
+                raise ValueError("FIA FP8 pseudo quantization requires --dtype bfloat16.")
+            # Mode 4 writes K/V scales into the paged cache at runtime.
+            return
         raw = layer.v_cache_scale.data
         # A minmax calibrator emits 0 for a channel whose absmax was 0;
         # sanitize to the neutral 127 so both consumers (the reciprocal below

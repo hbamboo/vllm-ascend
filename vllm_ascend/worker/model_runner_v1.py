@@ -4715,6 +4715,10 @@ class NPUModelRunner(GPUModelRunner):
         the scheduler assigns that physical page to full attention again.
         """
         self._c8_mxfp_v_scale_caches = []
+        if getattr(getattr(self, "ascend_config", None), "c8_mxfp_backend", "qfa") == "fia_pseudo":
+            # FIA reads static scales from the layer, not the two auxiliary
+            # cache planes reserved by the shared MXFP allocation budget.
+            return
         kv_cache_config = getattr(self, "kv_cache_config", None)
         group_by_layer = {
             name: group_id
@@ -5512,7 +5516,10 @@ class NPUModelRunner(GPUModelRunner):
                     raw = kv_cache_raw_tensors[layer_name]
                     if not isinstance(raw, torch.Tensor):
                         raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
-                    kv_caches[layer_name] = mxfp_cache_views_for_spec(raw, current_kv_cache_spec, kernel_block_size)
+                    kv_caches[layer_name] = mxfp_cache_views_for_spec(
+                        raw, current_kv_cache_spec, kernel_block_size,
+                        fia_pseudo=getattr(self.ascend_config, "c8_mxfp_backend", "qfa") == "fia_pseudo",
+                    )
                     continue
 
                 if layer_name in layer_tuple_strides:

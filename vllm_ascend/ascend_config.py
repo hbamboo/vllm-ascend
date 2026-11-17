@@ -596,6 +596,9 @@ class AscendConfig:
     # value (e.g. 4 = MXFP float8_e4m3 communication quantization) regardless of the
     # model's quant_type, 0 means disabled (use the model's own quant).
     combine_quant_mode: Literal[0, 2, 3, 4] = 0
+    # QFA keeps the checkpoint's MXFP8 recipe. FIA pseudo keeps Q in BF16
+    # and dynamically quantizes K/V per token, with paged FP32 scale caches.
+    c8_mxfp_backend: Literal["qfa", "fia_pseudo"] = "qfa"
     pa_shape_list: list[Any] = dataclasses.field(default_factory=list)
     # Per-rank token capacity after dispatch in the fused MC2/MegaMoe path.
     # The same value is passed as dispatch_ffn_combine's max_output_size

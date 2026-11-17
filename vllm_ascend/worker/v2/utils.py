@@ -55,7 +55,12 @@ class AscendV2KVBlockZeroer(KVBlockZeroer):
                 if layer_name in runner_only_attn_layers:
                     continue
                 kv_cache = static_forward_context[layer_name].kv_cache
-                if cache_dtype == "mxfp8" and isinstance(kv_cache, tuple) and len(kv_cache) == 4:
+                if (
+                    cache_dtype == "mxfp8"
+                    and isinstance(kv_cache, tuple)
+                    and len(kv_cache) == 4
+                    and kv_cache[3].dtype == torch.uint8
+                ):
                     kv_cache = kv_cache[:3]
                 layer_caches[layer_name] = kv_cache
         component_count = 1

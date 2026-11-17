@@ -737,7 +737,12 @@ class AscendModelSlimConfig(QuantizationConfig):
                     logger.info_once("[quantization] C8 MXFP8 KV cache enabled (--kv-cache-dtype mxfp8).")
                 from ..methods.kv_cache.mxfp_c8 import AscendC8MXFPKVCacheAttentionMethod
 
-                scheme = AscendC8MXFPKVCacheAttentionMethod(self.quant_description, prefix)
+                additional_config = getattr(get_current_vllm_config(), "additional_config", None) or {}
+                scheme = AscendC8MXFPKVCacheAttentionMethod(
+                    self.quant_description,
+                    prefix,
+                    attention_backend=additional_config.get("c8_mxfp_backend", "qfa"),
+                )
                 logger.debug(
                     "Select AscendKVCacheMethod(C8-MXFP) for %s (layer=%s)", prefix, "AttentionLayerBase[C8-MXFP]"
                 )
@@ -820,10 +825,7 @@ class AscendModelSlimConfig(QuantizationConfig):
         """
         from vllm.model_executor.layers.attention import Attention
 
-        return (
-            isinstance(layer, Attention)
-            and getattr(layer, "sliding_window", None) is None
-        )
+        return isinstance(layer, Attention) and getattr(layer, "sliding_window", None) is None
 
     @property
     def enable_mxfp_c8_quant(self) -> bool:
