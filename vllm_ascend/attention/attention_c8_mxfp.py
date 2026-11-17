@@ -84,7 +84,7 @@ def quantize_mxfp_per_token(key: torch.Tensor) -> tuple[torch.Tensor, torch.Tens
 
     The quantizer's second scale byte is padding when there is only one
     block. Repeat only the first byte into the existing 32-channel scale
-    slots for QFA K. FIA K/V use the first slot as their per-token descale.
+    slots for the K-only QFA path.
     """
     if key.ndim != 3:
         raise ValueError("Per-token C8 KV must have shape [tokens, kv_heads, head_dim].")
