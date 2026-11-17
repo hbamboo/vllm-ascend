@@ -92,7 +92,7 @@ class TestC8KPerTokenNPU(unittest.TestCase):
 
     def run_case(self, case):
         q8, qs = torch_npu.npu_dynamic_mx_quant(case.query, dst_type=torch.float8_e4m3fn)
-        k8, ks = self.helpers.quantize_mxfp_key_per_token(case.key)
+        k8, ks = self.helpers.quantize_mxfp_per_token(case.key)
         v8 = torch_npu.npu_quantize(case.value.flatten(1), case.reciprocal, None, torch.float8_e4m3fn, -1, False)
         v8 = v8.reshape_as(case.value)
         self.helpers.scatter_mxfp_pa_nz_kv_cache(k8, v8, *case.cache[:2], case.slots)
@@ -181,6 +181,110 @@ class TestC8KPerTokenNPU(unittest.TestCase):
                 quantized = self.run_case(case)
                 torch.npu.synchronize()
                 self.check_case(case, quantized)
+
+
+class TestC8KVPerTokenNPU(TestC8KPerTokenNPU):
+    """Same pages and prompts, with production FIA and two dynamic scales."""
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        import triton
+        import triton.language as tl
+
+        root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
+        spec = importlib.util.spec_from_file_location("c8_sink", root / "vllm_ascend/ops/triton/sink.py")
+        sink = importlib.util.module_from_spec(spec)
+        # The sink kernel uses no cached device-property values; bypass only
+        # that initialization to avoid importing vLLM platform plugins here.
+        with patch.dict(
+            sys.modules,
+            {
+                "vllm.triton_utils": SimpleNamespace(triton=triton, tl=tl),
+                "vllm_ascend.ops.triton.triton_utils": SimpleNamespace(init_device_properties_triton=lambda: None),
+            },
+        ):
+            spec.loader.exec_module(sink)
+        cls.helpers.AscendC8FIAPseudoAttentionBackendImpl.forward.__globals__["sink_apply_triton"] = (
+            sink.sink_apply_triton
+        )
+
+    def make_case(self, q_len, padding=0):
+        case = super().make_case(q_len, padding)
+        spec = SimpleNamespace(num_kv_heads=1, head_size=128, head_size_v=128)
+        case.cache = self.helpers.fia_pseudo_cache_views(case.raw, 3, spec, 512, page_stride_bytes=case.pitch)
+        case.value.mul_(torch.exp2(torch.arange(529, device="npu").remainder(5).float() - 2)[:, None, None])
+        case.impl = self.helpers.AscendC8FIAPseudoAttentionBackendImpl()
+        case.impl.num_heads, case.impl.num_kv_heads, case.impl.head_size, case.impl.scale = 6, 1, 128, 128**-0.5
+        case.impl.kv_sharing_target_layer_name = None
+        case.metadata.actual_seq_lengths_q = [q_len]
+        case.metadata.seq_lens_list = [529]
+        case.layer = SimpleNamespace(layer_name="attn")
+        return case
+
+    def run_case(self, case):
+        k8, ks = self.helpers.quantize_mxfp_per_token(case.key)
+        v8, vs = self.helpers.quantize_mxfp_per_token(case.value)
+        ks = torch.exp2(ks[:, 0, 0, 0].float() - 127)
+        vs = torch.exp2(vs[:, 0, 0, 0].float() - 127)
+        self.helpers.scatter_fia_fp8_cache(k8, v8, ks, vs, case.cache, case.slots)
+        case.impl.forward(case.layer, case.query, None, None, case.cache, case.metadata, output=case.output)
+        return k8, ks, v8, vs
+
+    def check_case(self, case, quantized):
+        k8, ks, v8, vs = (x.cpu() for x in quantized)
+        pages, offsets = case.slots.cpu() // 512, case.slots.cpu() % 512
+        for cached, source in zip(case.cache, (k8.flatten(1), v8.flatten(1), ks, vs)):
+            cached = cached.cpu()
+            if source.dtype == torch.float8_e4m3fn:
+                cached, source = cached.view(torch.uint8), source.view(torch.uint8)
+            torch.testing.assert_close(cached[pages, offsets], source, rtol=0, atol=0)
+        self.assertGreater(vs.unique().numel(), 1)
+        k = (k8.float() * ks[:, None, None]).bfloat16().float().repeat_interleave(6, 1)
+        v = (v8.float() * vs[:, None, None]).bfloat16().float().repeat_interleave(6, 1)
+        scores = torch.einsum("thd,shd->hts", case.query.cpu().float(), k) / math.sqrt(128)
+        mask = torch.arange(529)[None] > torch.arange(case.q_len)[:, None] + 529 - case.q_len
+        scores.masked_fill_(mask[None], float("-inf"))
+        expected = torch.einsum("hts,shd->thd", scores.softmax(-1), v)
+        if hasattr(case.layer, "sink_key"):
+            logits = (case.query.cpu().float() * case.layer.sink_key.cpu()).sum(-1) / math.sqrt(128)
+            expected *= torch.sigmoid(scores.logsumexp(-1).t() - logits)[..., None]
+        actual = case.output.cpu()
+        torch.testing.assert_close(actual, expected.bfloat16(), rtol=0.02, atol=0.02)
+        print(
+            "FIA_PASS",
+            case.q_len,
+            case.padding,
+            "max_error",
+            (actual - expected.bfloat16()).abs().max().item(),
+            flush=True,
+        )
+
+    def test_graph_replay_refreshes_token_scales(self):
+        case = self.make_case(1, 256)
+        for _ in range(3):
+            self.run_case(case)
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            quantized = self.run_case(case)
+        for factor in (2, 0.25):
+            case.key.mul_(factor)
+            case.value.mul_(1 / factor)
+            graph.replay()
+            torch.npu.synchronize()
+            self.check_case(case, quantized)
+            graph_output = case.output.clone()
+            self.run_case(case)
+            torch.npu.synchronize()
+            torch.testing.assert_close(case.output, graph_output, rtol=0, atol=0)
+
+    def test_learned_key_sink(self):
+        for q_len in (1, 6):
+            case = self.make_case(q_len)
+            case.layer.sink_key = torch.randn(1, 128, device="npu") / 4
+            quantized = self.run_case(case)
+            torch.npu.synchronize()
+            self.check_case(case, quantized)
 
 
 if __name__ == "__main__":

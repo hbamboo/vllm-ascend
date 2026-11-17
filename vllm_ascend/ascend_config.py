@@ -588,6 +588,8 @@ class AscendConfig:
     # C8-MXFP K granularity; per_token shares one E8M0 scale across all
     # local KV heads/channels, retaining QFA's existing cache wire format.
     c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
+    # Dynamic per-token V selects FIA with paged FP32 K/V descales.
+    c8_v_quant_mode: Literal["per_channel", "per_token"] = "per_channel"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -708,6 +710,16 @@ class AscendConfig:
         vc = vllm_config
         if self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
             raise ValueError("c8_k_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
+        if self.c8_v_quant_mode == "per_token":
+            # Keep torch lazy: this module is imported during platform discovery.
+            import torch
+
+            if self.c8_k_quant_mode != "per_token":
+                raise ValueError("c8_v_quant_mode=per_token requires c8_k_quant_mode=per_token.")
+            if vc.model_config.dtype != torch.bfloat16:
+                raise ValueError("Dynamic per-token KV requires --dtype bfloat16.")
+            if vc.kv_transfer_config is not None:
+                raise ValueError("Dynamic per-token KV does not support PD KV transfer.")
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None

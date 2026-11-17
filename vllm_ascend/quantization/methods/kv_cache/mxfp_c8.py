@@ -59,6 +59,8 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     checkpoint. Enabled with ``--kv-cache-dtype mxfp8``.
     """
 
+    v_quant_mode = "per_channel"
+
     def __init__(self, quant_description: dict, prefix: str):
         self.quant_description = quant_description
         self.prefix = prefix
@@ -72,12 +74,25 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
                 AscendC8MXFPAttentionBackendImpl,
             )
 
-            layer.attn_backend = AscendC8MXFPAttentionBackend
-            layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+            config = get_ascend_config()
+            self.v_quant_mode = config.c8_v_quant_mode
+            if self.v_quant_mode == "per_token":
+                from vllm_ascend.attention.attention_c8_fia import (
+                    AscendC8FIAPseudoAttentionBackend,
+                    AscendC8FIAPseudoAttentionBackendImpl,
+                )
+
+                if layer.head_size != layer.head_size_v:
+                    raise ValueError("Dynamic per-token KV requires equal K/V head dimensions.")
+                layer.attn_backend = AscendC8FIAPseudoAttentionBackend
+                layer.impl.__class__ = AscendC8FIAPseudoAttentionBackendImpl
+            else:
+                layer.attn_backend = AscendC8MXFPAttentionBackend
+                layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
             # Changing __class__ does not invoke the new class's __init__, so
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
-            layer.impl.k_quant_mode = get_ascend_config().c8_k_quant_mode
+            layer.impl.k_quant_mode = config.c8_k_quant_mode
             if (
                 layer.impl.k_quant_mode == "per_token"
                 and layer.num_kv_heads * layer.head_size > MXFP_MAX_QUANT_BLOCK_SIZE
@@ -95,6 +110,10 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         weight_param.weight_loader = _quant_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.v_quant_mode == "per_token":
+            # Load fa_v.scale for checkpoint compatibility; runtime generates
+            # and caches a fresh scale for every V token instead.
+            return
         vllm_config = get_current_vllm_config()
         target_dtype = vllm_config.model_config.dtype
         raw = layer.v_cache_scale.data

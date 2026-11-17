@@ -16,7 +16,7 @@ exec python -m vllm.entrypoints.cli.main serve \
     --kv-cache-dtype mxfp8 \
     --kv-cache-dtype-skip-layers sliding_window \
     --block-size 512 \
-    --additional-config '{"c8_k_quant_mode":"per_token"}' \
+    --additional-config '{"c8_k_quant_mode":"per_token","c8_v_quant_mode":"per_token"}' \
     --enforce-eager \
     --max-model-len 4096 \
     --max-num-batched-tokens 1024 \

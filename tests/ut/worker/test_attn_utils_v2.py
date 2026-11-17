@@ -25,7 +25,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
 from vllm_ascend.attention import utils as attention_utils
-from vllm_ascend.attention.attention_c8_mxfp import mxfp_cache_spec, mxfp_paged_cache_views
+from vllm_ascend.attention.attention_c8_mxfp import fia_pseudo_cache_views, mxfp_cache_spec, mxfp_paged_cache_views
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -870,7 +870,8 @@ def test_v2_zeroer_covers_each_mla_component_view():
     assert all(zeroer._meta[-1] == 3 for zeroer in zeroer._zeroers)
 
 
-def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
+@pytest.mark.parametrize("dynamic_v", [False, True])
+def test_v2_zeroer_mxfp8_scales(monkeypatch, dynamic_v):
     heads, k_dim, v_dim, block = 2, 64, 64, 512
     num_blocks = 3
     k_bytes = heads * block * k_dim
@@ -881,6 +882,8 @@ def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
     raw = torch.full((128 + num_blocks * pitch + 128,), 37, dtype=torch.int8)
     views = mxfp_paged_cache_views(raw[128:-128], num_blocks, heads, k_dim, v_dim, block, page_stride_bytes=pitch)
     spec = mxfp_cache_spec(_plain_full_attention_spec())
+    if dynamic_v:
+        views = fia_pseudo_cache_views(raw[128:-128], num_blocks, spec, block, page_stride_bytes=pitch)
     zeroer = AscendV2KVBlockZeroer(
         torch.device("cpu"),
         attn_groups_iter=[
@@ -897,8 +900,7 @@ def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
         cache_dtype="mxfp8",
     )
 
-    # The 4-tuple is truncated: only k, v and k_scale components are zeroed.
-    assert len(zeroer._zeroers) == 3
+    assert len(zeroer._zeroers) == (4 if dynamic_v else 3)
 
     # CPU runners cannot launch the Triton kernel; replay its segment-table
     # zeroing in plain torch.
@@ -918,6 +920,13 @@ def test_v2_zeroer_skips_static_v_scale_for_mxfp8(monkeypatch):
 
     monkeypatch.setattr("vllm.v1.worker.utils._zero_kv_blocks_kernel", _CpuZeroKernel())
     zeroer.zero_block_ids([0])
+
+    if dynamic_v:
+        payload = k_bytes + v_bytes + ks_bytes + vs_bytes
+        assert torch.all(raw[128 : 128 + payload] == 0)
+        assert torch.all(raw[128 + payload :] == 37)
+        assert torch.all(raw[:128] == 37)
+        return
 
     # Block 0 payload: k, k_scale and v are cleared, v_scale is preserved.
     assert torch.all(raw[128 : 128 + k_bytes] == 0)
@@ -2625,6 +2634,7 @@ def test_tq_groups_without_a_dsa_builder_skip_the_formatted_mapping(for_capture,
 
 def _c8_mxfp_vllm_config(cache_dtype: str = "mxfp8") -> SimpleNamespace:
     return SimpleNamespace(
+        additional_config={},
         cache_config=SimpleNamespace(cache_dtype=cache_dtype),
         attention_config=SimpleNamespace(indexer_kv_dtype="auto"),
         parallel_config=SimpleNamespace(decode_context_parallel_size=1),
@@ -2655,7 +2665,9 @@ def _run_get_kv_cache_spec(monkeypatch, vllm_config, spec) -> dict:
 
 @pytest.mark.parametrize("head_size_v", [64, 128])
 def test_get_kv_cache_spec_rewrites_c8_mxfp_spec(monkeypatch, head_size_v):
-    spec = _run_get_kv_cache_spec(monkeypatch, _c8_mxfp_vllm_config(), _plain_full_attention_spec(head_size_v))["attn"]
+    # Quantized layers already mark FP8; BF16 skip-layers must remain BF16.
+    layer_spec = replace(_plain_full_attention_spec(head_size_v), dtype=torch.float8_e4m3fn)
+    spec = _run_get_kv_cache_spec(monkeypatch, _c8_mxfp_vllm_config(), layer_spec)["attn"]
 
     assert spec.dtype == torch.float8_e4m3fn
     # Scales are budgeted through state_content_bytes: K + V + E8M0 groups.
@@ -2673,8 +2685,8 @@ def test_get_kv_cache_spec_keeps_plain_spec_without_mxfp8(monkeypatch):
     assert spec.state_content_bytes is None
 
 
-@pytest.mark.parametrize("head_size_v", [64, 128])
-def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v):
+@pytest.mark.parametrize("head_size_v,dynamic_v", [(64, False), (128, False), (64, True)])
+def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dynamic_v):
     spec = mxfp_cache_spec(_plain_full_attention_spec(head_size_v))
     num_blocks = 3
     layer_name = "attn"
@@ -2684,7 +2696,10 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v):
         kv_cache_tensors=[_make_kv_cache_tensor(raw.numel(), [layer_name], spec.page_size_bytes)],
         kv_cache_groups=[KVCacheGroupSpec(layer_names=[layer_name], kv_cache_spec=spec)],
     )
-    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: _c8_mxfp_vllm_config())
+    config = _c8_mxfp_vllm_config()
+    if dynamic_v:
+        config.additional_config["c8_v_quant_mode"] = "per_token"
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
 
@@ -2705,6 +2720,12 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v):
     )
 
     k, v, k_scale, v_scale = reshaped[layer_name]
+    if dynamic_v:
+        assert k.shape == v.shape == (num_blocks, 512, 2 * 64)
+        assert k_scale.shape == v_scale.shape == (num_blocks, 512)
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+        assert k_scale.stride(0) * 4 == spec.page_size_bytes
+        return
     assert k.shape == (num_blocks, 2, 64 // 32, 512, 32)
     assert v.shape == (num_blocks, 2, head_size_v // 32, 512, 32)
     assert k.dtype == v.dtype == torch.float8_e4m3fn

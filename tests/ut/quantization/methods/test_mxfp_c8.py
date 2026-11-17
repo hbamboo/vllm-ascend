@@ -360,7 +360,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
 
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token_group"),
+            return_value=SimpleNamespace(c8_k_quant_mode="per_token_group", c8_v_quant_mode="per_channel"),
         ):
             method.create_weights(layer)
 
@@ -376,7 +376,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         layer.head_size = layer.head_size_v = 128
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token"),
+            return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"),
         ):
             AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
         self.assertEqual(layer.impl.k_quant_mode, "per_token")
@@ -387,11 +387,27 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         with (
             patch(
                 "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-                return_value=SimpleNamespace(c8_k_quant_mode="per_token"),
+                return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"),
             ),
             self.assertRaisesRegex(ValueError, "1024"),
         ):
             AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+
+    def test_dynamic_v_installs_fia_and_skips_static_scale_postload(self):
+        from vllm_ascend.attention.attention_c8_fia import AscendC8FIAPseudoAttentionBackendImpl
+
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_token"),
+        ):
+            method.create_weights(layer)
+        method.process_weights_after_loading(layer)
+        self.assertIsInstance(layer.impl, AscendC8FIAPseudoAttentionBackendImpl)
+        self.assertTrue(hasattr(layer, "v_cache_scale"))
+        self.assertFalse(hasattr(layer, "v_cache_scale_float_reciprocal"))
 
 
 class TestQuantWeightLoader(TestBase):

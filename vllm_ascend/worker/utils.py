@@ -287,9 +287,10 @@ class AscendKVBlockZeroer(KVBlockZeroer):
                     kv_tensors = (kv_cache,)
                 else:
                     kv_tensors = kv_cache
-                    if cache_dtype == "mxfp8" and len(kv_tensors) == 4:
+                    if cache_dtype == "mxfp8" and len(kv_tensors) == 4 and kv_tensors[3].dtype == torch.uint8:
                         # V scales are checkpoint constants, initialized before
                         # capture. Clearing a recycled block must preserve them.
+                        # FIA FP32 per-token scales are dynamic and must be zeroed.
                         kv_tensors = kv_tensors[:3]
                 for kv in kv_tensors:
                     dp = kv.data_ptr()

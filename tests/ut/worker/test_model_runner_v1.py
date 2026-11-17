@@ -4289,6 +4289,7 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
 
     def _runner(self, layers):
         runner = NPUModelRunner.__new__(NPUModelRunner)
+        runner.ascend_config = SimpleNamespace(c8_v_quant_mode="per_channel")
         runner.kv_cache_config = SimpleNamespace(num_blocks=self.NUM_BLOCKS)
         runner.compilation_config = SimpleNamespace(static_forward_context=layers)
         runner.vllm_config = SimpleNamespace(
@@ -4332,6 +4333,14 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
 
     def test_a_layer_without_a_forward_context_entry_is_skipped(self):
         self._runner({})._fill_c8_mxfp_v_scale_caches({"stray": (MagicMock(), MagicMock())})
+
+    def test_dynamic_c8_v_scales_are_not_filled_from_checkpoint(self):
+        runner = self._runner({})
+        runner.ascend_config.c8_v_quant_mode = "per_token"
+        cache = self._c8_cache()
+        runner._fill_c8_mxfp_v_scale_caches({"attn": cache})
+        self.assertEqual(runner._c8_mxfp_v_scale_caches, [])
+        self.assertTrue(torch.all(cache[3] == 0))
 
     def test_cache_setup_hands_back_a_filled_cache(self):
         # The wiring, not just the helper: nothing downstream of

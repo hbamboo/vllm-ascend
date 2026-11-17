@@ -127,6 +127,11 @@ class TestAscendConfig(TestBase):
         with self.assertRaisesRegex(ValueError, "--kv-cache-dtype mxfp8"):
             config.derive_and_validate(SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="auto")))
 
+    def test_c8_v_quant_mode_requires_per_token_k(self):
+        config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_v_quant_mode="per_token")
+        with self.assertRaisesRegex(ValueError, "c8_k_quant_mode"):
+            config.derive_and_validate(SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="mxfp8")))
+
     @staticmethod
     def _clean_up_ascend_config(func):
         def wrapper(*args, **kwargs):
