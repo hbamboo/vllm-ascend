@@ -18,6 +18,7 @@
 - K/V：各调用一次 `npu_dynamic_quant(..., dst_type=torch.float8_e4m3fn, quant_mode="pertoken")`，每个 token 的 K、V 分别产生一个 FP32 scale；该 token 在当前 TP rank 上的所有 KV head/channel 共享 scale。
 - Cache：分页 ND 的 FP8 K/V 与 FP32 scale。包括 PrefillNoCache 在内的路径都先写量化 cache，再由 FIA 读取，避免 prefill 绕过 KV 量化。
 - Attention：调用 `torch_npu.npu_fused_infer_attention_score_v2`，`query_quant_mode=0`、`key_quant_mode=4`、`value_quant_mode=4`，`dequant_scale_key/value` 指向分页 FP32 scale cache。由算子内部反量化 K/V 后计算，没有在 Python 侧反量化整个 cache。
+- 单 token decode：FIA V5 要求 `sparse_mode=0`，不传 causal mask；可见 KV 长度已排除未来 token。存在多 token query 的 causal 批次使用 `sparse_mode=3`。
 - Sink：复用 C16 路径的 learned-key sink 融合后处理，使用原 BF16 Q 和 FIA 返回的 LSE。
 - 图模式：使用 FIA v2 的 UpdatableGraph 任务，重放时更新实际 Q/KV 长度；scale cache 地址固定，scale 内容随新 token 更新。
 
@@ -61,7 +62,7 @@ K/V: [T, Nkv, D]
 - 面向 Ascend 950，BF16，full-attention 层，K/V head_dim 相同。
 - Sliding-window 层继续由现有模型逻辑保留为 C16；PCP/DCP 不支持。
 - 当前不支持 PD KV 传输：新 page 的数据/scale 排布不能与旧 QFA packet 格式混用；配置了 KV transfer 时初始化明确报错。
-- 没有 NPU 实测。本次按用户要求仅修改本地代码；CPU 合约测试覆盖 page 边界与 stride、TND 恢复、两份动态 scale、跨页/多请求写入、decode 历史缓存、padding、V1/V2 zeroer 和图任务参数。同步后仍需验证服务器所安装 CANN 的 FIA mode 4 支持及整模型精度。
+- 已在 `10.222.47.74` 的 `hxd_debug` 容器、Ascend950DT_9582 上完成真实 NPU 算子验证。17 项 CPU 合约测试覆盖 page 边界与 stride、TND 恢复、两份动态 scale、跨页/多请求写入、decode 历史缓存、padding、V1/V2 zeroer 和图任务参数。尚未验证整模型推理精度与性能。
 
 CPU 合约测试可独立执行，不依赖 vLLM/torch_npu 初始化：
 
@@ -77,6 +78,8 @@ ASCEND_RT_VISIBLE_DEVICES=0 python tests/e2e/nightly/single_node/ops/singlecard_
 
 命令在同步后的仓库根目录执行，不依赖 `PYTHONPATH=.`。脚本在选择 NPU 后查询实际 runtime SOC，并打印设备名称和软件版本；不依赖 vllm-ascend 的构建期 `_build_info`。如果显示 `skipped`，表示没有执行 NPU 验证。
 
-该验证入口未在本地 Windows/NPU 上执行。当前 TorchNPU Python 文档与底层 V5 文档的 decode 类型支持列表存在差异，因此不能省略服务器版本验证。保持原始 BF16 KV 的模型结果可作为另一组精度比较标杆，但不能用于要求此量化路径逐值相等的测试。
+2026-11-17 验证代码提交为 `9d98c9da1`，环境为 torch `2.10.0+cpu`、torch_npu `2.10.0.post7`，实际 runtime SOC 为 `260`。eager 测试覆盖 `Q=1/6/128` 与 page padding `0/64` 共 6 组情况；数据和 scale cache 按字节/数值精确比对通过，attention 输出（rtol/atol 均为 0.02）和 LSE（rtol/atol 均为 0.01）与上述 BF16 反量化标杆比对通过。另一项图测试在两轮修改 K/V 输入后 replay，比对也通过。
+
+当前 TorchNPU Python 文档与底层 V5 文档的 decode 类型支持列表存在差异，其他服务器版本仍需实际验证。保持原始 BF16 KV 的模型结果可作为另一组精度比较标杆，但不能用于要求此量化路径逐值相等的测试。
 
 接口依据：[动态量化接口](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_dynamic_quant.md)、[FIA v2 Python 接口](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_fused_infer_attention_score_v2.md)、[底层 FIA V5 规格](https://github.com/hicann/ops-transformer/blob/master/attention/fused_infer_attention_score/docs/aclnnFusedInferAttentionScoreV5.md)。底层 V5 允许 FP8 per-token/mode 4，分页 BnBsH 数据与 mode-4 scale 可带第 0 维 stride。
