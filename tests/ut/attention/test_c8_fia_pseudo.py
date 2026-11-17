@@ -24,6 +24,18 @@ def load_nodes(path, namespace, kinds, names=None):
     exec(compile(module, str(path), "exec"), namespace)
 
 
+def load_class_method(path, class_name, method_name):
+    """Use the real base API, so the harness cannot invent missing methods."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+    method = next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == method_name)
+    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
+    module = ast.fix_missing_locations(ast.Module(body=[future, method], type_ignores=[]))
+    namespace = {}
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[method_name]
+
+
 def reference_quantize(x, *, dst_type, quant_mode):
     if x.ndim != 2 or quant_mode != "pertoken" or dst_type != torch.float8_e4m3fn:
         raise AssertionError("FIA mode 4 needs one scale per flattened token")
@@ -37,7 +49,12 @@ class TestC8FIAPseudo(unittest.TestCase):
         torch.manual_seed(7)
         torch.set_num_threads(1)
         self.root = Path(__file__).resolve().parents[3]
-        base = type("Base", (), {"get_graph_metadata_layer_name": lambda impl, name: name})
+        graph_metadata_method = load_class_method(
+            self.root / "vllm_ascend/attention/attention_v1.py",
+            "AscendAttentionBackendImpl",
+            "_graph_metadata_layer_name",
+        )
+        base = type("Base", (), {"_graph_metadata_layer_name": graph_metadata_method})
         self.fia = Mock(side_effect=self.reference_fia)
         self.fia.out = Mock()
         self.scatter = Mock(side_effect=self.scatter_nd)
@@ -283,6 +300,18 @@ class TestC8FIAPseudo(unittest.TestCase):
         self.assertIs(kwargs["dequant_scale_value"], cache[3])
         self.assertIs(kwargs["out"][0].untyped_storage(), out.untyped_storage())
         torch.testing.assert_close(self.sink.call_args.args[0], q, rtol=0, atol=0)
+        self.dynamic_quant.assert_not_called()
+
+    def test_capture_resolves_metadata_from_kv_sharing_owner(self):
+        impl, layer, meta, cache, q, _, _, out = self.setup_forward()
+        layer.layer_name = "consumer"
+        impl.kv_sharing_target_layer_name = "owner"
+        impl._graph_metadata_layer_name = Mock(wraps=impl._graph_metadata_layer_name)
+        self.context.capturing = True
+        impl.forward(layer, q, None, None, cache, meta, out)
+        impl._graph_metadata_layer_name.assert_called_once_with(layer)
+        provider = self.register.call_args.args[2]
+        self.assertEqual(provider.layer_name, "owner")
         self.dynamic_quant.assert_not_called()
 
     def test_pd_rejected_before_cache_write(self):
