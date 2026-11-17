@@ -255,6 +255,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
 
         layer = torch.nn.Module()
         layer.num_kv_heads = 2
+        layer.head_size = 4
         layer.head_size_v = 4
         if with_impl:
             layer.impl = object.__new__(AscendC8MXFPAttentionBackendImpl.__base__)
@@ -357,13 +358,40 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         method = AscendC8MXFPKVCacheAttentionMethod({}, prefix="model.layers.3")
         layer = self._make_layer(with_impl=True)
 
-        method.create_weights(layer)
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(c8_k_quant_mode="per_token_group"),
+        ):
+            method.create_weights(layer)
 
+        self.assertEqual(layer.impl.k_quant_mode, "per_token_group")
         self.assertIs(layer.attn_backend, AscendC8MXFPAttentionBackend)
         self.assertIsInstance(layer.impl, AscendC8MXFPAttentionBackendImpl)
         self.assertFalse(layer.impl.enable_hamming_sparse)
         self.assertEqual(AscendAttentionBackend.get_supported_kernel_block_sizes(), [128])
         self.assertEqual(AscendC8MXFPAttentionBackend.get_supported_kernel_block_sizes(), [512])
+
+    def test_installs_per_token_mode_on_swapped_impl(self):
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(c8_k_quant_mode="per_token"),
+        ):
+            AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+        self.assertEqual(layer.impl.k_quant_mode, "per_token")
+
+    def test_rejects_per_token_width_above_quantizer_limit(self):
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = 1024
+        with (
+            patch(
+                "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                return_value=SimpleNamespace(c8_k_quant_mode="per_token"),
+            ),
+            self.assertRaisesRegex(ValueError, "1024"),
+        ):
+            AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
 
 
 class TestQuantWeightLoader(TestBase):

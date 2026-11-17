@@ -55,7 +55,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
-
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
 # reference: quant_flash_attn_golden.py "PA_NZ: fp8=[Bn,N,D//32,Bs,32],
 # Kscale=[Bn,N,Bs//16,D//64,16,2], Vscale=[Bn,N,D//16,Bs//64,16,2]"). The
@@ -76,6 +75,43 @@ MXFP_V_SCALE_NZ_DIM_FRAG = 16
 MXFP8_GROUP_SIZE = 32
 # E8M0 scale elements are always 1 byte in KV cache budgeting.
 MXFP_SCALE_DTYPE_SIZE = 1
+MXFP_MAX_QUANT_BLOCK_SIZE = 1024
+
+
+def quantize_mxfp_key_per_token(key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize one whole token, then broadcast its scale for QFA PA_NZ.
+
+    The quantizer's second scale byte is padding when there is only one
+    block. Repeat only the first byte into the existing 32-channel scale
+    slots. This changes the K quantization granularity without changing Q,
+    checkpoint V scales, cache allocation, or the attention operator.
+    """
+    if key.ndim != 3:
+        raise ValueError("Per-token C8 K must have shape [tokens, kv_heads, head_dim].")
+    tokens, heads, head_dim = key.shape
+    validate_mxfp_k_scale_head_dim(head_dim)
+    width = heads * head_dim
+    if width <= 0 or width > MXFP_MAX_QUANT_BLOCK_SIZE:
+        raise ValueError("Per-token C8 K requires 1..1024 local KV channels per token.")
+    if key.dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("Per-token C8 K requires FP16 or BF16 input.")
+    if tokens == 0:
+        return (
+            torch.empty_like(key, dtype=torch.float8_e4m3fn),
+            torch.empty(
+                (0, heads, head_dim // MXFP_KV_SCALE_GROUP_SIZE, MXFP_KV_SCALE_VALUES_PER_GROUP),
+                dtype=torch.uint8,
+                device=key.device,
+            ),
+        )
+    quant_key, token_scale = torch_npu.npu_dynamic_mx_quant(
+        key.reshape(tokens, width), dst_type=torch.float8_e4m3fn, block_size=width
+    )
+    scale = token_scale.view(torch.uint8)[..., :1].reshape(tokens, 1, 1, 1)
+    scale = scale.expand(
+        tokens, heads, head_dim // MXFP_KV_SCALE_GROUP_SIZE, MXFP_KV_SCALE_VALUES_PER_GROUP
+    ).contiguous()
+    return quant_key.reshape_as(key), scale
 
 
 def validate_mxfp_k_scale_head_dim(head_dim: int) -> None:
@@ -496,7 +532,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     """MXFP8 KV cache backend computed by the QFA dual-operator interface.
 
     forward() quantizes Q/K dynamically (``npu_dynamic_mx_quant``, FP8 E4M3 +
-    per-token-group E8M0 scales) and V statically (the checkpoint's
+    E8M0 scales; K optionally shares one scale per token) and V statically (the checkpoint's
     per-channel E8M0 scale), scatters the quantized K/V plus their scale
     caches into the paged cache, and calls the QFA metadata + main operators
     directly on the paged cache.
@@ -530,6 +566,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     # this subclass's constructor. Class-level defaults are therefore
     # required for objects that predate the class swap.
     enable_hamming_sparse: bool = False
+    k_quant_mode: str = "per_token_group"
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata) -> dict:
         cache = getattr(attn_metadata, "qfa_metadata_cache", None)
@@ -949,12 +986,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         if sink_key is not None:
             num_actual_tokens = attn_metadata.num_actual_tokens
             group = self.num_heads // self.num_kv_heads
-            q = query[:num_actual_tokens].reshape(
-                num_actual_tokens, self.num_kv_heads, group, self.head_size
+            q = query[:num_actual_tokens].reshape(num_actual_tokens, self.num_kv_heads, group, self.head_size)
+            sink_logits = ((q.float() * sink_key.float().unsqueeze(1)).sum(-1) * self.scale).reshape(
+                num_actual_tokens, self.num_heads
             )
-            sink_logits = (
-                (q.float() * sink_key.float().unsqueeze(1)).sum(-1) * self.scale
-            ).reshape(num_actual_tokens, self.num_heads)
 
         record_attention_compute_start()
 
@@ -967,10 +1002,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
-            key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                key[: attn_metadata.num_actual_tokens],
-                dst_type=torch.float8_e4m3fn,
-            )
+            if self.k_quant_mode == "per_token":
+                key_mxfp8, key_scale = quantize_mxfp_key_per_token(key[: attn_metadata.num_actual_tokens])
+            else:
+                key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
+                    key[: attn_metadata.num_actual_tokens],
+                    dst_type=torch.float8_e4m3fn,
+                )
 
             original_value_shape = value.shape
             value = value.view(original_value_shape[0], -1)

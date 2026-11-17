@@ -2,6 +2,8 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.distributed import get_tensor_model_parallel_rank, get_tensor_model_parallel_world_size
 
+from vllm_ascend.ascend_config import get_ascend_config
+
 from ..base import AscendAttentionScheme
 
 
@@ -65,6 +67,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         layer.kv_cache_torch_dtype = torch.float8_e4m3fn
         if hasattr(layer, "impl"):
             from vllm_ascend.attention.attention_c8_mxfp import (
+                MXFP_MAX_QUANT_BLOCK_SIZE,
                 AscendC8MXFPAttentionBackend,
                 AscendC8MXFPAttentionBackendImpl,
             )
@@ -74,6 +77,12 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             # Changing __class__ does not invoke the new class's __init__, so
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
+            layer.impl.k_quant_mode = get_ascend_config().c8_k_quant_mode
+            if (
+                layer.impl.k_quant_mode == "per_token"
+                and layer.num_kv_heads * layer.head_size > MXFP_MAX_QUANT_BLOCK_SIZE
+            ):
+                raise ValueError("Per-token C8 K requires at most 1024 local KV channels; increase tensor parallelism.")
 
         # The checkpoint supplies the static V-cache scale.
         hidden_size = layer.num_kv_heads * layer.head_size_v

@@ -578,12 +578,16 @@ class AscendConfig:
     # FULL graphs wait on descriptor-specific external events at consumers.
     # Default to overlap on A5 only; explicit settings override this policy.
     multistream_engram_overlap: bool = dataclasses.field(
-        default_factory=lambda: get_current_hardware_profile().device_adaptor_family
-        == DeviceAdaptorFamily.FP8_OPTIMIZED
+        default_factory=lambda: (
+            get_current_hardware_profile().device_adaptor_family == DeviceAdaptorFamily.FP8_OPTIMIZED
+        )
     )
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
+    # C8-MXFP K granularity; per_token shares one E8M0 scale across all
+    # local KV heads/channels, retaining QFA's existing cache wire format.
+    c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -702,6 +706,8 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
+            raise ValueError("c8_k_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
