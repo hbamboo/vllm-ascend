@@ -69,11 +69,13 @@ CPU 合约测试可独立执行，不依赖 vLLM/torch_npu 初始化：
 python tests/ut/attention/test_c8_fia_pseudo.py -v
 ```
 
-服务器上提供了真实算子验证入口，覆盖非连续分页数据与 scale、prefill、单 token decode 和 graph replay，并与“同一份 FP8 KV 反量化为 BF16”的 CPU attention 标杆比较：
+服务器上提供了真实算子验证入口，覆盖非连续分页数据与 scale、prefill、单 token decode 和 graph replay，并与“同一份 FP8 KV 反量化为 BF16”的 CPU attention 标杆比较。脚本只导入标准库、torch 和 torch_npu，从本地源码读取未修改的缓存辅助函数，不初始化 vLLM 平台插件。张量计算仍调用真实 NPU 算子；独立验证进程没有 PD group。
 
 ```bash
-PYTHONPATH=. python tests/e2e/nightly/single_node/ops/singlecard_ops/test_c8_fia_pseudo.py -v
+ASCEND_RT_VISIBLE_DEVICES=0 python tests/e2e/nightly/single_node/ops/singlecard_ops/test_c8_fia_pseudo.py -v
 ```
+
+命令在同步后的仓库根目录执行，不依赖 `PYTHONPATH=.`。脚本在选择 NPU 后查询实际 runtime SOC，并打印设备名称和软件版本；不依赖 vllm-ascend 的构建期 `_build_info`。如果显示 `skipped`，表示没有执行 NPU 验证。
 
 该验证入口未在本地 Windows/NPU 上执行。当前 TorchNPU Python 文档与底层 V5 文档的 decode 类型支持列表存在差异，因此不能省略服务器版本验证。保持原始 BF16 KV 的模型结果可作为另一组精度比较标杆，但不能用于要求此量化路径逐值相等的测试。
 
