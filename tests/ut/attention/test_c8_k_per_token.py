@@ -82,6 +82,13 @@ def reference_mx_quant(x, *, dst_type, block_size=32):
     return quantized, codes.reshape(*shape[:-1], -1, 2)
 
 
+def reference_dynamic_quant(x, *, dst_type, quant_mode):
+    if quant_mode != "pertoken":
+        raise AssertionError("FIA KV must use per-token scales")
+    scale = x.float().abs().amax(-1) / torch.finfo(dst_type).max
+    return (x.float() / scale[..., None]).to(dst_type), scale
+
+
 class TestPerTokenKey(unittest.TestCase):
     def setUp(self):
         self.quantizer = MagicMock(side_effect=reference_mx_quant)
@@ -163,6 +170,7 @@ class TestPerTokenKey(unittest.TestCase):
 
         ops = SimpleNamespace(
             npu_dynamic_mx_quant=self.quantizer,
+            npu_dynamic_quant=MagicMock(side_effect=reference_dynamic_quant),
             npu_scatter_nd_update_=scatter,
             npu_fused_infer_attention_score_v2=MagicMock(side_effect=lambda **kw: (kw["query"].clone(), None)),
         )
@@ -188,10 +196,12 @@ class TestPerTokenKey(unittest.TestCase):
         v = k * torch.tensor([0.5, 8, 64], dtype=torch.bfloat16).reshape(3, 1, 1)
         q = torch.zeros(3, 6, 128, dtype=torch.bfloat16)
         impl.forward(layer, q, k, v, cache, metadata, output=torch.empty_like(q))
-        _, codes = helpers.quantize_mxfp_per_token(v)
-        expected = torch.exp2(codes[:, 0, 0, 0].float() - 127)
+        _, expected = reference_dynamic_quant(v.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
         slots = metadata.slot_mapping
         torch.testing.assert_close(cache[3][slots // 512, slots % 512], expected)
+        self.assertEqual(ops.npu_dynamic_quant.call_count, 2)
+        self.assertEqual(ops.npu_dynamic_quant.call_args.kwargs["quant_mode"], "pertoken")
+        self.quantizer.assert_not_called()
         history = cache[3].clone()
         metadata.actual_seq_lengths_q = [1]
         metadata.slot_mapping = torch.tensor([515])

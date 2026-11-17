@@ -220,21 +220,38 @@ class TestC8KVPerTokenNPU(TestC8KPerTokenNPU):
         case.metadata.actual_seq_lengths_q = [q_len]
         case.metadata.seq_lens_list = [529]
         case.layer = SimpleNamespace(layer_name="attn")
+        case.producer_query = case.query[:1].expand(529, -1, -1).contiguous()
+        case.producer_output = torch.empty_like(case.producer_query)
+        case.producer_metadata = SimpleNamespace(**vars(case.metadata))
+        case.producer_metadata.actual_seq_lengths_q = [529]
+        case.producer_metadata.num_actual_tokens = case.producer_metadata.max_query_len = 529
+        case.producer_metadata.slot_mapping = case.slots
         return case
 
     def run_case(self, case):
-        k8, ks = self.helpers.quantize_mxfp_per_token(case.key)
-        v8, vs = self.helpers.quantize_mxfp_per_token(case.value)
-        ks = torch.exp2(ks[:, 0, 0, 0].float() - 127)
-        vs = torch.exp2(vs[:, 0, 0, 0].float() - 127)
-        self.helpers.scatter_fia_fp8_cache(k8, v8, ks, vs, case.cache, case.slots)
+        # Exercise the real producer, including its quantizer selection and
+        # scale writes. The second call then reads the complete paged history.
+        case.impl.forward(
+            case.layer,
+            case.producer_query,
+            case.key,
+            case.value,
+            case.cache,
+            case.producer_metadata,
+            output=case.producer_output,
+        )
         case.impl.forward(case.layer, case.query, None, None, case.cache, case.metadata, output=case.output)
-        return k8, ks, v8, vs
+        return case.cache
 
-    def check_case(self, case, quantized):
+    def check_case(self, case, cache):
+        # Independent operator results are the byte/scale scatter oracle;
+        # only production forward writes the cache used by attention.
+        k8, ks = torch_npu.npu_dynamic_quant(case.key.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
+        v8, vs = torch_npu.npu_dynamic_quant(case.value.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
+        quantized = (k8.reshape_as(case.key), ks, v8.reshape_as(case.value), vs)
         k8, ks, v8, vs = (x.cpu() for x in quantized)
         pages, offsets = case.slots.cpu() // 512, case.slots.cpu() % 512
-        for cached, source in zip(case.cache, (k8.flatten(1), v8.flatten(1), ks, vs)):
+        for cached, source in zip(cache, (k8.flatten(1), v8.flatten(1), ks, vs)):
             cached = cached.cpu()
             if source.dtype == torch.float8_e4m3fn:
                 cached, source = cached.view(torch.uint8), source.view(torch.uint8)
@@ -285,6 +302,19 @@ class TestC8KVPerTokenNPU(TestC8KPerTokenNPU):
             quantized = self.run_case(case)
             torch.npu.synchronize()
             self.check_case(case, quantized)
+
+    def test_per_token_quantization_does_not_clip_bf16_extrema(self):
+        case = self.make_case(1)
+        row = torch.tensor([1.875, 1.0, 0.5, -1.875], dtype=torch.bfloat16, device="npu").repeat(32)
+        case.key.copy_(row.reshape(1, 1, 128))
+        case.value.copy_((row * 2).reshape(1, 1, 128))
+        self.run_case(case)
+        torch.npu.synchronize()
+        for payload, scale, original in zip(case.cache[:2], case.cache[2:], (case.key, case.value)):
+            reconstructed = (payload.cpu()[2, 0].float() * scale.cpu()[2, 0]).bfloat16()
+            # Compare to original BF16, not a golden built from already
+            # quantized values. MX scale_alg=0 clips these extrema to 1.75.
+            torch.testing.assert_close(reconstructed[[0, 3]], original.cpu()[0, 0, [0, 3]], rtol=0, atol=0)
 
 
 if __name__ == "__main__":

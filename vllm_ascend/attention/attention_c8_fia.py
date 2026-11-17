@@ -9,7 +9,6 @@ from vllm_ascend.ascend_forward_context import _EXTRA_CTX
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackend,
     AscendC8MXFPAttentionBackendImpl,
-    quantize_mxfp_per_token,
 )
 from vllm_ascend.attention.attention_v1 import _FIA_V2_WORKSPACE_KEY, SWA_INT_MAX, FIAV2ParamProvider
 from vllm_ascend.attention.utils import notify_kv_cache_written
@@ -64,14 +63,20 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
         if num_tokens == 0:
             return output
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
-            key8, key_scale = quantize_mxfp_per_token(key[:num_tokens])
-            value8, value_scale = quantize_mxfp_per_token(value[:num_tokens])
-            # One E8M0 scale per token. FIA accepts the equivalent FP32
-            # power-of-two descale; the FP8 payload is unchanged.
-            key_scale = torch.exp2(key_scale[:, 0, 0, 0].float() - 127)
-            value_scale = torch.exp2(value_scale[:, 0, 0, 0].float() - 127)
+            key8, key_scale = torch_npu.npu_dynamic_quant(
+                key[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+            )
+            value8, value_scale = torch_npu.npu_dynamic_quant(
+                value[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+            )
+            kv_shape = (num_tokens, self.num_kv_heads, self.head_size)
             scatter_fia_fp8_cache(
-                key8, value8, key_scale, value_scale, kv_cache, attn_metadata.slot_mapping[:num_tokens]
+                key8.view(kv_shape),
+                value8.view(kv_shape),
+                key_scale,
+                value_scale,
+                kv_cache,
+                attn_metadata.slot_mapping[:num_tokens],
             )
         record_attention_compute_start()
         kwargs = self._fia_kwargs(query, kv_cache, attn_metadata)
