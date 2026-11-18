@@ -304,6 +304,119 @@ class TestC8QFAFP8NPU(unittest.TestCase):
         expected[8], expected[9], expected[10] = 129, 1, 1
         torch.testing.assert_close(history.cpu(), expected, rtol=0, atol=0)
 
+    def test_invalid_graph_rows_do_not_change_v_head_quantization(self):
+        query = torch.zeros(12, 6, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.zeros(12, 1, 128, dtype=torch.bfloat16, device="npu")
+        valid_slots = list(range(8 * 128, 8 * 128 + 6))
+        control = self.make_case(6)
+        expected = self.forward_step(
+            control, query[:6], key[:6], torch.ones_like(key[:6]), [0, 6], [6], [[8]], valid_slots
+        )
+        for padded_value, invalid_slot in ((1e20, -1), (float("nan"), -1), (1e20, 12 * 128 + 7)):
+            with self.subTest(padded_value=padded_value, invalid_slot=invalid_slot):
+                case = self.make_case(6)
+                value = torch.ones_like(key)
+                value[6:].fill_(padded_value)
+                actual = self.forward_step(
+                    case,
+                    query,
+                    key,
+                    value,
+                    [0, 6, 12],
+                    [6, 1],
+                    [[8], [0]],
+                    valid_slots + [invalid_slot] * 6,
+                )
+                torch.npu.synchronize()
+                torch.testing.assert_close(actual[:6], expected, rtol=0, atol=0)
+                for cached, reference in zip(case.cache[:3], control.cache[:3]):
+                    actual_payload, expected_payload = cached[8, :, :6], reference[8, :, :6]
+                    if cached.dtype == torch.float8_e4m3fn:
+                        actual_payload = actual_payload.view(torch.uint8)
+                        expected_payload = expected_payload.view(torch.uint8)
+                    torch.testing.assert_close(actual_payload, expected_payload, rtol=0, atol=0)
+                torch.testing.assert_close(case.cache[3][8], control.cache[3][8], rtol=0, atol=0)
+                torch.testing.assert_close(case.impl.qfa_v_descale, control.impl.qfa_v_descale, rtol=0, atol=0)
+                torch.testing.assert_close(case.impl.qfa_v_head_bound, control.impl.qfa_v_head_bound, rtol=0, atol=0)
+
+    def test_graph_replay_masks_invalid_v_before_head_max_reduction(self):
+        case = self.make_case(6)
+        query = torch.zeros(12, 6, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.zeros(12, 1, 128, dtype=torch.bfloat16, device="npu")
+        value = torch.ones_like(key)
+        value[6:].fill_(1e4)
+        valid_slots = list(range(8 * 128, 8 * 128 + 6))
+        metadata = SimpleNamespace(**vars(case.metadata))
+        metadata.num_actual_tokens = 12
+        metadata.actual_seq_lengths_q = [6, 12]
+        metadata.seq_lens_list = [6, 1]
+        metadata.query_start_loc_gpu = torch.tensor([0, 6, 12], dtype=torch.int32, device="npu")
+        metadata.seq_lens_gpu = torch.tensor([6, 1], dtype=torch.int32, device="npu")
+        metadata.block_tables = torch.tensor([[8], [0]], dtype=torch.int32, device="npu")
+        metadata.slot_mapping = torch.tensor(valid_slots + [-1] * 6, dtype=torch.int64, device="npu")
+        output = torch.empty_like(query)
+        scale_address = case.impl.qfa_v_descale.data_ptr()
+        before = case.raw.cpu().reshape(-1, case.pitch).clone()
+
+        def run():
+            case.impl.forward(case.layer, query, key, value, case.cache, metadata, output=output)
+
+        for _ in range(3):
+            run()
+        torch.npu.synchronize()
+        metadata.qfa_metadata_cache = {}
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            run()
+        baseline = output[:6].clone()
+        baseline_payload = case.cache[1][8, :, :6].view(torch.uint8).clone()
+        baseline_scale = case.impl.qfa_v_descale.clone()
+        for padding in (float("nan"), 1e20):
+            value[6:].fill_(padding)
+            graph.replay()
+            torch.npu.synchronize()
+            torch.testing.assert_close(output[:6], baseline, rtol=0, atol=0)
+            torch.testing.assert_close(case.cache[1][8, :, :6].view(torch.uint8), baseline_payload, rtol=0, atol=0)
+            torch.testing.assert_close(case.impl.qfa_v_descale, baseline_scale, rtol=0, atol=0)
+            torch.testing.assert_close(
+                case.impl.qfa_v_head_bound.cpu(), torch.ones(1, dtype=torch.bfloat16), rtol=0, atol=0
+            )
+
+        # The same row now owns a valid cache slot, so its V=100 must grow
+        # the shared head bound. Other padded values remain excluded.
+        value[6].fill_(100)
+        metadata.slot_mapping[6] = 8 * 128 + 6
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(case.impl.qfa_v_head_bound.cpu(), torch.full((1,), 100, dtype=torch.bfloat16))
+        reconstructed = case.cache[1][8, 0, 6].float() * case.impl.qfa_v_descale[0]
+        torch.testing.assert_close(reconstructed.cpu(), torch.full((128,), 100.0), rtol=0.01, atol=0.01)
+        grown_scale = case.impl.qfa_v_descale.clone()
+        metadata.slot_mapping[6] = -1
+        value[6:].fill_(1e30)
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(case.impl.qfa_v_descale, grown_scale, rtol=0, atol=0)
+        self.assertEqual(case.impl.qfa_v_descale.data_ptr(), scale_address)
+        untouched = ~torch.isin(torch.arange(before.shape[0]), torch.tensor([0, 8]))
+        torch.testing.assert_close(case.raw.cpu().reshape(-1, case.pitch)[untouched], before[untouched], rtol=0, atol=0)
+
+    def test_all_pad_dummy_preserves_initial_v_scale_and_other_pages(self):
+        case = self.make_case(6)
+        initial_scale = case.impl.qfa_v_descale.clone()
+        initial_bound = case.impl.qfa_v_head_bound.clone()
+        before = case.raw.cpu().reshape(-1, case.pitch).clone()
+        query = torch.zeros(12, 6, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.zeros(12, 1, 128, dtype=torch.bfloat16, device="npu")
+        value = torch.full_like(key, float("nan"))
+        self.forward_step(case, query, key, value, [0, 6, 12], [1, 1], [[0], [0]], [-1] * 12)
+        torch.npu.synchronize()
+        torch.testing.assert_close(case.impl.qfa_v_descale, initial_scale, rtol=0, atol=0)
+        torch.testing.assert_close(case.impl.qfa_v_head_bound, initial_bound, rtol=0, atol=0)
+        # Dummy metadata may update page 0's tag, but every usable page is
+        # untouched and invalid NaNs cannot enter the persistent head bound.
+        torch.testing.assert_close(case.raw.cpu().reshape(-1, case.pitch)[1:], before[1:], rtol=0, atol=0)
+
     def test_lse_and_learned_key_sink_use_quantized_query(self):
         for q_len in (1, 6):
             with self.subTest(q_len=q_len):

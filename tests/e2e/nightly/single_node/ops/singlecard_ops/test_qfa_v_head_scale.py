@@ -14,13 +14,18 @@ sys.path.insert(0, str(next(p for p in Path(__file__).resolve().parents if (p / 
 import torch
 import torch_npu
 
-from vllm_ascend.ops.triton.qfa_v_head_scale import qfa_v_history_pages, rescale_qfa_v_cache
+from vllm_ascend.ops.triton.qfa_v_head_scale import (
+    prepare_qfa_v_head_input,
+    qfa_v_history_pages,
+    rescale_qfa_v_cache,
+)
 
 NUM_PAGES = 4
 NUM_HEADS = 2
 BLOCK_SIZE = 128
 HEAD_DIM = 128
 FP8_MAX = 448.0
+SENTINEL_SIZE = 32
 KV_BYTES = NUM_HEADS * BLOCK_SIZE * HEAD_DIM
 K_SCALE_BYTES = NUM_HEADS * BLOCK_SIZE * 4
 PAGE_PITCH = 2 * KV_BYTES + K_SCALE_BYTES + NUM_HEADS * 4 + 64
@@ -66,6 +71,12 @@ def expected_backing(initial, codes, new_scale):
     return raw
 
 
+def quantize_head_input(value, slots, bound):
+    prepared = prepare_qfa_v_head_input(value, slots, bound, value.shape[0], NUM_PAGES * BLOCK_SIZE)
+    payload, scale = torch_npu.npu_dynamic_quant(prepared, dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
+    return prepared, payload, scale
+
+
 class TestQfaVHeadScaleNPU(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -102,6 +113,88 @@ class TestQfaVHeadScaleNPU(unittest.TestCase):
         torch.testing.assert_close(self.raw.cpu(), expected, rtol=0, atol=0)
         torch.testing.assert_close(self.bound.cpu(), (self.new_scale.cpu() * FP8_MAX).to(torch.bfloat16))
         torch.testing.assert_close(self.head_scale.cpu(), self.new_scale.cpu())
+
+    def test_prepare_masks_padding_outliers_before_dynamic_quant(self):
+        num_tokens = 6
+        source = torch.linspace(-2, 2, num_tokens * NUM_HEADS * HEAD_DIM).reshape(num_tokens, NUM_HEADS, HEAD_DIM)
+        clean = source.to(torch.bfloat16)
+        clean[[1, 2, 4]] = 0
+        dirty = clean.clone()
+        dirty[1].fill_(1e20)
+        dirty[2].fill_(float("nan"))
+        dirty[4].fill_(-1e20)
+        # Keep a padded source head stride, as produced by sliced projections.
+        clean_storage = torch.empty((num_tokens, NUM_HEADS, HEAD_DIM + 16), dtype=torch.bfloat16, device="npu")
+        dirty_storage = torch.empty_like(clean_storage)
+        clean_npu = clean_storage[..., :HEAD_DIM]
+        dirty_npu = dirty_storage[..., :HEAD_DIM]
+        clean_npu.copy_(clean)
+        dirty_npu.copy_(dirty)
+        slots = torch.tensor([0, -1, NUM_PAGES * BLOCK_SIZE, 129, -1, 130], dtype=torch.int32, device="npu")
+        bound = torch.tensor([0.5, 1.0], dtype=torch.bfloat16, device="npu")
+
+        prepared, payload, scale = quantize_head_input(clean_npu, slots, bound)
+        dirty_prepared, dirty_payload, dirty_scale = quantize_head_input(dirty_npu, slots, bound)
+        expected = torch.cat(
+            (clean.permute(1, 0, 2).reshape(NUM_HEADS, -1), bound.cpu()[:, None].expand(-1, SENTINEL_SIZE)), dim=1
+        )
+        torch.testing.assert_close(prepared.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(dirty_prepared.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(payload.view(torch.uint8).cpu(), dirty_payload.view(torch.uint8).cpu())
+        torch.testing.assert_close(scale.cpu(), dirty_scale.cpu(), rtol=0, atol=0)
+
+    def test_all_invalid_tokens_preserve_tiny_bound_and_scale(self):
+        tiny = torch.finfo(torch.float32).tiny
+        bound_cpu = torch.tensor([tiny * FP8_MAX, 2 * tiny * FP8_MAX], dtype=torch.bfloat16)
+        self.bound.copy_(bound_cpu)
+        self.head_scale.copy_(bound_cpu.float() / FP8_MAX)
+        value = torch.full((6, NUM_HEADS, HEAD_DIM), float("nan"), dtype=torch.bfloat16, device="npu")
+        slots = torch.full((6,), -1, dtype=torch.int32, device="npu")
+        prepared, payload, scale = quantize_head_input(value, slots, self.bound)
+        torch.testing.assert_close(prepared[:, : 6 * HEAD_DIM].cpu(), torch.zeros(NUM_HEADS, 6 * HEAD_DIM).bfloat16())
+        torch.testing.assert_close(
+            payload[:, : 6 * HEAD_DIM].view(torch.uint8).cpu(),
+            torch.zeros(NUM_HEADS, 6 * HEAD_DIM, dtype=torch.uint8),
+        )
+        expected_scale = bound_cpu.float() / FP8_MAX
+        torch.testing.assert_close(scale.cpu(), expected_scale, rtol=0, atol=0)
+        empty_history = torch.zeros(NUM_PAGES, dtype=torch.int32, device="npu")
+        rescale_qfa_v_cache(self.values, self.scales, scale, empty_history, self.bound, self.head_scale)
+        torch.testing.assert_close(self.bound.cpu(), bound_cpu, rtol=0, atol=0)
+        torch.testing.assert_close(self.head_scale.cpu(), expected_scale, rtol=0, atol=0)
+        torch.testing.assert_close(self.raw.cpu(), self.initial, rtol=0, atol=0)
+
+    def test_prepare_graph_replay_reads_changed_slot_validity(self):
+        num_tokens = 6
+        source = torch.linspace(-2, 2, num_tokens * NUM_HEADS * HEAD_DIM).reshape(num_tokens, NUM_HEADS, HEAD_DIM)
+        source = source.to(torch.bfloat16)
+        value = source.to("npu")
+        slots = torch.arange(128, 128 + num_tokens, dtype=torch.int32, device="npu")
+        bound = torch.tensor([0.5, 1.0], dtype=torch.bfloat16, device="npu")
+        quantize_head_input(value, slots, bound)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            prepared, payload, scale = quantize_head_input(value, slots, bound)
+
+        changed = source.clone()
+        changed[1].fill_(1e20)
+        changed[2].fill_(float("nan"))
+        changed[4].fill_(-1e20)
+        value.copy_(changed)
+        slots.copy_(torch.tensor([128, -1, NUM_PAGES * BLOCK_SIZE, 129, -1, 130], dtype=torch.int32))
+        graph.replay()
+        torch.npu.synchronize()
+        source[[1, 2, 4]] = 0
+        expected = torch.cat(
+            (source.permute(1, 0, 2).reshape(NUM_HEADS, -1), bound.cpu()[:, None].expand(-1, SENTINEL_SIZE)), dim=1
+        )
+        expected_payload, expected_scale = torch_npu.npu_dynamic_quant(
+            expected.to("npu"), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+        )
+        torch.testing.assert_close(prepared.cpu(), expected, rtol=0, atol=0)
+        torch.testing.assert_close(payload.view(torch.uint8).cpu(), expected_payload.view(torch.uint8).cpu())
+        torch.testing.assert_close(scale.cpu(), expected_scale.cpu(), rtol=0, atol=0)
 
     def test_graph_replay_reads_changed_pages_lengths_and_head_scale(self):
         self.run_helpers()

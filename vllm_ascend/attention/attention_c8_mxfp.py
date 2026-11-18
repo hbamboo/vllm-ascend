@@ -617,7 +617,6 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
 
 QFA_QUANT_MODE_MXFP8 = 1
 QFA_QUANT_MODE_FP8_PER_TOKEN = 6
-QFA_V_HEAD_SENTINEL_SIZE = 32
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
 QFA_LAYOUT_TND = "TND"
@@ -1064,7 +1063,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """Native mode 6, preserving V head-scale coherence across cached pages."""
         from cann_ops_transformer.ops import quant_flash_attn, quant_flash_attn_metadata
 
-        from vllm_ascend.ops.triton.qfa_v_head_scale import qfa_v_history_pages, rescale_qfa_v_cache
+        from vllm_ascend.ops.triton.qfa_v_head_scale import (
+            prepare_qfa_v_head_input,
+            qfa_v_history_pages,
+            rescale_qfa_v_cache,
+        )
         from vllm_ascend.ops.triton.sink import qfa_sink_apply_triton
 
         num_tokens = attn_metadata.num_actual_tokens
@@ -1085,12 +1088,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
             )
             # Native QFA has one V scale per head for the whole visible cache.
-            # Include the previous head bound so ordinary decode retains its scale.
-            # A 32-element sentinel tail keeps the quantizer's row width aligned.
-            value_by_head = value[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size)
-            value_by_head = value_by_head.permute(1, 0, 2).reshape(self.num_kv_heads, -1)
-            bounded_value = torch.cat(
-                (value_by_head, self.qfa_v_head_bound[:, None].expand(-1, QFA_V_HEAD_SENTINEL_SIZE)), dim=1
+            # Padding slots never enter V's shared amax or its persistent bound.
+            # The fused preparation also appends the prior bound, keeping the
+            # quantizer's head rows aligned without a separate layout/cat copy.
+            bounded_value = prepare_qfa_v_head_input(
+                value[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size),
+                attn_metadata.slot_mapping[:num_tokens],
+                self.qfa_v_head_bound,
+                num_tokens,
+                kv_cache[0].shape[0] * kv_cache[0].shape[2],
             )
             value8, value_scale = torch_npu.npu_dynamic_quant(
                 bounded_value, dst_type=torch.float8_e4m3fn, quant_mode="pertoken"

@@ -10,8 +10,83 @@ from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 QFA_FP8_BLOCK_SIZE = 128
 QFA_FP8_HEAD_DIM = 128
 QFA_FP8_MAX = 448.0
+QFA_V_HEAD_SENTINEL_SIZE = 32
+_PREPARE_TOKEN_TILE = 32
 _MARK_TILE = 128
 _RESCALE_TOKEN_TILE = 32
+
+
+@triton.jit
+def _prepare_qfa_v_head_input_kernel(
+    value,
+    slot_mapping,
+    head_bound,
+    output,
+    VALUE_TOKEN_STRIDE: tl.constexpr,
+    VALUE_HEAD_STRIDE: tl.constexpr,
+    VALUE_DIM_STRIDE: tl.constexpr,
+    SLOT_STRIDE: tl.constexpr,
+    BOUND_STRIDE: tl.constexpr,
+    NUM_TOKENS: tl.constexpr,
+    NUM_CACHE_SLOTS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    TOKEN_TILE: tl.constexpr,
+    SENTINEL_SIZE: tl.constexpr,
+    NUM_TOKEN_TILES: tl.constexpr,
+):
+    head = tl.program_id(0)
+    tile = tl.program_id(1)
+    row_width = NUM_TOKENS * HEAD_DIM + SENTINEL_SIZE
+    if tile < NUM_TOKEN_TILES:
+        tokens = tile * TOKEN_TILE + tl.arange(0, TOKEN_TILE)
+        dimensions = tl.arange(0, HEAD_DIM)
+        slots = tl.load(slot_mapping + tokens * SLOT_STRIDE, mask=tokens < NUM_TOKENS, other=-1)
+        valid = (tokens < NUM_TOKENS) & (slots >= 0) & (slots < NUM_CACHE_SLOTS)
+        values = tl.load(
+            value
+            + tokens[:, None] * VALUE_TOKEN_STRIDE
+            + head * VALUE_HEAD_STRIDE
+            + dimensions[None, :] * VALUE_DIM_STRIDE,
+            mask=valid[:, None],
+            other=0.0,
+        )
+        tl.store(
+            output + head * row_width + tokens[:, None] * HEAD_DIM + dimensions[None, :],
+            values,
+            mask=tokens[:, None] < NUM_TOKENS,
+        )
+    else:
+        tail = tl.arange(0, SENTINEL_SIZE)
+        bound = tl.load(head_bound + head * BOUND_STRIDE)
+        tl.store(output + head * row_width + NUM_TOKENS * HEAD_DIM + tail, bound)
+
+
+def prepare_qfa_v_head_input(value, slot_mapping, head_bound, num_tokens, num_cache_slots):
+    """Pack valid TND V into head rows, zero graph padding, and append bounds."""
+    num_heads = value.shape[1]
+    output = torch.empty(
+        (num_heads, num_tokens * QFA_FP8_HEAD_DIM + QFA_V_HEAD_SENTINEL_SIZE),
+        dtype=torch.bfloat16,
+        device=value.device,
+    )
+    num_token_tiles = triton.cdiv(num_tokens, _PREPARE_TOKEN_TILE)
+    init_device_properties_triton()
+    _prepare_qfa_v_head_input_kernel[(num_heads, num_token_tiles + 1)](
+        value,
+        slot_mapping,
+        head_bound,
+        output,
+        *value.stride(),
+        slot_mapping.stride(0),
+        head_bound.stride(0),
+        num_tokens,
+        num_cache_slots,
+        QFA_FP8_HEAD_DIM,
+        _PREPARE_TOKEN_TILE,
+        QFA_V_HEAD_SENTINEL_SIZE,
+        num_token_tiles,
+    )
+    return output
 
 
 @triton.jit
