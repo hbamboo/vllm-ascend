@@ -360,7 +360,9 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
 
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token_group", c8_v_quant_mode="per_channel"),
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token_group", c8_k_quant_mode="per_token_group", c8_v_quant_mode="per_channel"
+            ),
         ):
             method.create_weights(layer)
 
@@ -376,7 +378,9 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         layer.head_size = layer.head_size_v = 128
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"),
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token_group", c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"
+            ),
         ):
             AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
         self.assertEqual(layer.impl.k_quant_mode, "per_token")
@@ -387,7 +391,9 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         with (
             patch(
                 "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-                return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"),
+                return_value=SimpleNamespace(
+                    c8_q_quant_mode="per_token_group", c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"
+                ),
             ),
             self.assertRaisesRegex(ValueError, "1024"),
         ):
@@ -401,13 +407,83 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_token"),
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token_group", c8_k_quant_mode="per_token", c8_v_quant_mode="per_token"
+            ),
         ):
             method.create_weights(layer)
         method.process_weights_after_loading(layer)
         self.assertIsInstance(layer.impl, AscendC8FIAPseudoAttentionBackendImpl)
         self.assertTrue(hasattr(layer, "v_cache_scale"))
         self.assertFalse(hasattr(layer, "v_cache_scale_float_reciprocal"))
+
+    def test_per_token_q_installs_qfa_fp8_and_initializes_static_v_descales(self):
+        from vllm_ascend.attention.attention_c8_qfa_fp8 import (
+            AscendC8QFAFP8AttentionBackend,
+            AscendC8QFAFP8AttentionBackendImpl,
+        )
+
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token", c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"
+            ),
+        ):
+            method.create_weights(layer)
+        codes = torch.tensor([0, 126, 127, 128], dtype=torch.uint8).repeat(64)
+        layer.v_cache_scale.data.copy_(codes)
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_current_vllm_config",
+            return_value=SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+        ):
+            method.process_weights_after_loading(layer)
+
+        self.assertIs(layer.attn_backend, AscendC8QFAFP8AttentionBackend)
+        self.assertIsInstance(layer.impl, AscendC8QFAFP8AttentionBackendImpl)
+        self.assertEqual(layer.attn_backend.get_supported_kernel_block_sizes(), [128])
+        expected_codes = codes.clone()
+        expected_codes[expected_codes == 0] = 127
+        descale = torch.exp2(expected_codes.float() - 127)
+        torch.testing.assert_close(layer.impl.qfa_v_output_scale, descale.reshape(2, 128), rtol=0, atol=0)
+        torch.testing.assert_close(layer.impl.qfa_v_descale, torch.ones(2, dtype=torch.float32), rtol=0, atol=0)
+        self.assertEqual(layer.impl.qfa_p_scale.dtype, torch.float32)
+        self.assertEqual(layer.impl.qfa_p_scale.numel(), 1)
+        self.assertEqual(layer.impl.qfa_p_scale.item(), 448)
+        for state in (layer.impl.qfa_v_output_scale, layer.impl.qfa_v_descale, layer.impl.qfa_p_scale):
+            self.assertEqual(state.device, layer.v_cache_scale.device)
+        torch.testing.assert_close(layer.v_cache_scale_float_reciprocal, (1 / descale).bfloat16(), rtol=0, atol=0)
+
+    def test_qfa_fp8_rejects_unsupported_head_dimensions(self):
+        for k_dim, v_dim in ((256, 256), (128, 64)):
+            with self.subTest(k_dim=k_dim, v_dim=v_dim):
+                layer = self._make_layer(with_impl=True)
+                layer.head_size, layer.head_size_v = k_dim, v_dim
+                with (
+                    patch(
+                        "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                        return_value=SimpleNamespace(
+                            c8_q_quant_mode="per_token", c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"
+                        ),
+                    ),
+                    self.assertRaisesRegex(ValueError, "128"),
+                ):
+                    AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+
+    def test_qfa_fp8_does_not_apply_the_mx_block_width_limit(self):
+        layer = self._make_layer(with_impl=True)
+        layer.num_kv_heads = 16
+        layer.head_size = layer.head_size_v = 128
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token", c8_k_quant_mode="per_token", c8_v_quant_mode="per_channel"
+            ),
+        ):
+            AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+        self.assertEqual(layer.v_cache_scale.shape, (2048,))
 
 
 class TestQuantWeightLoader(TestBase):

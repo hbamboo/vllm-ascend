@@ -60,6 +60,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     """
 
     v_quant_mode = "per_channel"
+    q_quant_mode = "per_token_group"
 
     def __init__(self, quant_description: dict, prefix: str):
         self.quant_description = quant_description
@@ -75,8 +76,19 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             )
 
             config = get_ascend_config()
+            self.q_quant_mode = config.c8_q_quant_mode
             self.v_quant_mode = config.c8_v_quant_mode
-            if self.v_quant_mode == "per_token":
+            if self.q_quant_mode == "per_token":
+                from vllm_ascend.attention.attention_c8_qfa_fp8 import (
+                    AscendC8QFAFP8AttentionBackend,
+                    AscendC8QFAFP8AttentionBackendImpl,
+                )
+
+                if (layer.head_size, layer.head_size_v) != (128, 128):
+                    raise ValueError("QFA FP8 per-token Q/K requires K/V head dimensions of 128.")
+                layer.attn_backend = AscendC8QFAFP8AttentionBackend
+                layer.impl.__class__ = AscendC8QFAFP8AttentionBackendImpl
+            elif self.v_quant_mode == "per_token":
                 from vllm_ascend.attention.attention_c8_fia import (
                     AscendC8FIAPseudoAttentionBackend,
                     AscendC8FIAPseudoAttentionBackendImpl,
@@ -94,7 +106,8 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             layer.impl.enable_hamming_sparse = False
             layer.impl.k_quant_mode = config.c8_k_quant_mode
             if (
-                layer.impl.k_quant_mode == "per_token"
+                self.q_quant_mode != "per_token"
+                and layer.impl.k_quant_mode == "per_token"
                 and layer.num_kv_heads * layer.head_size > MXFP_MAX_QUANT_BLOCK_SIZE
             ):
                 raise ValueError("Per-token C8 K requires at most 1024 local KV channels; increase tensor parallelism.")
@@ -123,12 +136,19 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         if bool((raw == 0).any()):
             raw[raw == 0] = 127
         exponent = raw.to(torch.float32) - 127
+        descale = torch.exp2(exponent)
         # Only the reciprocal is consumed (npu_quantize needs 1/scale); the
         # raw E8M0 bytes are broadcast into the V-scale cache as-is.
         layer.v_cache_scale_float_reciprocal = torch.nn.Parameter(
-            (1 / torch.exp2(exponent)).to(target_dtype),
+            (1 / descale).to(target_dtype),
             requires_grad=False,
         )
+        if self.q_quant_mode == "per_token":
+            layer.impl.qfa_v_descale = torch.ones(layer.num_kv_heads, dtype=torch.float32, device=raw.device)
+            layer.impl.qfa_p_scale = torch.tensor(
+                [torch.finfo(torch.float8_e4m3fn).max], dtype=torch.float32, device=raw.device
+            )
+            layer.impl.qfa_v_output_scale = descale.reshape(layer.num_kv_heads, layer.head_size_v)
 
     def apply(
         self,

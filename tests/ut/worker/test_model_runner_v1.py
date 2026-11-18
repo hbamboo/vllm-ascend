@@ -4289,7 +4289,7 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
 
     def _runner(self, layers):
         runner = NPUModelRunner.__new__(NPUModelRunner)
-        runner.ascend_config = SimpleNamespace(c8_v_quant_mode="per_channel")
+        runner.ascend_config = SimpleNamespace(c8_q_quant_mode="per_token_group", c8_v_quant_mode="per_channel")
         runner.kv_cache_config = SimpleNamespace(num_blocks=self.NUM_BLOCKS)
         runner.compilation_config = SimpleNamespace(static_forward_context=layers)
         runner.vllm_config = SimpleNamespace(
@@ -4341,6 +4341,12 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
         runner._fill_c8_mxfp_v_scale_caches({"attn": cache})
         self.assertEqual(runner._c8_mxfp_v_scale_caches, [])
         self.assertTrue(torch.all(cache[3] == 0))
+
+    def test_qfa_fp8_cache_does_not_require_a_static_v_scale_component(self):
+        runner = self._runner({})
+        runner.ascend_config.c8_q_quant_mode = "per_token"
+        runner._fill_c8_mxfp_v_scale_caches({"attn": (MagicMock(), MagicMock(), MagicMock())})
+        self.assertEqual(runner._c8_mxfp_v_scale_caches, [])
 
     def test_cache_setup_hands_back_a_filled_cache(self):
         # The wiring, not just the helper: nothing downstream of

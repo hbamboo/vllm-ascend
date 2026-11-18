@@ -585,9 +585,11 @@ class AscendConfig:
     enable_prefill_mc2: bool = False
     multistream_overlap_shared_expert: bool = False
     enable_kv_nz: bool = False
-    # C8-MXFP K granularity; per_token shares one E8M0 scale across all
-    # local KV heads/channels, retaining QFA's existing cache wire format.
+    # K per_token shares one scale across local KV heads/channels: E8M0 in
+    # MXFP8 mode, FP32 when c8_q_quant_mode selects the FP8 token path.
     c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
+    # Per-token Q selects QFA FP8 mode 6 with FP32 Q/K descales.
+    c8_q_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
     # Dynamic per-token V selects FIA with paged FP32 K/V descales.
     c8_v_quant_mode: Literal["per_channel", "per_token"] = "per_channel"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -708,7 +710,20 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
-        if self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
+        if self.c8_q_quant_mode == "per_token":
+            import torch
+
+            if vc.cache_config.cache_dtype != "mxfp8":
+                raise ValueError("c8_q_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
+            if self.c8_k_quant_mode != "per_token":
+                raise ValueError("c8_q_quant_mode=per_token requires c8_k_quant_mode=per_token.")
+            if self.c8_v_quant_mode != "per_channel":
+                raise ValueError("QFA FP8 per-token Q/K currently requires c8_v_quant_mode=per_channel.")
+            if vc.model_config.dtype != torch.bfloat16:
+                raise ValueError("QFA FP8 per-token Q/K requires --dtype bfloat16.")
+            if vc.kv_transfer_config is not None:
+                raise ValueError("QFA FP8 per-token Q/K does not support PD KV transfer.")
+        elif self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
             raise ValueError("c8_k_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
         if self.c8_v_quant_mode == "per_token":
             # Keep torch lazy: this module is imported during platform discovery.

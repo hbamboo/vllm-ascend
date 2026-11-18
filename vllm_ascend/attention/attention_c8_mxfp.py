@@ -289,7 +289,12 @@ def mxfp_paged_cache_views(
 
 
 def mxfp_cache_views_for_spec(
-    raw_tensor: torch.Tensor, spec: "FullAttentionSpec", kernel_block_size: int, *, fia_pseudo: bool = False
+    raw_tensor: torch.Tensor,
+    spec: "FullAttentionSpec",
+    kernel_block_size: int,
+    *,
+    fia_pseudo: bool = False,
+    qfa_fp8: bool = False,
 ):
     """Translate scheduler pages (including padding) into kernel block views."""
     if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
@@ -298,6 +303,14 @@ def mxfp_cache_views_for_spec(
     page_bytes = spec.page_size_bytes
     if page_bytes % ratio or raw_tensor.numel() % page_bytes:
         raise ValueError("MXFP raw allocation and physical pitch must contain whole pages.")
+    if qfa_fp8:
+        return qfa_fp8_cache_views(
+            raw_tensor,
+            raw_tensor.numel() // page_bytes * ratio,
+            spec,
+            kernel_block_size,
+            page_stride_bytes=page_bytes // ratio,
+        )
     if fia_pseudo:
         return fia_pseudo_cache_views(
             raw_tensor,
@@ -315,6 +328,41 @@ def mxfp_cache_views_for_spec(
         kernel_block_size,
         page_stride_bytes=page_bytes // ratio,
     )
+
+
+def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride_bytes=None):
+    """PA_BNBD FP8 payloads and FP32 token K scales in each scheduler page."""
+    if block_size != 128 or spec.head_size != 128 or spec.head_size_v != 128:
+        raise ValueError("QFA FP8 per-token requires 128-token kernel pages and 128-wide K/V heads.")
+    kv_bytes = spec.num_kv_heads * block_size * spec.head_size
+    scale_bytes = spec.num_kv_heads * block_size * 4
+    payload_bytes = 2 * kv_bytes + scale_bytes
+    pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
+    if (
+        raw_tensor.ndim != 1
+        or raw_tensor.dtype != torch.int8
+        or not raw_tensor.is_contiguous()
+        or pitch < payload_bytes
+        or raw_tensor.numel() < num_blocks * pitch
+        or pitch % 4
+        or raw_tensor.storage_offset() % 4
+    ):
+        raise ValueError("QFA FP8 cache requires aligned complete pages containing K, V and FP32 K scales.")
+    kv_shape = (num_blocks, spec.num_kv_heads, block_size, spec.head_size)
+    scale_shape = (num_blocks, spec.num_kv_heads, block_size)
+    views = []
+    for shape, offset, dtype, size in (
+        (kv_shape, 0, torch.float8_e4m3fn, 1),
+        (kv_shape, kv_bytes, torch.float8_e4m3fn, 1),
+        (scale_shape, 2 * kv_bytes, torch.float32, 4),
+    ):
+        strides = (pitch // size, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
+        views.append(
+            torch.as_strided(
+                raw_tensor.view(dtype), shape, strides, storage_offset=(raw_tensor.storage_offset() + offset) // size
+            )
+        )
+    return tuple(views)
 
 
 def fia_pseudo_cache_views(

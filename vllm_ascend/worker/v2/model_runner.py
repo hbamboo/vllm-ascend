@@ -543,7 +543,7 @@ class NPUModelRunner(GPUModelRunner):
     def _fill_c8_mxfp_v_scale_caches(self) -> None:
         """Initialize C8 V scales and retain views for page reassignment."""
         self._c8_mxfp_v_scale_caches = []
-        if self.ascend_config.c8_v_quant_mode == "per_token":
+        if self.ascend_config.c8_v_quant_mode == "per_token" or self.ascend_config.c8_q_quant_mode == "per_token":
             return
         num_blocks = self.kv_cache_config.num_blocks
         if num_blocks <= 0:

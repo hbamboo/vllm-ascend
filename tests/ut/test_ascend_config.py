@@ -25,6 +25,7 @@ from types import SimpleNamespace
 from typing import Any
 from unittest.mock import PropertyMock, patch
 
+import torch
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -115,6 +116,34 @@ class TestRlConfig(TestBase):
 
 
 class TestAscendConfig(TestBase):
+    def test_c8_q_quant_mode_defaults_and_choices(self):
+        kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
+        self.assertEqual(AscendConfig(**kwargs).c8_q_quant_mode, "per_token_group")
+        self.assertEqual(AscendConfig(**kwargs, c8_q_quant_mode="per_token").c8_q_quant_mode, "per_token")
+        with self.assertRaisesRegex(ValueError, "c8_q_quant_mode"):
+            AscendConfig(**kwargs, c8_q_quant_mode="invalid")
+
+    def test_c8_q_per_token_mode_requires_supported_configuration(self):
+        cases = (
+            ({}, "auto", torch.bfloat16, None, "--kv-cache-dtype mxfp8"),
+            ({"c8_k_quant_mode": "per_token_group"}, "mxfp8", torch.bfloat16, None, "c8_k_quant_mode"),
+            ({"c8_v_quant_mode": "per_token"}, "mxfp8", torch.bfloat16, None, "c8_v_quant_mode"),
+            ({}, "mxfp8", torch.float16, None, "--dtype bfloat16"),
+            ({}, "mxfp8", torch.bfloat16, object(), "PD KV transfer"),
+        )
+        for overrides, cache_dtype, dtype, transfer, message in cases:
+            with self.subTest(message=message):
+                kwargs = {"c8_q_quant_mode": "per_token", "c8_k_quant_mode": "per_token"}
+                kwargs.update(overrides)
+                config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **kwargs)
+                vc = SimpleNamespace(
+                    cache_config=SimpleNamespace(cache_dtype=cache_dtype),
+                    model_config=SimpleNamespace(dtype=dtype),
+                    kv_transfer_config=transfer,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    config.derive_and_validate(vc)
+
     def test_c8_k_quant_mode_defaults_and_choices(self):
         kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
         self.assertEqual(AscendConfig(**kwargs).c8_k_quant_mode, "per_token_group")
