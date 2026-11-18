@@ -489,6 +489,13 @@ class IQuestQ1Attention(nn.Module):
             # next to the target's promoted SWA window. Allocation is full
             # either way; clearing the module attr only changes the spec view.
             self.attn.sliding_window = None
+            # All-layer C8 must not capture the draft: its checkpoint has no
+            # C8 V scale and its attention keeps the generic BF16 FIA path.
+            # Without --kv-cache-dtype-skip-layers the draft would inherit
+            # --kv-cache-dtype=mxfp8, so pin its cache to the model dtype
+            # before the KV-cache specs are built.
+            self.attn.kv_cache_dtype = "auto"
+            self.attn.kv_cache_torch_dtype = vllm_config.model_config.dtype
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)

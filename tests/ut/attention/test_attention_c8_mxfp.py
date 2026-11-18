@@ -4,6 +4,7 @@ from unittest.mock import MagicMock, patch
 import torch
 
 from tests.ut.base import TestBase
+from vllm_ascend.attention import attention_c8_mxfp
 from vllm_ascend.attention.attention_c8_mxfp import AscendC8MXFPAttentionBackendImpl
 
 
@@ -48,9 +49,24 @@ class TestC8MXFPQfaQueryPlan(TestBase):
         )
         seen = {"source_scale": scale}
 
-        def fake_metadata(_self, _metadata, *, cu_seqlens_q, seqused_kv, max_seqlen_q, mask_mode, layout_q_descale):
+        def fake_metadata(
+            _self,
+            _metadata,
+            *,
+            cu_seqlens_q,
+            seqused_kv,
+            max_seqlen_q,
+            mask_mode,
+            win_left,
+            win_right,
+            quant_mode,
+            layout_q_descale,
+        ):
             seen["metadata_max_seqlen_q"] = max_seqlen_q
             seen["metadata_mask_mode"] = mask_mode
+            seen["metadata_win_left"] = win_left
+            seen["metadata_win_right"] = win_right
+            seen["metadata_quant_mode"] = quant_mode
             seen["metadata_layout"] = layout_q_descale
             return MagicMock()
 
@@ -63,12 +79,18 @@ class TestC8MXFPQfaQueryPlan(TestBase):
             *,
             max_seqlen_q,
             mask_mode,
+            win_left,
+            win_right,
+            quant_mode,
             layout_q_descale,
             output,
             **kwargs,
         ):
             seen["max_seqlen_q"] = max_seqlen_q
             seen["mask_mode"] = mask_mode
+            seen["win_left"] = win_left
+            seen["win_right"] = win_right
+            seen["quant_mode"] = quant_mode
             seen["layout"] = layout_q_descale
             seen["scale"] = query_scale
             return output
@@ -89,6 +111,9 @@ class TestC8MXFPQfaQueryPlan(TestBase):
         self.assertEqual(seen["metadata_max_seqlen_q"], seen["max_seqlen_q"])
         self.assertEqual(seen["metadata_layout"], seen["layout"])
         self.assertEqual(seen["metadata_mask_mode"], seen["mask_mode"])
+        self.assertEqual(seen["metadata_win_left"], seen["win_left"])
+        self.assertEqual(seen["metadata_win_right"], seen["win_right"])
+        self.assertEqual(seen["metadata_quant_mode"], seen["quant_mode"])
         return seen
 
     # --- max_seqlen_q -----------------------------------------------------
@@ -282,10 +307,13 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
             "seqused_kv": torch.tensor([10, 20], dtype=torch.int32),
             "max_seqlen_q": 1,
             "mask_mode": 0,
+            "win_left": -1,
+            "win_right": -1,
+            "quant_mode": 1,
             "layout_q_descale": "N2TGD",
         }
-        ops_module = MagicMock(quant_flash_attn_metadata=metadata_op)
-        with patch.dict("sys.modules", {"cann_ops_transformer.ops": ops_module}):
+        ops_module = MagicMock(npu_quant_flash_attn_vllm_metadata=metadata_op)
+        with patch.object(attention_c8_mxfp, "_qfa_ops", return_value=ops_module):
             plans = [self.impl._get_qfa_metadata(attn_metadata, **{**defaults, **call}) for call in calls]
         return plans, invocations
 
@@ -307,7 +335,13 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
             self.assertIs(plan, plans[0])
 
     def test_a_different_non_tensor_input_gets_its_own_plan(self):
-        for override in ({"layout_q_descale": "TND"}, {"mask_mode": 3}, {"max_seqlen_q": 2}):
+        for override in (
+            {"layout_q_descale": "TND"},
+            {"mask_mode": 3},
+            {"max_seqlen_q": 2},
+            {"win_left": 4095, "win_right": 0, "mask_mode": 4},
+            {"quant_mode": 6},
+        ):
             with self.subTest(**override):
                 plans, invocations = self._plans([{}, override])
                 self.assertEqual(len(invocations), 2)

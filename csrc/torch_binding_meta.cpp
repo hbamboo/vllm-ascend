@@ -1781,6 +1781,157 @@ void npu_fused_quant_lightning_indexer_manage_meta(
     return;
 }
 
+std::tuple<at::Tensor, at::Tensor> npu_quant_flash_attn_vllm_meta(
+    const at::Tensor &q, const at::Tensor &k, const at::Tensor &v,
+    const at::Tensor &q_descale, const at::Tensor &k_descale, const at::Tensor &v_descale,
+    int64_t quant_mode,
+    const c10::optional<at::Tensor> &block_table,
+    const c10::optional<at::Tensor> &p_scale,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_kv,
+    const c10::optional<at::Tensor> &sinks,
+    const c10::optional<at::Tensor> &attn_mask,
+    const c10::optional<at::Tensor> &metadata,
+    double softmax_scale, int64_t mask_mode, int64_t win_left, int64_t win_right,
+    int64_t max_seqlen_q, int64_t max_seqlen_kv,
+    c10::string_view layout_q, c10::string_view layout_q_descale,
+    c10::string_view layout_kv, c10::string_view layout_out,
+    bool return_softmax_lse)
+{
+    constexpr int64_t QFA_DIM_THREE = 3;
+    constexpr int64_t QFA_QUANT_MODE_MXFP4 = 5;
+    const int64_t q_dtype_ratio = quant_mode == QFA_QUANT_MODE_MXFP4 ? 2 : 1;
+    const std::string layout_q_str(layout_q);
+    const std::string layout_kv_str(layout_kv);
+    const std::string layout_out_str(layout_out);
+
+    c10::SymInt t_size(0);
+    c10::SymInt n_size(0);
+    c10::SymInt d_size(0);
+    c10::SymInt s_size(0);
+    c10::SymInt b_size(0);
+    if (layout_q_str == "TND") {
+        t_size = q.sym_size(0);
+        n_size = q.sym_size(1);
+    } else if (layout_q_str == "NTD") {
+        n_size = q.sym_size(0);
+        t_size = q.sym_size(1);
+    } else if (layout_q_str == "BSND") {
+        b_size = q.sym_size(0);
+        s_size = q.sym_size(1);
+        n_size = q.sym_size(2);
+    } else {
+        b_size = q.sym_size(0);
+        n_size = q.sym_size(1);
+        s_size = q.sym_size(2);
+    }
+    if (layout_kv_str == "TND") {
+        d_size = v.sym_size(2);
+    } else if (layout_kv_str == "PA_NZ") {
+        d_size = v.sym_size(2) * v.sym_size(4);
+    } else {
+        d_size = v.sym_size(v.dim() - 1);
+    }
+    (void)k;
+    (void)q_descale;
+    (void)k_descale;
+    (void)v_descale;
+    (void)block_table;
+    (void)p_scale;
+    (void)cu_seqlens_q;
+    (void)cu_seqlens_kv;
+    (void)seqused_q;
+    (void)seqused_kv;
+    (void)sinks;
+    (void)attn_mask;
+    (void)metadata;
+    (void)softmax_scale;
+    (void)mask_mode;
+    (void)win_left;
+    (void)win_right;
+    (void)max_seqlen_q;
+    (void)max_seqlen_kv;
+    (void)layout_q_descale;
+
+    c10::SymDimVector lse_size;
+    if (return_softmax_lse) {
+        if (q.dim() == QFA_DIM_THREE) {
+            lse_size = {n_size, t_size};
+        } else {
+            lse_size = {b_size, n_size, s_size};
+        }
+    } else {
+        lse_size = {c10::SymInt(0)};
+    }
+    c10::SymDimVector out_size;
+    const c10::SymInt ratio(q_dtype_ratio);
+    if (layout_out_str == "TND") {
+        out_size = {t_size, n_size, ratio * d_size};
+    } else if (layout_out_str == "BNSD") {
+        out_size = {b_size, n_size, s_size, ratio * d_size};
+    } else {
+        out_size = {b_size, s_size, n_size, ratio * d_size};
+    }
+    at::Tensor attention_out =
+        at::empty_symint(out_size, q.options().dtype(at::kBFloat16).device(c10::kMeta));
+    at::Tensor softmax_lse =
+        at::empty_symint(lse_size, q.options().dtype(at::kFloat).device(c10::kMeta));
+    return std::tuple<at::Tensor, at::Tensor>(attention_out, softmax_lse);
+}
+
+at::Tensor npu_quant_flash_attn_vllm_metadata_meta(
+    int64_t num_heads_q, int64_t num_heads_kv, int64_t head_dim, int64_t quant_mode,
+    const c10::optional<at::Tensor> &cu_seqlens_q,
+    const c10::optional<at::Tensor> &cu_seqlens_kv,
+    const c10::optional<at::Tensor> &seqused_q,
+    const c10::optional<at::Tensor> &seqused_kv,
+    int64_t batch_size, int64_t max_seqlen_q, int64_t max_seqlen_kv, int64_t head_dim_v,
+    int64_t mask_mode, int64_t win_left, int64_t win_right,
+    c10::string_view layout_q, c10::string_view layout_q_descale,
+    c10::string_view layout_kv, c10::string_view layout_out,
+    bool is_grad_enabled, c10::string_view device)
+{
+    constexpr int64_t METADATA_STRIDE = 16;
+    constexpr int64_t METADATA_ALIGN = 4096;
+    constexpr int64_t DEFAULT_CUBE_CORE = 36;
+    constexpr int64_t DEFAULT_VECTOR_CORE = 72;
+    (void)num_heads_kv;
+    (void)head_dim;
+    (void)quant_mode;
+    (void)cu_seqlens_kv;
+    (void)seqused_kv;
+    (void)max_seqlen_q;
+    (void)max_seqlen_kv;
+    (void)head_dim_v;
+    (void)mask_mode;
+    (void)win_left;
+    (void)win_right;
+    (void)layout_q;
+    (void)layout_q_descale;
+    (void)layout_kv;
+    (void)layout_out;
+    (void)is_grad_enabled;
+    (void)device;
+
+    c10::SymInt batch(batch_size);
+    if (seqused_q.has_value()) {
+        batch = seqused_q->sym_size(0);
+    } else if (cu_seqlens_q.has_value()) {
+        batch = cu_seqlens_q->sym_size(0) - 1;
+    }
+    if (!batch.is_symbolic() && batch.expect_int() <= 0) {
+        batch = c10::SymInt(1);
+    }
+    const c10::SymInt per_batch(
+        static_cast<int64_t>(DEFAULT_CUBE_CORE + DEFAULT_VECTOR_CORE) * METADATA_STRIDE * num_heads_q);
+    c10::SymInt row = c10::SymInt(METADATA_STRIDE) + per_batch * batch;
+    row = (row + c10::SymInt(METADATA_ALIGN - 1)) / c10::SymInt(METADATA_ALIGN) * c10::SymInt(METADATA_ALIGN);
+    return at::empty_symint(c10::SymDimVector{c10::SymInt(2), row},
+                            at::TensorOptions().dtype(at::kInt).device(c10::kMeta));
+}
+
 } // namespace meta
 } // namespace vllm_ascend
 
@@ -1856,6 +2007,9 @@ TORCH_LIBRARY_IMPL_EXPAND(CONCAT(_C, _ascend), Meta, ops) {
     ops.impl("npu_msa_index_score", &vllm_ascend::meta::npu_msa_index_score_meta);
     ops.impl("npu_kv_quant_sparse_flash_attention_vllm",
              &vllm_ascend::meta::npu_kv_quant_sparse_flash_attention_vllm_meta);
+    ops.impl("npu_quant_flash_attn_vllm", &vllm_ascend::meta::npu_quant_flash_attn_vllm_meta);
+    ops.impl("npu_quant_flash_attn_vllm_metadata",
+             &vllm_ascend::meta::npu_quant_flash_attn_vllm_metadata_meta);
     // Fused sparse attention overlap
     ops.impl("npu_fused_sparse_attention_overlap", &vllm_ascend::meta::npu_fused_sparse_attention_overlap_meta);
     // Fused lightning indexer manage

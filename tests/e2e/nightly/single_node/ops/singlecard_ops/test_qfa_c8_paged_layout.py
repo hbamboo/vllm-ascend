@@ -8,8 +8,12 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch_npu
-from cann_ops_transformer.ops import quant_flash_attn, quant_flash_attn_metadata
 from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+from vllm_ascend.utils import bootstrap_custom_op_env
+
+bootstrap_custom_op_env()
+import vllm_ascend.vllm_ascend_C  # noqa: E402, F401
 
 from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
@@ -21,6 +25,9 @@ from vllm_ascend.attention.attention_c8_mxfp import (
 )
 from vllm_ascend.ops.triton.triton_utils import init_device_properties_triton
 from vllm_ascend.worker.utils import AscendKVBlockZeroer
+
+quant_flash_attn = torch.ops._C_ascend.npu_quant_flash_attn_vllm
+quant_flash_attn_metadata = torch.ops._C_ascend.npu_quant_flash_attn_vllm_metadata
 
 
 @pytest.mark.parametrize("query_tokens", [1, 64])

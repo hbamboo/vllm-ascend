@@ -64,11 +64,14 @@ def _triton_sink_apply(
     lse_ptr,  # [T*H] fp32 (TND LSE flattened)
     scale,
     num_rows,
+    num_tokens,
     NUM_HEADS: tl.constexpr,  # H (per rank)
     GROUP: tl.constexpr,  # query heads per kv head
     HEAD_DIM: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     SINK_1D: tl.constexpr,  # single kv head: load the sink row once
+    LSE_HEAD_MAJOR: tl.constexpr,  # lse is [H, T] (QFA) instead of [T*H]
+    EXACT_FP32: tl.constexpr,  # C8 torch path: no intermediate bf16 roundings
 ):
     # One program per BLOCK_ROWS tile, no row loop: each tile has a serial
     # load -> dot -> sigmoid -> store dependency chain, so per-program
@@ -84,7 +87,10 @@ def _triton_sink_apply(
         # tile shares one sink vector, so load it once as a flat 1-D load and
         # broadcast. The generic 2-D gather below has non-affine addresses
         # and defeats vectorized loads (~25x slower on prefill).
-        sink_row = tl.load(sink_ptr + d_offs).to(tl.bfloat16).to(tl.float32)
+        sink_row = tl.load(sink_ptr + d_offs)
+        if not EXACT_FP32:
+            sink_row = sink_row.to(tl.bfloat16)
+        sink_row = sink_row.to(tl.float32)
         sink = tl.broadcast_to(sink_row[None, :], (BLOCK_ROWS, HEAD_DIM))
     else:
         # head h belongs to kv head h // group (kv-major head layout)
@@ -94,20 +100,28 @@ def _triton_sink_apply(
             mask=mask[:, None],
             other=0,
         )
-        sink = sink.to(tl.bfloat16).to(tl.float32)
+        if not EXACT_FP32:
+            sink = sink.to(tl.bfloat16)
+        sink = sink.to(tl.float32)
     q_tile = tl.load(
         q_ptr + rows[:, None] * HEAD_DIM + d_offs[None, :],
         mask=mask[:, None],
         other=0,
     ).to(tl.float32)
     logit = tl.sum(q_tile * sink, axis=1)
-    # replicate the torch path's bf16 bmm output rounding
-    logit = logit.to(tl.bfloat16).to(tl.float32)
-    lse_val = tl.load(lse_ptr + rows, mask=mask, other=0).to(tl.float32)
+    if not EXACT_FP32:
+        # replicate the FIA path's bf16 bmm output rounding
+        logit = logit.to(tl.bfloat16).to(tl.float32)
+    if LSE_HEAD_MAJOR:
+        lse_off = (rows % NUM_HEADS) * num_tokens + rows // NUM_HEADS
+    else:
+        lse_off = rows
+    lse_val = tl.load(lse_ptr + lse_off, mask=mask, other=0).to(tl.float32)
     factor = tl.sigmoid(lse_val - logit * scale)
-    # replicate factor.to(attn_output.dtype): >=0.998 rounds to exactly
-    # 1.0 in bf16, keeping the common case bit-exact.
-    factor = factor.to(tl.bfloat16).to(tl.float32)
+    if not EXACT_FP32:
+        # replicate factor.to(attn_output.dtype): >=0.998 rounds to exactly
+        # 1.0 in bf16, keeping the common case bit-exact.
+        factor = factor.to(tl.bfloat16).to(tl.float32)
     out_tile = tl.load(
         out_ptr + rows[:, None] * HEAD_DIM + d_offs[None, :],
         mask=mask[:, None],
@@ -131,6 +145,8 @@ def sink_apply_triton(
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
+    lse_head_major: bool = False,
+    exact_fp32: bool = False,
 ) -> None:
     """Fold the learned sink into ``attn_output[:num_tokens]`` in place.
 
@@ -148,9 +164,15 @@ def sink_apply_triton(
     # LSE arrives as (T, H, 1) or (T, H); both flatten to one fp32 value per
     # (token, head) pair. Reshape first (free for contiguous input), then
     # materialize if a non-contiguous layout slips through.
-    lse2d = lse.reshape(num_tokens, num_heads)
-    if not lse2d.is_contiguous():
-        lse2d = lse2d.contiguous()
+    if lse_head_major:
+        # QFA returns the LSE head-major, [num_heads, num_tokens]; the kernel
+        # indexes it directly, so no transpose copy is needed.
+        lse2d = lse.reshape(-1)
+        assert lse2d.is_contiguous(), "head-major LSE must be contiguous"
+    else:
+        lse2d = lse.reshape(num_tokens, num_heads)
+        if not lse2d.is_contiguous():
+            lse2d = lse2d.contiguous()
 
     num_rows = num_tokens * num_heads
     if num_rows == 0:
@@ -166,11 +188,14 @@ def sink_apply_triton(
         lse2d,
         scale,
         num_rows,
+        num_tokens,
         NUM_HEADS=num_heads,
         GROUP=num_heads // num_kv_heads,
         HEAD_DIM=head_dim,
         BLOCK_ROWS=_SINK_BLOCK_ROWS,
         SINK_1D=(num_kv_heads == 1),
+        LSE_HEAD_MAJOR=lse_head_major,
+        EXACT_FP32=exact_fp32,
     )
 
 
