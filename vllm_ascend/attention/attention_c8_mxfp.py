@@ -56,6 +56,23 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheSpec
 
 
+def _qfa_ops():
+    """Return the in-tree QFA torch custom operators.
+
+    QFA now ships as a vllm-ascend custom operator (``csrc/attention/
+    quant_flash_attn_vllm``) instead of the external ``cann_ops_transformer``
+    package. Ascend 950 (A5) does not go through the generic custom-op loader
+    (``enable_custom_op`` is disabled on that profile), so import the
+    extension explicitly before dispatching, mirroring the A5 MiniMax-M3
+    operators.
+    """
+    from vllm_ascend.utils import bootstrap_custom_op_env  # noqa: PLC0415
+
+    bootstrap_custom_op_env()
+    import vllm_ascend.vllm_ascend_C  # noqa: F401, PLC0415
+
+    return torch.ops._C_ascend
+
 # KV cache MXFP8 scale layouts, PA_NZ flavor (QFA layout_kv="PA_NZ"; golden
 # reference: quant_flash_attn_golden.py "PA_NZ: fp8=[Bn,N,D//32,Bs,32],
 # Kscale=[Bn,N,Bs//16,D//64,16,2], Vscale=[Bn,N,D//16,Bs//64,16,2]"). The
@@ -784,7 +801,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             # TND + PA: pass cu_seqlens_q only; the KV side is addressed via
             # block_table + seqused_kv. batch_size must NOT be passed with a
             # TND layout_q (the checker rejects it).
-            from cann_ops_transformer.ops import quant_flash_attn_metadata
+            quant_flash_attn_metadata = _qfa_ops().npu_quant_flash_attn_vllm_metadata
 
             metadata = quant_flash_attn_metadata(
                 self.num_heads,
@@ -880,11 +897,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         key_scale = key_scale.view(torch.float8_e8m0fnu)
         value_scale = value_scale.view(torch.float8_e8m0fnu)
         query_scale = query_scale.view(torch.float8_e8m0fnu)
-        from cann_ops_transformer.ops import quant_flash_attn
+        quant_flash_attn = _qfa_ops().npu_quant_flash_attn_vllm
 
-        # cann_ops_transformer delivery signature (verified on-device): the
-        # allocating wrapper is capture-safe under npugraph_ex (ops-transformer
-        # golden tests capture exactly this call, GRAPH_PATH=7).
+        # The in-tree custom op allocates its outputs inside the dispatcher and
+        # is capture-safe under npugraph_ex / aclgraph, matching the other
+        # vllm-ascend attention custom operators.
         result = quant_flash_attn(
             quant_query,
             key,
