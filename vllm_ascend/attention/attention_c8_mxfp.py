@@ -77,6 +77,10 @@ MXFP8_GROUP_SIZE = 32
 MXFP_SCALE_DTYPE_SIZE = 1
 MXFP_MAX_QUANT_BLOCK_SIZE = 1024
 FIA_SCALE_DTYPE_SIZE = 4
+# The C8 backend exposes 512-token kernel blocks even when the scheduler
+# combines several kernel blocks into one physical page.
+C8_KBLOCK_KERNEL_BLOCK_SIZE = 512
+K_BLOCK_STAGE_DTYPE_SIZE = 2
 
 
 def quantize_mxfp_per_token(key: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
@@ -217,18 +221,58 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
+def get_c8_swa_k_block_size(layer, configured_group_size: int) -> int:
+    """Select the SWA layout from the implementation, including promoted specs."""
+    if configured_group_size and getattr(getattr(layer, "impl", None), "sliding_window", None) is not None:
+        return configured_group_size
+    return 0
+
+
+def fia_kblock_channel_packet_section_sizes(
+    num_kv_heads: int, block_size: int, head_dim: int, k_block_size: int
+) -> tuple[int, int, int, int, int]:
+    """Bytes for K8, V8, block/channel K scales, token/head V scales and K staging."""
+    if num_kv_heads <= 0 or head_dim <= 0:
+        raise ValueError("K block/channel cache requires positive KV heads and head dimension.")
+    if k_block_size <= 0 or block_size < 2 * k_block_size or block_size % k_block_size:
+        raise ValueError("K block/channel cache block must contain whole groups and at least two K groups.")
+    payload_bytes = block_size * num_kv_heads * head_dim
+    return (
+        payload_bytes,
+        payload_bytes,
+        block_size // k_block_size * num_kv_heads * head_dim * FIA_SCALE_DTYPE_SIZE,
+        block_size * num_kv_heads * FIA_SCALE_DTYPE_SIZE,
+        2 * k_block_size * num_kv_heads * head_dim * K_BLOCK_STAGE_DTYPE_SIZE,
+    )
+
+
 def mxfp_cache_spec(
-    spec: "FullAttentionSpec | SlidingWindowSpec", *, fia_pseudo: bool = False
+    spec: "FullAttentionSpec | SlidingWindowSpec", *, fia_pseudo: bool = False, k_block_size: int = 0
 ) -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
         raise ValueError("MXFP cache requires one stored state per token and one slot per KV head.")
-    mxfp_packet_section_sizes(spec.num_kv_heads, spec.block_size, k_dim, v_dim)
-    scale_bytes = (
-        math.ceil(2 * FIA_SCALE_DTYPE_SIZE / spec.num_kv_heads) if fia_pseudo else (k_dim + v_dim) // MXFP8_GROUP_SIZE
-    )
-    result = replace(spec, dtype=torch.float8_e4m3fn, state_content_bytes=k_dim + v_dim + scale_bytes)
+    if k_block_size:
+        if k_dim != v_dim:
+            raise ValueError("K block/channel cache requires equal K/V head dimensions.")
+        if spec.block_size % C8_KBLOCK_KERNEL_BLOCK_SIZE:
+            raise ValueError("K block/channel scheduler block must contain whole 512-token kernel blocks.")
+        # Stage storage belongs to each kernel block, not each scheduler
+        # page. Keep its per-token budget when scheduler blocks are merged.
+        kernel_bytes = sum(
+            fia_kblock_channel_packet_section_sizes(spec.num_kv_heads, C8_KBLOCK_KERNEL_BLOCK_SIZE, k_dim, k_block_size)
+        )
+        state_bytes = math.ceil(kernel_bytes / (C8_KBLOCK_KERNEL_BLOCK_SIZE * spec.num_kv_heads))
+    else:
+        mxfp_packet_section_sizes(spec.num_kv_heads, spec.block_size, k_dim, v_dim)
+        scale_bytes = (
+            math.ceil(2 * FIA_SCALE_DTYPE_SIZE / spec.num_kv_heads)
+            if fia_pseudo
+            else (k_dim + v_dim) // MXFP8_GROUP_SIZE
+        )
+        state_bytes = k_dim + v_dim + scale_bytes
+    result = replace(spec, dtype=torch.float8_e4m3fn, state_content_bytes=state_bytes)
     if result.page_size_padded is not None and result.page_size_padded < result.unpadded_page_size_bytes:
         raise ValueError("MXFP padded page is smaller than its K/V and scale payload.")
     return result
@@ -287,7 +331,12 @@ def mxfp_paged_cache_views(
 
 
 def mxfp_cache_views_for_spec(
-    raw_tensor: torch.Tensor, spec: "FullAttentionSpec", kernel_block_size: int, *, fia_pseudo: bool = False
+    raw_tensor: torch.Tensor,
+    spec: "FullAttentionSpec | SlidingWindowSpec",
+    kernel_block_size: int,
+    *,
+    fia_pseudo: bool = False,
+    k_block_size: int = 0,
 ):
     """Translate scheduler pages (including padding) into kernel block views."""
     if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
@@ -296,6 +345,17 @@ def mxfp_cache_views_for_spec(
     page_bytes = spec.page_size_bytes
     if page_bytes % ratio or raw_tensor.numel() % page_bytes:
         raise ValueError("MXFP raw allocation and physical pitch must contain whole pages.")
+    if k_block_size:
+        if kernel_block_size != C8_KBLOCK_KERNEL_BLOCK_SIZE:
+            raise ValueError("K block/channel cache requires 512-token kernel blocks.")
+        return fia_kblock_channel_cache_views(
+            raw_tensor,
+            raw_tensor.numel() // page_bytes * ratio,
+            spec,
+            kernel_block_size,
+            k_block_size,
+            page_stride_bytes=page_bytes // ratio,
+        )
     if fia_pseudo:
         return fia_pseudo_cache_views(
             raw_tensor,
@@ -358,6 +418,54 @@ def fia_pseudo_cache_views(
                 storage_offset=(raw_tensor.storage_offset() + offset) // element_size,
             )
         )
+    return tuple(views)
+
+
+def fia_kblock_channel_cache_views(
+    raw_tensor: torch.Tensor,
+    num_blocks: int,
+    spec,
+    block_size: int,
+    k_block_size: int,
+    *,
+    page_stride_bytes: int | None = None,
+):
+    """Five page-strided views; BF16 staging is separate from FP8 attention KV."""
+    if raw_tensor.ndim != 1 or raw_tensor.dtype != torch.int8 or not raw_tensor.is_contiguous():
+        raise ValueError("K block/channel cache requires a contiguous flat int8 allocation.")
+    if num_blocks <= 0:
+        raise ValueError("K block/channel cache requires at least one kernel block.")
+    if spec.head_size != spec.head_size_v:
+        raise ValueError("K block/channel cache requires equal K/V head dimensions.")
+    sizes = fia_kblock_channel_packet_section_sizes(spec.num_kv_heads, block_size, spec.head_size, k_block_size)
+    payload_bytes = sum(sizes)
+    pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
+    if pitch < payload_bytes or raw_tensor.numel() < num_blocks * pitch:
+        raise ValueError("K block/channel cache page is smaller than its payload and staging.")
+    if any(size % FIA_SCALE_DTYPE_SIZE for size in (pitch, raw_tensor.numel(), raw_tensor.storage_offset())):
+        raise ValueError("K block/channel FP32 scales require a 4-byte-aligned allocation and page pitch.")
+    heads, dim = spec.num_kv_heads, spec.head_size
+    shapes = (
+        (num_blocks, block_size, heads * dim),
+        (num_blocks, block_size, heads * dim),
+        (num_blocks, block_size // k_block_size, heads, dim),
+        (num_blocks, block_size, heads),
+        (num_blocks, 2 * k_block_size, heads, dim),
+    )
+    dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float32, torch.float32, torch.bfloat16)
+    element_sizes = (1, 1, FIA_SCALE_DTYPE_SIZE, FIA_SCALE_DTYPE_SIZE, K_BLOCK_STAGE_DTYPE_SIZE)
+    views, offset = [], 0
+    for shape, dtype, element_size, size in zip(shapes, dtypes, element_sizes, sizes):
+        strides = (pitch // element_size, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
+        views.append(
+            torch.as_strided(
+                raw_tensor.view(dtype),
+                shape,
+                strides,
+                storage_offset=(raw_tensor.storage_offset() + offset) // element_size,
+            )
+        )
+        offset += size
     return tuple(views)
 
 

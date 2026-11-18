@@ -86,6 +86,17 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
                     raise ValueError("Dynamic per-token KV requires equal K/V head dimensions.")
                 layer.attn_backend = AscendC8FIAPseudoAttentionBackend
                 layer.impl.__class__ = AscendC8FIAPseudoAttentionBackendImpl
+                if config.c8_swa_k_quant_group_size and layer.impl.sliding_window is not None:
+                    from vllm_ascend.attention.attention_c8_kblock import (
+                        AscendC8KBlockAttentionBackend,
+                        AscendC8KBlockAttentionBackendImpl,
+                    )
+
+                    if layer.impl.kv_sharing_target_layer_name is not None:
+                        raise ValueError("Block-channel SWA K does not support shared-KV aliases.")
+                    layer.attn_backend = AscendC8KBlockAttentionBackend
+                    layer.impl.__class__ = AscendC8KBlockAttentionBackendImpl
+                    layer.impl.k_block_group_size = config.c8_swa_k_quant_group_size
             else:
                 layer.attn_backend = AscendC8MXFPAttentionBackend
                 layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl

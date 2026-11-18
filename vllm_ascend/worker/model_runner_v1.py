@@ -124,6 +124,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
+    get_c8_swa_k_block_size,
     is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
@@ -5515,6 +5516,10 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(
                         raw, current_kv_cache_spec, kernel_block_size,
                         fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
+                        k_block_size=get_c8_swa_k_block_size(
+                            self.compilation_config.static_forward_context.get(layer_name),
+                            getattr(self.ascend_config, "c8_swa_k_quant_group_size", 0),
+                        ),
                     )
                     continue
 
@@ -6362,7 +6367,13 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
-                        spec = mxfp_cache_spec(spec, fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token")
+                        spec = mxfp_cache_spec(
+                            spec,
+                            fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
+                            k_block_size=get_c8_swa_k_block_size(
+                                attn_module, getattr(self.ascend_config, "c8_swa_k_quant_group_size", 0)
+                            ),
+                        )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):

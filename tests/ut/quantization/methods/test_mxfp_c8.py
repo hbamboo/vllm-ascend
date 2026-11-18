@@ -402,7 +402,10 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
             return_value=SimpleNamespace(
-                c8_k_quant_mode="per_token", c8_v_quant_mode="per_token", _c8_qk_smoothing_coefficients={}
+                c8_k_quant_mode="per_token",
+                c8_v_quant_mode="per_token",
+                c8_swa_k_quant_group_size=0,
+                _c8_qk_smoothing_coefficients={},
             ),
         ):
             method.create_weights(layer)
@@ -423,6 +426,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         config = SimpleNamespace(
             c8_k_quant_mode="per_token",
             c8_v_quant_mode="per_token",
+            c8_swa_k_quant_group_size=0,
             _c8_qk_smoothing_coefficients={"7": {"swa": coefficients.tolist()}},
         )
         method = AscendC8MXFPKVCacheAttentionMethod({}, "swa")
@@ -439,12 +443,60 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         self.assertFalse(layer.impl.qk_smoothing_query_scale.requires_grad)
         self.assertEqual(layer.impl.qk_smoothing_key_scale.device, layer.v_cache_scale.device)
 
+    def test_block_channel_k_selects_only_sliding_layers(self):
+        from vllm_ascend.attention.attention_c8_fia import AscendC8FIAPseudoAttentionBackend
+        from vllm_ascend.attention.attention_c8_kblock import (
+            AscendC8KBlockAttentionBackend,
+            AscendC8KBlockAttentionBackendImpl,
+        )
+
+        config = SimpleNamespace(
+            c8_k_quant_mode="per_token",
+            c8_v_quant_mode="per_token",
+            c8_swa_k_quant_group_size=32,
+            _c8_qk_smoothing_coefficients={},
+        )
+        for window, expected in ((None, AscendC8FIAPseudoAttentionBackend), (4096, AscendC8KBlockAttentionBackend)):
+            with self.subTest(window=window):
+                layer = self._make_layer(with_impl=True)
+                layer.head_size = layer.head_size_v = 128
+                layer.impl.sliding_window = window
+                layer.impl.kv_sharing_target_layer_name = None
+                with patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config", return_value=config):
+                    method = AscendC8MXFPKVCacheAttentionMethod({}, "swa")
+                    method.create_weights(layer)
+                    method.process_weights_after_loading(layer)
+                self.assertIs(layer.attn_backend, expected)
+                if window is not None:
+                    self.assertIsInstance(layer.impl, AscendC8KBlockAttentionBackendImpl)
+                    self.assertEqual(layer.impl.k_block_group_size, 32)
+                    self.assertIsNone(layer.impl.qk_smoothing_query_scale)
+
+    def test_block_channel_k_rejects_shared_alias(self):
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        layer.impl.sliding_window = 4096
+        layer.impl.kv_sharing_target_layer_name = "producer"
+        with (
+            patch(
+                "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                return_value=SimpleNamespace(
+                    c8_k_quant_mode="per_token",
+                    c8_v_quant_mode="per_token",
+                    c8_swa_k_quant_group_size=32,
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "shared-KV"),
+        ):
+            AscendC8MXFPKVCacheAttentionMethod({}, "alias").create_weights(layer)
+
     def test_qk_smoothing_unlisted_layer_keeps_identity(self):
         layer = self._make_layer(with_impl=True)
         layer.head_size = layer.head_size_v = 128
         config = SimpleNamespace(
             c8_k_quant_mode="per_token",
             c8_v_quant_mode="per_token",
+            c8_swa_k_quant_group_size=0,
             _c8_qk_smoothing_coefficients={"0": {"other": [[1.0] * 128]}},
         )
         with (
@@ -472,6 +524,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
                 config = SimpleNamespace(
                     c8_k_quant_mode="per_token",
                     c8_v_quant_mode="per_token",
+                    c8_swa_k_quant_group_size=0,
                     _c8_qk_smoothing_coefficients={"0": {"layer": coefficients}},
                 )
                 method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")

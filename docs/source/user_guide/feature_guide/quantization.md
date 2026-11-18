@@ -138,18 +138,20 @@ prompts = [
 # Set sampling parameters
 sampling_params = SamplingParams(temperature=0.6, top_p=0.95, top_k=40)
 
-llm = LLM(model="/path/to/your/quantized_model",
-          max_model_len=4096,
-          trust_remote_code=True,
-          # Set appropriate TP and DP values
-          tensor_parallel_size=2,
-          data_parallel_size=1,
-          # Set an unused port
-          port=8000,
-          # Set serving model name
-          served_model_name="quantized_model",
-          # Specify `quantization="ascend"` to enable quantization for models quantized by ModelSlim
-          quantization="ascend")
+llm = LLM(
+    model="/path/to/your/quantized_model",
+    max_model_len=4096,
+    trust_remote_code=True,
+    # Set appropriate TP and DP values
+    tensor_parallel_size=2,
+    data_parallel_size=1,
+    # Set an unused port
+    port=8000,
+    # Set serving model name
+    served_model_name="quantized_model",
+    # Specify `quantization="ascend"` to enable quantization for models quantized by ModelSlim
+    quantization="ascend",
+)
 
 outputs = llm.generate(prompts, sampling_params)
 for output in outputs:
@@ -226,6 +228,51 @@ service and clear existing KV/prefix caches when coefficients change.
 FP8 accuracy improvement is not guaranteed. Identity coefficients are kept
 when candidates fail calibration or holdout checks. The Q/K transforms
 also add runtime work; measure inference latency before enabling them.
+
+### Experimental block/channel FP8 K for SWA
+
+Set the token group size to enable dynamic K scales per group, KV head,
+and channel on sliding-window layers:
+
+```json
+{
+  "c8_k_quant_mode": "per_token",
+  "c8_v_quant_mode": "per_token",
+  "c8_swa_k_quant_group_size": 32
+}
+```
+
+Use `--dtype bfloat16 --kv-cache-dtype mxfp8 --block-size 512`
+with `--no-async-scheduling --disable-hybrid-kv-cache-manager`. The group
+size can be 32, 64, or 128; its default is 0 (disabled). V is dynamically
+quantized per token and KV head. Full-attention layers retain the existing
+per-token FP8 FIA path. Checkpoint weights do not change.
+
+K/V payloads are FP8 E4M3 with FP32 scales. FIA does not natively accept
+the block-dependent K channel scales, so a Triton kernel gathers the
+visible window and dequantizes it to BF16 before BF16 FIA computes
+attention. The original Q supplies both attention and learned-key sink
+correction. This is not native FIA FP8 dequantization or FP8 attention
+arithmetic, and it adds runtime work and BF16 workspace.
+
+Each physical page also reserves two groups of original BF16 K for
+unfinished-group updates and speculative replacement. K is requantized
+from those originals, avoiding accumulated error from rescaling old FP8
+values. With one KV head and D=128, a 512-token page uses 157696 bytes
+at group size 32, versus 135168 bytes in the per-token path. This overhead
+is included in the KV memory budget; actual token capacity also depends
+on hybrid page padding and temporary workspace. Outside-window pages are
+still retained with the required hybrid-manager setting.
+
+This path requires synchronous scheduling because FIA takes host sequence
+lengths. It supports speculative lookahead shorter than the group size,
+not arbitrary rewinds. Shared-KV aliases, PD transfer, PCP/DCP, and combining
+this option with `c8_qk_smoothing_path` are unsupported. Restart the service
+and clear existing KV/prefix caches when changing the cache format.
+
+The quantization axes are an experimental accuracy candidate. Local
+attention error, model accuracy, and latency must be measured separately;
+improvement over per-token FP8 is not guaranteed.
 
 ## References
 

@@ -134,6 +134,48 @@ class TestAscendConfig(TestBase):
         with self.assertRaisesRegex(ValueError, "c8_k_quant_mode"):
             config.derive_and_validate(SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="mxfp8")))
 
+    def test_c8_swa_k_groups_default_and_choices(self):
+        kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
+        self.assertEqual(AscendConfig(**kwargs).c8_swa_k_quant_group_size, 0)
+        for size in (32, 64, 128):
+            self.assertEqual(AscendConfig(**kwargs, c8_swa_k_quant_group_size=size).c8_swa_k_quant_group_size, size)
+        with self.assertRaisesRegex(ValueError, "c8_swa_k_quant_group_size"):
+            AscendConfig(**kwargs, c8_swa_k_quant_group_size=16)
+
+    def test_c8_swa_k_groups_require_per_token_fia(self):
+        config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_swa_k_quant_group_size=32)
+        with self.assertRaisesRegex(ValueError, "requires per-token K/V FIA"):
+            config.derive_and_validate(SimpleNamespace())
+
+    def test_c8_swa_k_groups_reject_incompatible_state(self):
+        for changes, smoothing, message in (
+            ({"async_scheduling": True}, None, "no-async-scheduling"),
+            ({"disable_hybrid_kv_cache_manager": False}, None, "disable-hybrid-kv-cache-manager"),
+            ({}, "old_smoothing.json", "cannot be combined"),
+            ({"draft_tokens": 32}, None, "fewer speculative tokens"),
+        ):
+            with self.subTest(changes=changes, smoothing=smoothing):
+                scheduler = SimpleNamespace(async_scheduling=False, disable_hybrid_kv_cache_manager=True)
+                for name, value in changes.items():
+                    if name != "draft_tokens":
+                        setattr(scheduler, name, value)
+                vc = SimpleNamespace(
+                    cache_config=SimpleNamespace(cache_dtype="mxfp8"),
+                    model_config=SimpleNamespace(dtype=torch.bfloat16),
+                    kv_transfer_config=None,
+                    scheduler_config=scheduler,
+                    speculative_config=SimpleNamespace(num_speculative_tokens=changes.get("draft_tokens", 5)),
+                )
+                config = AscendConfig(
+                    sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                    c8_k_quant_mode="per_token",
+                    c8_v_quant_mode="per_token",
+                    c8_swa_k_quant_group_size=32,
+                    c8_qk_smoothing_path=smoothing,
+                )
+                with self.assertRaisesRegex(ValueError, message):
+                    config.derive_and_validate(vc)
+
     def test_c8_qk_smoothing_requires_per_token_fia(self):
         config = AscendConfig(
             sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_qk_smoothing_path="smoothing.json"

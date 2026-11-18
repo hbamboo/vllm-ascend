@@ -60,6 +60,7 @@ from vllm.v1.worker.utils import AttentionGroup
 
 from vllm_ascend.ascend_config import KVPPConfig, get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
+    get_c8_swa_k_block_size,
     is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
@@ -340,7 +341,11 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # cache (Invalid_Argument_Tensor_Dtype in ScatterPaKvCache).
         if is_c8_mxfp_kv_quant(vllm_config) and is_mxfp_cache_spec(spec):
             spec = mxfp_cache_spec(
-                spec, fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token"
+                spec,
+                fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token",
+                k_block_size=get_c8_swa_k_block_size(
+                    attn_module, int((vllm_config.additional_config or {}).get("c8_swa_k_quant_group_size", 0))
+                ),
             )
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
@@ -1547,6 +1552,8 @@ def _reshape_kv_cache_v2(
 
     vllm_config = get_current_vllm_config()
     is_dsv4_model = _is_dsv4_model(vllm_config)
+    k_block_size = int((vllm_config.additional_config or {}).get("c8_swa_k_quant_group_size", 0))
+    k_block_layers = get_layers_from_vllm_config(vllm_config, AttentionLayerBase) if k_block_size else {}
     layer_kv_cache_spec = _get_layer_kv_cache_specs(kv_cache_config)
     kv_caches: dict[str, Any] = {}
     layer_tuple_strides: dict[str, int] = {}
@@ -1601,6 +1608,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec,
                     kernel_block_size,
                     fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token",
+                    k_block_size=get_c8_swa_k_block_size(k_block_layers.get(layer_name), k_block_size),
                 )
                 continue
 

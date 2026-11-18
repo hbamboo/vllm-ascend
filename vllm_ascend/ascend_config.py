@@ -593,6 +593,9 @@ class AscendConfig:
     # Optional post-RoPE Q/K channel smoothing coefficients, independent of
     # checkpoint weights. Unlisted attention layers retain the original path.
     c8_qk_smoothing_path: str | None = None
+    # Experimental SWA K scales: one FP32 scale per token group/head/channel.
+    # Zero retains per-token K; V remains dynamic per-token/head.
+    c8_swa_k_quant_group_size: Literal[0, 32, 64, 128] = 0
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -726,6 +729,18 @@ class AscendConfig:
                 raise ValueError("Dynamic per-token KV requires --dtype bfloat16.")
             if vc.kv_transfer_config is not None:
                 raise ValueError("Dynamic per-token KV does not support PD KV transfer.")
+        if self.c8_swa_k_quant_group_size:
+            if self.c8_k_quant_mode != "per_token" or self.c8_v_quant_mode != "per_token":
+                raise ValueError("c8_swa_k_quant_group_size requires per-token K/V FIA quantization.")
+            if self.c8_qk_smoothing_path is not None:
+                raise ValueError("Block-channel SWA K cannot be combined with c8_qk_smoothing_path.")
+            if vc.scheduler_config.async_scheduling is not False:
+                raise ValueError("Block-channel SWA K requires --no-async-scheduling for FIA host lengths.")
+            if vc.scheduler_config.disable_hybrid_kv_cache_manager is not True:
+                raise ValueError("Block-channel SWA K currently requires --disable-hybrid-kv-cache-manager.")
+            speculative = vc.speculative_config
+            if speculative is not None and (speculative.num_speculative_tokens or 0) >= self.c8_swa_k_quant_group_size:
+                raise ValueError("Block-channel SWA K requires fewer speculative tokens than its token group size.")
         if self.c8_qk_smoothing_path is not None:
             if self.c8_k_quant_mode != "per_token" or self.c8_v_quant_mode != "per_token":
                 raise ValueError("c8_qk_smoothing_path requires per-token K/V FIA quantization.")
