@@ -587,9 +587,10 @@ class AscendConfig:
     enable_kv_nz: bool = False
     # K per_token shares one scale across local KV heads/channels: E8M0 in
     # MXFP8 mode, FP32 when c8_q_quant_mode selects the FP8 token path.
-    c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
-    # Per-token Q selects QFA FP8 mode 6 with FP32 Q/K descales.
-    c8_q_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
+    # per_token_head uses one FP32 scale for each token/head pair.
+    c8_k_quant_mode: Literal["per_token_group", "per_token", "per_token_head"] = "per_token_group"
+    # FP32 QFA modes: per_token pairs with dynamic V; per_token_head with static V.
+    c8_q_quant_mode: Literal["per_token_group", "per_token", "per_token_head"] = "per_token_group"
     # Dynamic per-token V selects FIA; dynamic per-head V selects QFA mode 6.
     c8_v_quant_mode: Literal["per_channel", "per_token", "per_head"] = "per_channel"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
@@ -710,19 +711,24 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
-        if self.c8_q_quant_mode == "per_token":
+        if self.c8_q_quant_mode in ("per_token", "per_token_head"):
             import torch
 
             if vc.cache_config.cache_dtype != "mxfp8":
-                raise ValueError("c8_q_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
-            if self.c8_k_quant_mode != "per_token":
-                raise ValueError("c8_q_quant_mode=per_token requires c8_k_quant_mode=per_token.")
-            if self.c8_v_quant_mode != "per_head":
-                raise ValueError("c8_q_quant_mode=per_token requires c8_v_quant_mode=per_head.")
+                raise ValueError(f"c8_q_quant_mode={self.c8_q_quant_mode} requires --kv-cache-dtype mxfp8.")
+            if self.c8_k_quant_mode != self.c8_q_quant_mode:
+                raise ValueError(
+                    f"c8_q_quant_mode={self.c8_q_quant_mode} requires c8_k_quant_mode={self.c8_q_quant_mode}."
+                )
+            expected_v_mode = "per_channel" if self.c8_q_quant_mode == "per_token_head" else "per_head"
+            if self.c8_v_quant_mode != expected_v_mode:
+                raise ValueError(f"c8_q_quant_mode={self.c8_q_quant_mode} requires c8_v_quant_mode={expected_v_mode}.")
             if vc.model_config.dtype != torch.bfloat16:
                 raise ValueError("QFA FP8 per-token Q/K requires --dtype bfloat16.")
             if vc.kv_transfer_config is not None:
                 raise ValueError("QFA FP8 per-token Q/K does not support PD KV transfer.")
+        elif self.c8_k_quant_mode == "per_token_head":
+            raise ValueError("c8_k_quant_mode=per_token_head requires c8_q_quant_mode=per_token_head.")
         elif self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
             raise ValueError("c8_k_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
         if self.c8_v_quant_mode == "per_head" and self.c8_q_quant_mode != "per_token":

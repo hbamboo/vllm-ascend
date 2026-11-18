@@ -1627,6 +1627,7 @@ def test_copy_num_computed_tokens_to_cpu_records_event():
 
 def _c8_mxfp_runner(layers: dict, num_blocks: int = 2) -> NPUModelRunner:
     runner = NPUModelRunner.__new__(NPUModelRunner)
+    runner.ascend_config = SimpleNamespace(c8_q_quant_mode="per_token_group", c8_v_quant_mode="per_channel")
     runner.kv_cache_config = SimpleNamespace(num_blocks=num_blocks)
     runner.compilation_config = SimpleNamespace(static_forward_context=layers)
     runner.vllm_config = SimpleNamespace(
@@ -1680,6 +1681,19 @@ def test_fill_c8_mxfp_v_scale_caches_skips_non_c8_layers():
 
     assert runner._c8_mxfp_v_scale_caches == []
     assert not hasattr(runner, "kv_block_zeroer")
+
+
+@pytest.mark.parametrize("q_mode,v_mode", [("per_token", "per_head"), ("per_token_head", "per_channel")])
+def test_fill_c8_mxfp_v_scale_caches_skips_qfa_fp32_page_tags(q_mode, v_mode):
+    layer = _c8_mxfp_layer()
+    page_v_scale = torch.zeros((2, 2), dtype=torch.float32)
+    layer.kv_cache = (MagicMock(), MagicMock(), MagicMock(), page_v_scale)
+    runner = _c8_mxfp_runner({"attn": layer})
+    runner.ascend_config.c8_q_quant_mode = q_mode
+    runner.ascend_config.c8_v_quant_mode = v_mode
+    runner._fill_c8_mxfp_v_scale_caches()
+    assert runner._c8_mxfp_v_scale_caches == []
+    assert torch.all(page_v_scale == 0)
 
 
 @pytest.mark.parametrize("ratio", [1, 2, 4])

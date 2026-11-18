@@ -181,6 +181,7 @@ def _triton_qfa_sink_apply(
     attn_ptr,
     lse_ptr,
     sink_ptr,
+    v_scale_ptr,
     out_ptr,
     scale,
     num_rows,
@@ -189,85 +190,97 @@ def _triton_qfa_sink_apply(
     HEAD_DIM: tl.constexpr,
     Q_TOKEN_STRIDE: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
+    Q_SCALE_TOKEN_STRIDE: tl.constexpr,
+    Q_SCALE_HEAD_STRIDE: tl.constexpr,
     LSE_HEAD_STRIDE: tl.constexpr,
     LSE_TOKEN_STRIDE: tl.constexpr,
     BLOCK_ROWS: tl.constexpr,
     SINK_1D: tl.constexpr,
+    HAS_SINK: tl.constexpr,
+    HAS_V_SCALE: tl.constexpr,
+    V_SCALE_HEAD_STRIDE: tl.constexpr,
+    V_SCALE_DIM_STRIDE: tl.constexpr,
 ):
     rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
     dim = tl.arange(0, HEAD_DIM)
     valid = rows < num_rows
     token = rows // NUM_HEADS
     head = rows % NUM_HEADS
-    if Q_TOKEN_STRIDE == NUM_HEADS * HEAD_DIM and Q_HEAD_STRIDE == HEAD_DIM:
-        q_offsets = rows[:, None] * HEAD_DIM + dim[None, :]
-    else:
-        q_offsets = token[:, None] * Q_TOKEN_STRIDE + head[:, None] * Q_HEAD_STRIDE + dim[None, :]
-    query = tl.load(
-        q_ptr + q_offsets,
-        mask=valid[:, None],
-        other=0.0,
-    ).to(tl.float32)
-    query_scale = tl.load(q_scale_ptr + token, mask=valid, other=0).to(tl.float32)
-    query = query * query_scale[:, None]
-    if SINK_1D:
-        sink_row = tl.load(sink_ptr + dim).to(tl.float32)
-        sink = tl.broadcast_to(sink_row[None, :], (BLOCK_ROWS, HEAD_DIM))
-    else:
-        kv_head = head // GROUP
-        sink = tl.load(
-            sink_ptr + kv_head[:, None] * HEAD_DIM + dim[None, :],
+    if HAS_SINK:
+        if Q_TOKEN_STRIDE == NUM_HEADS * HEAD_DIM and Q_HEAD_STRIDE == HEAD_DIM:
+            q_offsets = rows[:, None] * HEAD_DIM + dim[None, :]
+        else:
+            q_offsets = token[:, None] * Q_TOKEN_STRIDE + head[:, None] * Q_HEAD_STRIDE + dim[None, :]
+        query = tl.load(
+            q_ptr + q_offsets,
+            mask=valid[:, None],
+            other=0.0,
+        ).to(tl.float32)
+        query_scale = tl.load(
+            q_scale_ptr + token * Q_SCALE_TOKEN_STRIDE + head * Q_SCALE_HEAD_STRIDE, mask=valid, other=0
+        ).to(tl.float32)
+        query = query * query_scale[:, None]
+        if SINK_1D:
+            sink_row = tl.load(sink_ptr + dim).to(tl.float32)
+            sink = tl.broadcast_to(sink_row[None, :], (BLOCK_ROWS, HEAD_DIM))
+        else:
+            kv_head = head // GROUP
+            sink = tl.load(sink_ptr + kv_head[:, None] * HEAD_DIM + dim[None, :], mask=valid[:, None], other=0).to(
+                tl.float32
+            )
+        logit = tl.sum(query * sink, axis=1) * scale
+        lse = tl.load(lse_ptr + head * LSE_HEAD_STRIDE + token * LSE_TOKEN_STRIDE, mask=valid, other=0).to(tl.float32)
+        factor = tl.sigmoid(lse - logit)
+    offsets = rows[:, None] * HEAD_DIM + dim[None, :]
+    attn = tl.load(attn_ptr + offsets, mask=valid[:, None], other=0).to(tl.float32)
+    if HAS_V_SCALE:
+        channel_scale = tl.load(
+            v_scale_ptr + (head // GROUP)[:, None] * V_SCALE_HEAD_STRIDE + dim[None, :] * V_SCALE_DIM_STRIDE,
             mask=valid[:, None],
             other=0,
         ).to(tl.float32)
-    logit = tl.sum(query * sink, axis=1) * scale
-    lse = tl.load(
-        lse_ptr + head * LSE_HEAD_STRIDE + token * LSE_TOKEN_STRIDE,
-        mask=valid,
-        other=0,
-    ).to(tl.float32)
-    factor = tl.sigmoid(lse - logit)
-    offsets = rows[:, None] * HEAD_DIM + dim[None, :]
-    attn = tl.load(attn_ptr + offsets, mask=valid[:, None], other=0).to(tl.float32)
-    # QFA already applied V's per-head descale. Keep the sink calculation
-    # in FP32 and round only the final result written to the caller's buffer.
-    tl.store(out_ptr + offsets, attn * factor[:, None], mask=valid[:, None])
+        attn = attn * channel_scale
+    if HAS_SINK:
+        attn = attn * factor[:, None]
+    tl.store(out_ptr + offsets, attn, mask=valid[:, None])
 
 
 def qfa_sink_apply_triton(
     query: torch.Tensor,
     query_scale: torch.Tensor,
     attn_output: torch.Tensor,
-    lse: torch.Tensor,
-    sink_key: torch.Tensor,
+    lse: torch.Tensor | None,
+    sink_key: torch.Tensor | None,
     scale: float,
     num_tokens: int,
     num_heads: int,
     num_kv_heads: int,
     head_dim: int,
     output: torch.Tensor,
+    v_output_scale: torch.Tensor | None = None,
 ) -> None:
     """Write QFA output with the learned-key sink directly to ``output``.
 
-    ``query`` is TND FP8 and ``query_scale`` contains one FP32 descale per
-    token. QFA's ``lse`` is head-major ``(num_heads, num_tokens)``. The
-    attention input and destination are contiguous TND BF16 buffers; unlike
-    the FIA path, Qhat, sink logits and the factor stay FP32 until the final
-    output store. The QFA attention input is left unchanged.
+    Q descales are FP32 ``[T]`` or ``[T, Hq]``. Optional static V scales
+    ``[Hkv, D]`` are restored in the same kernel as the learned-key sink.
+    Without a sink, only the V channel restoration is performed. Qhat,
+    channel restoration and sink arithmetic stay FP32 until the final store.
     """
     num_rows = num_tokens * num_heads
     if num_rows == 0:
         return
     query = query.reshape(num_tokens, num_heads, head_dim)
-    lse = lse.reshape(num_heads, num_tokens)
+    if sink_key is not None:
+        lse = lse.reshape(num_heads, num_tokens)
     init_device_properties_triton()
     grid = triton.cdiv(num_rows, _SINK_BLOCK_ROWS)
     _triton_qfa_sink_apply[(grid,)](
         query,
         query_scale,
         attn_output,
-        lse,
-        sink_key,
+        lse if sink_key is not None else attn_output,
+        sink_key if sink_key is not None else query,
+        v_output_scale if v_output_scale is not None else attn_output,
         output,
         scale,
         num_rows,
@@ -276,8 +289,14 @@ def qfa_sink_apply_triton(
         HEAD_DIM=head_dim,
         Q_TOKEN_STRIDE=query.stride(0),
         Q_HEAD_STRIDE=query.stride(1),
-        LSE_HEAD_STRIDE=lse.stride(0),
-        LSE_TOKEN_STRIDE=lse.stride(1),
+        Q_SCALE_TOKEN_STRIDE=query_scale.stride(0),
+        Q_SCALE_HEAD_STRIDE=query_scale.stride(1) if query_scale.ndim == 2 else 0,
+        LSE_HEAD_STRIDE=lse.stride(0) if sink_key is not None else 0,
+        LSE_TOKEN_STRIDE=lse.stride(1) if sink_key is not None else 0,
         BLOCK_ROWS=_SINK_BLOCK_ROWS,
         SINK_1D=(num_kv_heads == 1),
+        HAS_SINK=sink_key is not None,
+        HAS_V_SCALE=v_output_scale is not None,
+        V_SCALE_HEAD_STRIDE=v_output_scale.stride(0) if v_output_scale is not None else 0,
+        V_SCALE_DIM_STRIDE=v_output_scale.stride(1) if v_output_scale is not None else 0,
     )

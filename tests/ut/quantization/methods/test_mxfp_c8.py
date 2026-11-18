@@ -441,6 +441,7 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         self.assertIs(type(layer.impl), AscendC8MXFPAttentionBackendImpl)
         self.assertEqual(layer.impl.q_quant_mode, "per_token")
         self.assertEqual(layer.impl.k_quant_mode, "per_token")
+        self.assertEqual(layer.impl.v_quant_mode, "per_head")
         self.assertFalse(layer.impl.supports_quant_query_input)
         self.assertEqual(layer.attn_backend.get_supported_kernel_block_sizes(), [128])
         tiny = torch.finfo(torch.float32).tiny
@@ -460,6 +461,49 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         for state in (layer.impl.qfa_v_head_bound, layer.impl.qfa_v_descale, layer.impl.qfa_p_scale):
             self.assertEqual(state.device, layer.v_cache_scale.device)
 
+    def test_token_head_qk_installs_qfa_and_restores_checkpoint_v_channels(self):
+        from vllm_ascend.attention.attention_c8_mxfp import (
+            AscendC8MXFPAttentionBackendImpl,
+            AscendC8QFAFP8AttentionBackend,
+        )
+
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+            return_value=SimpleNamespace(
+                c8_q_quant_mode="per_token_head", c8_k_quant_mode="per_token_head", c8_v_quant_mode="per_channel"
+            ),
+        ):
+            method.create_weights(layer)
+        codes = torch.tensor([0, 126, 127, 128], dtype=torch.uint8).repeat(64)
+        layer.v_cache_scale.weight_loader(layer.v_cache_scale, codes)
+        with patch(
+            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_current_vllm_config",
+            return_value=SimpleNamespace(model_config=SimpleNamespace(dtype=torch.bfloat16)),
+        ):
+            method.process_weights_after_loading(layer)
+
+        self.assertIs(layer.attn_backend, AscendC8QFAFP8AttentionBackend)
+        self.assertIs(type(layer.impl), AscendC8MXFPAttentionBackendImpl)
+        self.assertEqual(layer.impl.q_quant_mode, "per_token_head")
+        self.assertEqual(layer.impl.k_quant_mode, "per_token_head")
+        self.assertEqual(layer.impl.v_quant_mode, "per_channel")
+        self.assertFalse(layer.impl.supports_quant_query_input)
+        self.assertEqual(layer.attn_backend.get_supported_kernel_block_sizes(), [128])
+        expected_codes = codes.clone()
+        expected_codes[expected_codes == 0] = 127
+        descale = torch.exp2(expected_codes.float() - 127)
+        torch.testing.assert_close(layer.impl.qfa_v_output_scale, descale.reshape(2, 128), rtol=0, atol=0)
+        torch.testing.assert_close(layer.impl.qfa_v_descale, torch.ones(2, dtype=torch.float32), rtol=0, atol=0)
+        torch.testing.assert_close(layer.v_cache_scale_float_reciprocal, (1 / descale).bfloat16(), rtol=0, atol=0)
+        self.assertEqual(layer.impl.qfa_p_scale.item(), torch.finfo(torch.float8_e4m3fn).max)
+        self.assertFalse(hasattr(layer.impl, "qfa_v_head_bound"))
+        for state in (layer.impl.qfa_v_output_scale, layer.impl.qfa_v_descale, layer.impl.qfa_p_scale):
+            self.assertEqual(state.dtype, torch.float32)
+            self.assertEqual(state.device, layer.v_cache_scale.device)
+
     def test_qfa_fp8_rejects_unsupported_head_dimensions(self):
         for k_dim, v_dim in ((256, 256), (128, 64)):
             with self.subTest(k_dim=k_dim, v_dim=v_dim):
@@ -477,17 +521,19 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
                     AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
 
     def test_qfa_fp8_does_not_apply_the_mx_block_width_limit(self):
-        layer = self._make_layer(with_impl=True)
-        layer.num_kv_heads = 16
-        layer.head_size = layer.head_size_v = 128
-        with patch(
-            "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(
-                c8_q_quant_mode="per_token", c8_k_quant_mode="per_token", c8_v_quant_mode="per_head"
-            ),
-        ):
-            AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
-        self.assertEqual(layer.v_cache_scale.shape, (2048,))
+        for q_mode, v_mode in (("per_token", "per_head"), ("per_token_head", "per_channel")):
+            with self.subTest(q_mode=q_mode):
+                layer = self._make_layer(with_impl=True)
+                layer.num_kv_heads = 16
+                layer.head_size = layer.head_size_v = 128
+                with patch(
+                    "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                    return_value=SimpleNamespace(
+                        c8_q_quant_mode=q_mode, c8_k_quant_mode=q_mode, c8_v_quant_mode=v_mode
+                    ),
+                ):
+                    AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+                self.assertEqual(layer.v_cache_scale.shape, (2048,))
 
 
 class TestQuantWeightLoader(TestBase):

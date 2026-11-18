@@ -1021,7 +1021,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         num_actual_tokens = quant_key.shape[0]
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         key_cache, value_cache = kv_cache[0], kv_cache[1]
-        if self.q_quant_mode == "per_token":
+        if self.q_quant_mode in ("per_token", "per_token_head"):
             from cann_ops_transformer.ops import scatter_pa_kv_cache_with_k_scale
 
             scatter_pa_kv_cache_with_k_scale(
@@ -1030,7 +1030,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 key_cache,
                 value_cache,
                 slot_mapping,
-                key_scale[:, None].expand(-1, self.num_kv_heads),
+                key_scale if key_scale.ndim == 2 else key_scale[:, None].expand(-1, self.num_kv_heads),
                 kv_cache[2].unsqueeze(-1),
                 cache_layout="BNBD",
             )
@@ -1060,7 +1060,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         notify_kv_cache_written()
 
     def _forward_fp8_per_token(self, layer, query, key, value, kv_cache, attn_metadata, output):
-        """Native mode 6, preserving V head-scale coherence across cached pages."""
+        """Native mode 6 with FP32 Q/K scales and dynamic or static V."""
         from cann_ops_transformer.ops import quant_flash_attn, quant_flash_attn_metadata
 
         from vllm_ascend.ops.triton.qfa_v_head_scale import (
@@ -1073,9 +1073,10 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         num_tokens = attn_metadata.num_actual_tokens
         if num_tokens == 0:
             return output
+        token_head = self.q_quant_mode == "per_token_head"
         query = query[:num_tokens].reshape(num_tokens, self.num_heads, self.head_size)
         query8, query_scale = torch_npu.npu_dynamic_quant(
-            query.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+            query if token_head else query.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
         )
         query8 = query8.reshape_as(query)
         cu_q, used_kv = self._qfa_step_lengths(attn_metadata, num_tokens)
@@ -1084,36 +1085,44 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         if self.kv_sharing_target_layer_name is not None:
             owner = self.vllm_config.compilation_config.static_forward_context[self.kv_sharing_target_layer_name].impl
         elif key is not None and value is not None:
+            key = key[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size)
             key8, key_scale = torch_npu.npu_dynamic_quant(
-                key[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+                key if token_head else key.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
             )
-            # Native QFA has one V scale per head for the whole visible cache.
-            # Padding slots never enter V's shared amax or its persistent bound.
-            # The fused preparation also appends the prior bound, keeping the
-            # quantizer's head rows aligned without a separate layout/cat copy.
-            bounded_value = prepare_qfa_v_head_input(
-                value[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size),
-                attn_metadata.slot_mapping[:num_tokens],
-                self.qfa_v_head_bound,
-                num_tokens,
-                kv_cache[0].shape[0] * kv_cache[0].shape[2],
-            )
-            value8, value_scale = torch_npu.npu_dynamic_quant(
-                bounded_value, dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
-            )
-            value8 = value8[:, : num_tokens * self.head_size].reshape(self.num_kv_heads, num_tokens, self.head_size)
-            value8 = value8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
-            num_pages = kv_cache[0].shape[0]
-            history_key = ("fp8_v_history", num_pages)
-            history = step_cache.get(history_key)
-            if history is None:
-                history = qfa_v_history_pages(attn_metadata.block_tables, cu_q, used_kv, num_pages)
-                step_cache[history_key] = history
-            # Only referenced historical rows are rescaled; shared prefix pages
-            # have one writer. New/overlaid pages never read their former bytes.
-            rescale_qfa_v_cache(
-                kv_cache[1], kv_cache[3], value_scale, history, self.qfa_v_head_bound, self.qfa_v_descale
-            )
+            if token_head:
+                value8 = torch_npu.npu_quantize(
+                    value[:num_tokens].reshape(num_tokens, -1),
+                    layer.v_cache_scale_float_reciprocal,
+                    None,
+                    torch.float8_e4m3fn,
+                    -1,
+                    False,
+                ).reshape(num_tokens, self.num_kv_heads, self.head_size)
+            else:
+                # Native QFA has one V scale per head for the whole visible cache.
+                # Exclude padding from amax and retain the previous head bound.
+                bounded_value = prepare_qfa_v_head_input(
+                    value[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size),
+                    attn_metadata.slot_mapping[:num_tokens],
+                    self.qfa_v_head_bound,
+                    num_tokens,
+                    kv_cache[0].shape[0] * kv_cache[0].shape[2],
+                )
+                value8, value_scale = torch_npu.npu_dynamic_quant(
+                    bounded_value, dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+                )
+                value8 = value8[:, : num_tokens * self.head_size].reshape(self.num_kv_heads, num_tokens, self.head_size)
+                value8 = value8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
+                num_pages = kv_cache[0].shape[0]
+                history_key = ("fp8_v_history", num_pages)
+                history = step_cache.get(history_key)
+                if history is None:
+                    history = qfa_v_history_pages(attn_metadata.block_tables, cu_q, used_kv, num_pages)
+                    step_cache[history_key] = history
+                # One writer per shared page; fresh pages never read former bytes.
+                rescale_qfa_v_cache(
+                    kv_cache[1], kv_cache[3], value_scale, history, self.qfa_v_head_bound, self.qfa_v_descale
+                )
             self.reshape_and_cache(
                 key8.reshape(num_tokens, self.num_kv_heads, self.head_size), value8, key_scale, kv_cache, attn_metadata
             )
@@ -1141,7 +1150,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             step_cache[plan_key] = metadata
         query_ntd = query8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
-        scale_nt = query_scale[None, :].expand(self.num_heads, -1).contiguous()
+        scale_nt = (
+            query_scale.t().contiguous() if token_head else query_scale[None, :].expand(self.num_heads, -1).contiguous()
+        )
         sink_key = getattr(layer, "sink_key", None)
         attn_output, lse = quant_flash_attn(
             query_ntd,
@@ -1167,7 +1178,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_out="TND",
             return_softmax_lse=sink_key is not None,
         )
-        if sink_key is not None:
+        if sink_key is not None or token_head:
             qfa_sink_apply_triton(
                 query8,
                 query_scale,
@@ -1180,6 +1191,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 self.num_kv_heads,
                 self.head_size,
                 output[:num_tokens].view(num_tokens, self.num_heads, self.head_size),
+                v_output_scale=owner.qfa_v_output_scale if token_head else None,
             )
         else:
             output[:num_tokens] = attn_output.reshape_as(output[:num_tokens])
@@ -1227,7 +1239,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 f"{len(kv_cache) if kv_cache is not None else 0}."
             )
 
-        if self.q_quant_mode == "per_token":
+        if self.q_quant_mode in ("per_token", "per_token_head"):
             return self._forward_fp8_per_token(layer, query, key, value, kv_cache, attn_metadata, output)
 
         # IQuest-Q1 learned-key sink: an always-visible KV entry with a zero

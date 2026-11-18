@@ -4715,7 +4715,9 @@ class NPUModelRunner(GPUModelRunner):
         the scheduler assigns that physical page to full attention again.
         """
         self._c8_mxfp_v_scale_caches = []
-        if self.ascend_config.c8_v_quant_mode == "per_token" or self.ascend_config.c8_q_quant_mode == "per_token":
+        if self.ascend_config.c8_v_quant_mode == "per_token" or self.ascend_config.c8_q_quant_mode in (
+            "per_token", "per_token_head"
+        ):
             return
         kv_cache_config = getattr(self, "kv_cache_config", None)
         group_by_layer = {
@@ -5517,7 +5519,7 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(
                         raw, current_kv_cache_spec, kernel_block_size,
                         fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
-                        qfa_fp8=self.ascend_config.c8_q_quant_mode == "per_token",
+                        qfa_fp8=self.ascend_config.c8_q_quant_mode in ("per_token", "per_token_head"),
                     )
                     continue
 

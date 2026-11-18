@@ -4343,13 +4343,15 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
         self.assertTrue(torch.all(cache[3] == 0))
 
     def test_qfa_fp8_page_v_scales_are_not_filled_from_checkpoint(self):
-        runner = self._runner({})
-        runner.ascend_config.c8_q_quant_mode = "per_token"
-        runner.ascend_config.c8_v_quant_mode = "per_head"
-        page_v_scale = torch.zeros((self.NUM_BLOCKS, self.NUM_KV_HEADS), dtype=torch.float32)
-        runner._fill_c8_mxfp_v_scale_caches({"attn": (MagicMock(), MagicMock(), MagicMock(), page_v_scale)})
-        self.assertEqual(runner._c8_mxfp_v_scale_caches, [])
-        self.assertTrue(torch.all(page_v_scale == 0))
+        for q_mode, v_mode in (("per_token", "per_head"), ("per_token_head", "per_channel")):
+            with self.subTest(q_mode=q_mode):
+                runner = self._runner({"attn": self._c8_layer()})
+                runner.ascend_config.c8_q_quant_mode = q_mode
+                runner.ascend_config.c8_v_quant_mode = v_mode
+                page_v_scale = torch.zeros((self.NUM_BLOCKS, self.NUM_KV_HEADS), dtype=torch.float32)
+                runner._fill_c8_mxfp_v_scale_caches({"attn": (MagicMock(), MagicMock(), MagicMock(), page_v_scale)})
+                self.assertEqual(runner._c8_mxfp_v_scale_caches, [])
+                self.assertTrue(torch.all(page_v_scale == 0))
 
     def test_cache_setup_hands_back_a_filled_cache(self):
         # The wiring, not just the helper: nothing downstream of

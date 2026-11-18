@@ -2685,9 +2685,21 @@ def test_get_kv_cache_spec_keeps_plain_spec_without_mxfp8(monkeypatch):
     assert spec.state_content_bytes is None
 
 
-@pytest.mark.parametrize("head_size_v,dynamic_v", [(64, False), (128, False), (64, True)])
-def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dynamic_v):
-    spec = mxfp_cache_spec(_plain_full_attention_spec(head_size_v))
+@pytest.mark.parametrize(
+    "head_size_v,dynamic_v,q_mode",
+    [
+        (64, False, None),
+        (128, False, None),
+        (64, True, None),
+        (128, False, "per_token"),
+        (128, False, "per_token_head"),
+    ],
+)
+def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dynamic_v, q_mode):
+    base_spec = _plain_full_attention_spec(head_size_v)
+    if q_mode is not None:
+        base_spec = replace(base_spec, head_size=128)
+    spec = mxfp_cache_spec(base_spec)
     num_blocks = 3
     layer_name = "attn"
     raw = torch.full((num_blocks * spec.page_size_bytes,), 37, dtype=torch.int8)
@@ -2699,6 +2711,9 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dyna
     config = _c8_mxfp_vllm_config()
     if dynamic_v:
         config.additional_config["c8_v_quant_mode"] = "per_token"
+    if q_mode is not None:
+        config.additional_config["c8_q_quant_mode"] = q_mode
+        config.additional_config["c8_v_quant_mode"] = "per_head" if q_mode == "per_token" else "per_channel"
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
@@ -2714,12 +2729,23 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dyna
         ],
         kv_cache_raw_tensors={layer_name: raw},
         cache_dtype="mxfp8",
-        kernel_block_sizes=[512],
+        kernel_block_sizes=[128 if q_mode is not None else 512],
         shared_kv_cache_layers={},
         kv_cache_config=kv_cache_config,
     )
 
     k, v, k_scale, v_scale = reshaped[layer_name]
+    if q_mode is not None:
+        kernel_blocks = num_blocks * 4
+        assert k.shape == v.shape == (kernel_blocks, 2, 128, 128)
+        assert k.dtype == v.dtype == torch.float8_e4m3fn
+        assert k_scale.shape == (kernel_blocks, 2, 128)
+        assert v_scale.shape == (kernel_blocks, 2)
+        assert k_scale.dtype == v_scale.dtype == torch.float32
+        assert k.stride(0) * 4 == spec.page_size_bytes
+        for view in (k, v, k_scale, v_scale):
+            assert view.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
+        return
     if dynamic_v:
         assert k.shape == v.shape == (num_blocks, 512, 2 * 64)
         assert k_scale.shape == v_scale.shape == (num_blocks, 512)
