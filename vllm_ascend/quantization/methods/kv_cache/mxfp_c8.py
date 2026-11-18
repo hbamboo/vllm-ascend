@@ -80,6 +80,15 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             config = get_ascend_config()
             self.q_quant_mode = config.c8_q_quant_mode
             self.v_quant_mode = config.c8_v_quant_mode
+            if self.q_quant_mode in ("per_token", "per_token_head") and getattr(layer, "sliding_window", None) is not None:
+                # QFA quant mode 6 rejects SLIDING_WINDOW in its checker, and
+                # the mask-less CAUSAL path would silently see the full
+                # history. Keep sliding layers on the model dtype instead.
+                raise ValueError(
+                    "c8_q_quant_mode=per_token/per_token_head uses QFA quant mode 6, which does not "
+                    "support SLIDING_WINDOW. Add '--kv-cache-dtype-skip-layers sliding_window' so "
+                    "sliding-window layers keep the model dtype."
+                )
             if self.q_quant_mode in ("per_token", "per_token_head"):
                 from vllm_ascend.attention.attention_c8_mxfp import AscendC8QFAFP8AttentionBackend
 

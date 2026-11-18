@@ -816,13 +816,20 @@ class AscendModelSlimConfig(QuantizationConfig):
         checkpoint carries no C8 V scale and its attention keeps the generic
         BF16 FIA path.
 
-        Sliding-window layers are supported: ``mxfp_cache_spec`` converts
-        their spec (see ``is_mxfp_cache_spec``), so they receive the
-        (k, v, k_scale, v_scale) cache tuple, and the QFA backend enforces
-        the window through ``MaskMode.SLIDING_WINDOW``. These layers carry no
-        static V scale in the checkpoint; ``create_weights`` initializes it
-        to the neutral E8M0 value (127 -> 1.0), so the V cache stays
-        numerically valid without calibration.
+        Sliding-window layers are supported by the MXFP8 QFA backend:
+        ``mxfp_cache_spec`` converts their spec (see ``is_mxfp_cache_spec``),
+        so they receive the (k, v, k_scale, v_scale) cache tuple, and the
+        backend enforces the window through ``MaskMode.SLIDING_WINDOW``.
+        These layers carry no static V scale in the checkpoint;
+        ``create_weights`` initializes it to the neutral E8M0 value
+        (127 -> 1.0), so the V cache stays numerically valid without
+        calibration.
+
+        The FP8 per-token Q/K path (``c8_q_quant_mode=per_token`` or
+        ``per_token_head``) is the exception: QFA quant mode 6 rejects
+        SLIDING_WINDOW, so those layers must be skipped with
+        ``--kv-cache-dtype-skip-layers sliding_window``. ``create_weights``
+        raises if such a layer reaches the per-token backend.
         """
         from vllm.model_executor.layers.attention import Attention
 

@@ -417,6 +417,21 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         self.assertTrue(hasattr(layer, "v_cache_scale"))
         self.assertFalse(hasattr(layer, "v_cache_scale_float_reciprocal"))
 
+    def test_per_token_q_rejects_sliding_window_layer(self):
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        layer.sliding_window = 4096
+        with (
+            patch(
+                "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                return_value=SimpleNamespace(
+                    c8_q_quant_mode="per_token", c8_k_quant_mode="per_token", c8_v_quant_mode="per_head"
+                ),
+            ),
+            self.assertRaisesRegex(ValueError, "skip-layers"),
+        ):
+            AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
+
     def test_per_token_q_installs_integrated_qfa_and_initializes_dynamic_v_state(self):
         from vllm_ascend.attention.attention_c8_mxfp import (
             AscendC8MXFPAttentionBackendImpl,
