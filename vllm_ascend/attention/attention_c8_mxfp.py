@@ -37,7 +37,7 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -217,8 +217,14 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
-    """Budget scales through upstream state_content_bytes, preserving real D."""
+def mxfp_cache_spec(spec: "FullAttentionSpec | SlidingWindowSpec") -> "FullAttentionSpec | SlidingWindowSpec":
+    """Budget scales through upstream state_content_bytes, preserving real D.
+
+    Sliding-window specs take the same per-token byte budget: full layers
+    build the QFA packet views and sliding layers build the FIA pseudo views,
+    which both fit ``k + v + (k + v) / 32`` bytes per token when the local
+    KV width is 256 (the shipped IQuest-Q1 TP8 geometry).
+    """
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
         raise ValueError("MXFP cache requires one stored state per token and one slot per KV head.")
@@ -243,8 +249,16 @@ def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
     a hybrid model -- so ``type(spec) is FullAttentionSpec`` alone also matches
     BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
     rewrites the dtype, so test the dtype instead of the global flag.
+
+    Sliding-window C8 layers are accepted in both spec forms: the conversion
+    runs while they are still ``SlidingWindowSpec`` (see the Ascend
+    ``get_kv_cache_spec``), and the hybrid promotion later turns them into
+    ``FullAttentionSpec`` carrying the same dtype and budget.
     """
-    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+    return (
+        type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        and spec.dtype == torch.float8_e4m3fn
+    )
 
 
 def mxfp_paged_cache_views(

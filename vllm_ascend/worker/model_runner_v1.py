@@ -124,6 +124,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
@@ -4699,12 +4700,9 @@ class NPUModelRunner(GPUModelRunner):
     def _is_c8_mxfp_kv_cache(self, spec: AttentionSpec) -> bool:
         # The dtype, not the global flag: --kv-cache-dtype-skip-layers keeps
         # some layers on BF16 and vLLM promotes their SlidingWindowSpec to
-        # FullAttentionSpec when the layers share one block pool.
-        return (
-            type(spec) is FullAttentionSpec
-            and is_c8_mxfp_kv_quant(self.vllm_config)
-            and spec.dtype == torch.float8_e4m3fn
-        )
+        # FullAttentionSpec when the layers share one block pool. Sliding C8
+        # specs are converted while still SlidingWindowSpec, so accept both.
+        return is_c8_mxfp_kv_quant(self.vllm_config) and is_mxfp_cache_spec(spec)
 
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         """Initialize V scales and retain views for physical-page reassignment.
@@ -4723,16 +4721,24 @@ class NPUModelRunner(GPUModelRunner):
             for group_id, group in enumerate(getattr(kv_cache_config, "kv_cache_groups", ()))
             for name in group.layer_names
         }
+        from vllm_ascend.attention.attention_c8_fia import AscendC8FIAPseudoAttentionBackendImpl
+
         for layer_name, cache in kv_caches.items():
             layer = self.compilation_config.static_forward_context.get(layer_name)
-            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
-                value_scale_cache = cache[3]
-                assert value_scale_cache.shape[0] % self.kv_cache_config.num_blocks == 0
-                kernel_blocks_per_page = value_scale_cache.shape[0] // self.kv_cache_config.num_blocks
-                self._c8_mxfp_v_scale_caches.append(
-                    (layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page, group_by_layer.get(layer_name))
-                )
-                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
+            impl = getattr(layer, "impl", None)
+            if not isinstance(impl, AscendC8MXFPAttentionBackendImpl):
+                continue
+            if isinstance(impl, AscendC8FIAPseudoAttentionBackendImpl):
+                # FIA C8 layers cache a dynamic FP32 per-token scale instead
+                # of the checkpoint's static E8M0 V scale.
+                continue
+            value_scale_cache = cache[3]
+            assert value_scale_cache.shape[0] % self.kv_cache_config.num_blocks == 0
+            kernel_blocks_per_page = value_scale_cache.shape[0] // self.kv_cache_config.num_blocks
+            self._c8_mxfp_v_scale_caches.append(
+                (layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page, group_by_layer.get(layer_name))
+            )
+            fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
 
     def _restore_c8_mxfp_loaded_v_scales(self, scheduler_output: "SchedulerOutput") -> None:
         """Prepare admitted Pull pages after receives and Mamba copies finish."""
@@ -5514,9 +5520,20 @@ class NPUModelRunner(GPUModelRunner):
                     raw = kv_cache_raw_tensors[layer_name]
                     if not isinstance(raw, torch.Tensor):
                         raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
+                    from vllm_ascend.attention.attention_c8_fia import (
+                        AscendC8FIAPseudoAttentionBackendImpl,
+                    )
+
+                    static_ctx = getattr(self.compilation_config, "static_forward_context", None) or {}
+                    layer_impl = getattr(static_ctx.get(layer_name), "impl", None)
+                    if layer_impl is None:
+                        # Config fallback mirroring the v2 runner: per-token V
+                        # keeps every layer on the FIA pseudo layout.
+                        fia_pseudo = self.ascend_config.c8_v_quant_mode == "per_token"
+                    else:
+                        fia_pseudo = isinstance(layer_impl, AscendC8FIAPseudoAttentionBackendImpl)
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(
-                        raw, current_kv_cache_spec, kernel_block_size,
-                        fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
+                        raw, current_kv_cache_spec, kernel_block_size, fia_pseudo=fia_pseudo
                     )
                     continue
 
@@ -6363,6 +6380,14 @@ class NPUModelRunner(GPUModelRunner):
                     kv_cache_spec[layer_name] = spec
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
+                    if (
+                        "mtp_model_layer" in layer_name
+                        and isinstance(spec, AttentionSpec)
+                        and spec.dtype == torch.float8_e4m3fn
+                    ):
+                        # The draft checkpoint carries no C8 V scale; pin it
+                        # to the model dtype under a global --kv-cache-dtype.
+                        spec = replace(spec, dtype=self.vllm_config.model_config.dtype, page_size_padded=None)
                     if self._is_c8_mxfp_kv_cache(spec):
                         spec = mxfp_cache_spec(spec)
                     kv_cache_spec[layer_name] = spec

@@ -526,11 +526,18 @@ class FIAParamProvider:
 @dataclass(frozen=True, slots=True)
 class FIAV2ParamProvider:
     layer_name: str | None
+    # Sliding C8 decode feeds two query rows per request (FIA's antiquant
+    # path rejects BAND at S=1), so the captured graph must replay the same
+    # doubled cumulative lengths.
+    duplicate_single_query: bool = False
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
+        qlen = metadata.actual_seq_lengths_q
+        if self.duplicate_single_query and qlen and qlen[-1] == len(qlen):
+            qlen = [2 * (i + 1) for i in range(len(qlen))]
         return {
-            "actual_seq_qlen": metadata.actual_seq_lengths_q,
+            "actual_seq_qlen": qlen,
             "actual_seq_kvlen": metadata.seq_lens_list,
         }
 

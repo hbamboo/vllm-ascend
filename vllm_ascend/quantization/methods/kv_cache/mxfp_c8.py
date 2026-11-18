@@ -76,6 +76,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
 
             config = get_ascend_config()
             self.v_quant_mode = config.c8_v_quant_mode
+            sliding_window = getattr(layer, "sliding_window", None)
             if self.v_quant_mode == "per_token":
                 from vllm_ascend.attention.attention_c8_fia import (
                     AscendC8FIAPseudoAttentionBackend,
@@ -86,15 +87,28 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
                     raise ValueError("Dynamic per-token KV requires equal K/V head dimensions.")
                 layer.attn_backend = AscendC8FIAPseudoAttentionBackend
                 layer.impl.__class__ = AscendC8FIAPseudoAttentionBackendImpl
+            elif sliding_window is not None:
+                # Sliding-window C8 stores the same dense per-token FP8 K/V
+                # page as the FIA path; the window is enforced by FIA v2's
+                # BAND mask (sparse_mode=4), which the delivered QFA rejects.
+                # Keep the MXFP backend class so every C8 layer stays in one
+                # attention group; only the impl differs per layer.
+                from vllm_ascend.attention.attention_c8_fia import (
+                    AscendC8FIAPseudoAttentionBackendImpl,
+                )
+
+                layer.attn_backend = AscendC8MXFPAttentionBackend
+                layer.impl.__class__ = AscendC8FIAPseudoAttentionBackendImpl
             else:
                 layer.attn_backend = AscendC8MXFPAttentionBackend
                 layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
             # Changing __class__ does not invoke the new class's __init__, so
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
-            layer.impl.k_quant_mode = config.c8_k_quant_mode
+            layer.impl.k_quant_mode = "per_token" if sliding_window is not None else config.c8_k_quant_mode
             if (
-                layer.impl.k_quant_mode == "per_token"
+                sliding_window is None
+                and layer.impl.k_quant_mode == "per_token"
                 and layer.num_kv_heads * layer.head_size > MXFP_MAX_QUANT_BLOCK_SIZE
             ):
                 raise ValueError("Per-token C8 K requires at most 1024 local KV channels; increase tensor parallelism.")

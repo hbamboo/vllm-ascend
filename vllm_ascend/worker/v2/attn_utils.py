@@ -332,12 +332,21 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
             )
             continue
 
-        # Convert only the layers that really store MXFP8. The MTP draft keeps
-        # a BF16 FullAttentionSpec (model.py clears its module-level sliding
-        # window so it does not fight the target's promoted windows), and
-        # --kv-cache-dtype-skip-layers layers are BF16 too; rewriting those to
-        # the packet-packed FP8 layout made the BF16 kernels write into an FP8
-        # cache (Invalid_Argument_Tensor_Dtype in ScatterPaKvCache).
+        # Convert only the layers that really store C8 K/V. The MTP draft
+        # keeps a BF16 FullAttentionSpec (model.py pins its cache dtype and
+        # clears its module-level sliding window so it does not fight the
+        # target's promoted windows), and --kv-cache-dtype-skip-layers layers
+        # are BF16 too; rewriting those to the FP8 layout made the BF16
+        # kernels write into an FP8 cache (Invalid_Argument_Tensor_Dtype in
+        # ScatterPaKvCache). Sliding-window specs are converted here as well:
+        # they keep the same per-token budget and are promoted to
+        # FullAttentionSpec by vLLM afterwards.
+        if (
+            "mtp_model_layer" in layer_name
+            and isinstance(spec, AttentionSpec)
+            and spec.dtype == torch.float8_e4m3fn
+        ):
+            spec = replace(spec, dtype=vllm_config.model_config.dtype, page_size_padded=None)
         if is_c8_mxfp_kv_quant(vllm_config) and is_mxfp_cache_spec(spec):
             spec = mxfp_cache_spec(spec)
         kv_cache_spec[layer_name] = spec
@@ -1590,11 +1599,32 @@ def _reshape_kv_cache_v2(
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
+                # The page layout follows the layer's attention backend, not a
+                # global flag: sliding C8 layers run FIA v2 and store dense FP8
+                # K/V with FP32 per-token scales, while full layers keep the
+                # QFA packet layout.
+                from vllm_ascend.attention.attention_c8_fia import (
+                    AscendC8FIAPseudoAttentionBackendImpl,
+                )
+
+                static_ctx = (
+                    getattr(getattr(vllm_config, "compilation_config", None), "static_forward_context", None) or {}
+                )
+                layer_impl = getattr(static_ctx.get(layer_name), "impl", None)
+                if layer_impl is None:
+                    # Callers without a static forward context (unit tests)
+                    # fall back to the config switch, where per-token V keeps
+                    # every layer on the FIA pseudo layout.
+                    fia_pseudo = (getattr(vllm_config, "additional_config", None) or {}).get(
+                        "c8_v_quant_mode"
+                    ) == "per_token"
+                else:
+                    fia_pseudo = isinstance(layer_impl, AscendC8FIAPseudoAttentionBackendImpl)
                 kv_caches[layer_name] = mxfp_cache_views_for_spec(
                     raw_cache,
                     kv_cache_spec,
                     kernel_block_size,
-                    fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token",
+                    fia_pseudo=fia_pseudo,
                 )
                 continue
 
