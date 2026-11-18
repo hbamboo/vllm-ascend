@@ -37,8 +37,9 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
+from vllm_ascend import envs
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
     AscendAttentionBackendImpl,
@@ -217,7 +218,7 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
+def mxfp_cache_spec(spec: "FullAttentionSpec | SlidingWindowSpec") -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
@@ -243,8 +244,17 @@ def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
     a hybrid model -- so ``type(spec) is FullAttentionSpec`` alone also matches
     BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
     rewrites the dtype, so test the dtype instead of the global flag.
+
+    All-layer C8 mode (no ``--kv-cache-dtype-skip-layers``) also converts
+    sliding-window specs: ``get_kv_cache_spec`` upgrades them while they are
+    still ``SlidingWindowSpec`` (with the hybrid KV cache manager enabled they
+    stay that type; with it disabled vLLM promotes them to
+    ``FullAttentionSpec`` afterwards). Both forms must therefore be accepted.
     """
-    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+    return (
+        type(spec) in (FullAttentionSpec, SlidingWindowSpec)
+        and spec.dtype == torch.float8_e4m3fn
+    )
 
 
 def mxfp_paged_cache_views(
@@ -615,10 +625,15 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
         return AttentionCGSupport.ALWAYS
 
 
+# Standard A8C8 MXFP8 mode (FP32 softmax). Sliding-window layers use it too:
+# the mask-mode/quant-mode checker restriction is lifted by the patched
+# ops-transformer (cann/ops-transformer PR #16121), so no FP16-softmax
+# fallback is needed.
 QFA_QUANT_MODE_MXFP8 = 1
 QFA_QUANT_MODE_FP8_PER_TOKEN = 6
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
+QFA_MASK_MODE_SLIDING_WINDOW = 4
 QFA_LAYOUT_TND = "TND"
 QFA_LAYOUT_N2TGD = "N2TGD"
 QFA_LAYOUT_PA_NZ = "PA_NZ"
@@ -736,16 +751,21 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         seqused_kv: torch.Tensor,
         max_seqlen_q: int,
         mask_mode: int,
+        win_left: int,
+        win_right: int,
+        quant_mode: int,
         layout_q_descale: str,
     ):
         """Return the QFA metadata plan (AICPU op output), derived once a step.
 
         The plan's inputs are all non-layer-specific (head counts, lengths,
-        mask mode, layouts), so one plan serves every full-attention layer of
-        a step. Sharing is safe under graph capture for the same reason as
-        _qfa_step_lengths: the deriving call runs inside the captured region,
-        ahead of every QFA call that reads its output, and the main operator
-        treats ``metadata`` as a read-only input.
+        mask mode, window, layouts), so one plan serves every layer of a step
+        that shares the same mask/window configuration (all full-attention
+        layers; all sliding-window layers with the same window). Sharing is
+        safe under graph capture for the same reason as _qfa_step_lengths:
+        the deriving call runs inside the captured region, ahead of every QFA
+        call that reads its output, and the main operator treats ``metadata``
+        as a read-only input.
         """
         cache = self._qfa_step_cache(attn_metadata)
         plan_key = (
@@ -754,6 +774,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self.head_size,
             max_seqlen_q,
             mask_mode,
+            win_left,
+            win_right,
+            quant_mode,
             layout_q_descale,
         )
         metadata = cache.get(plan_key)
@@ -767,7 +790,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 self.num_heads,
                 self.num_kv_heads,
                 self.head_size,
-                QFA_QUANT_MODE_MXFP8,
+                quant_mode,
                 cu_seqlens_q=cu_seqlens_q,
                 cu_seqlens_kv=None,
                 seqused_q=None,
@@ -775,8 +798,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=-1,
                 mask_mode=mask_mode,
-                win_left=-1,
-                win_right=-1,
+                win_left=win_left,
+                win_right=win_right,
                 layout_q=QFA_LAYOUT_TND,
                 layout_q_descale=layout_q_descale,
                 layout_kv=QFA_LAYOUT_PA_NZ,
@@ -837,10 +860,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         qfa_metadata,
         max_seqlen_q: int,
         mask_mode: int,
+        win_left: int,
+        win_right: int,
+        quant_mode: int,
         layout_q_descale: str,
         num_tokens: int,
         output: torch.Tensor,
-        sink_logits: torch.Tensor | None = None,
+        query_bf16: torch.Tensor | None = None,
+        sink_key: torch.Tensor | None = None,
     ) -> torch.Tensor:
         key, value, key_scale, value_scale = kv_cache
         # The K/V caches are already the packet-packed PA_NZ 5-D strided
@@ -865,7 +892,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             query_scale,
             key_scale,
             value_scale,
-            QFA_QUANT_MODE_MXFP8,
+            quant_mode,
             block_table=attn_metadata.block_tables,
             p_scale=None,
             cu_seqlens_q=cu_seqlens_q,
@@ -874,40 +901,45 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             seqused_kv=seqused_kv,
             sinks=None,
             # The doc forbids attn_mask under NO_MASK and requires it under
-            # CAUSAL, so the two travel together.
+            # CAUSAL/SLIDING_WINDOW, so the mask travels with the mask mode.
             attn_mask=(None if mask_mode == QFA_MASK_MODE_NO_MASK else self._qfa_int8_mask(attn_metadata)),
             metadata=qfa_metadata,
             softmax_scale=self.scale,
             mask_mode=mask_mode,
-            win_left=-1,
-            win_right=-1,
+            win_left=win_left,
+            win_right=win_right,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=-1,
             layout_q=QFA_LAYOUT_TND,
             layout_q_descale=layout_q_descale,
             layout_kv=QFA_LAYOUT_PA_NZ,
             layout_out=QFA_LAYOUT_TND,
-            return_softmax_lse=sink_logits is not None,
+            return_softmax_lse=sink_key is not None,
         )
         # return_softmax_lse=False yields an empty LSE tensor in the
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        if sink_logits is not None:
-            # Learned-key sink correction, ported from the FIA path in
-            # vllm_ascend.models.iquest_q1.attention: the sink is an
-            # always-visible entry with a zero value, so it only changes the
-            # softmax denominator. QFA's LSE carries the same ln(sum exp
-            # (scaled logits)) convention as FIA's, but is HEAD-major
-            # ((H, T)) -- verified empirically (single-block probe: max
-            # |lse - ln| = 3e-3 under (H, T) vs 3e-1 under (T, H), identical
-            # for the TND and N2TGD kernels), unlike FIA's token-major
-            # (T, Q_N, 1). Transpose to token-major (T, H, 1) to match
-            # sink_logits.
-            lse = result[1].reshape(-1).view(self.num_heads, num_tokens)
-            lse = lse.t().reshape(num_tokens, self.num_heads, 1)
-            factor = torch.sigmoid(-(sink_logits.unsqueeze(-1) - lse.float()))
-            attn_output = (attn_output.float() * factor).to(attn_output.dtype)
+        if sink_key is not None:
+            # Learned-key sink correction, fused into one Triton kernel
+            # (it replaces ~10 torch kernels per layer: the q.sink dot, the
+            # LSE transpose, Sub/Neg/Sigmoid, the Cast/Mul pair). QFA's LSE
+            # is HEAD-major ([H, T]); the kernel indexes it directly.
+            from vllm_ascend.ops.triton.sink import sink_apply_triton
+
+            sink_apply_triton(
+                query_bf16,
+                attn_output,
+                result[1].reshape(-1),
+                sink_key,
+                self.scale,
+                num_tokens,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                lse_head_major=True,
+                exact_fp32=True,
+            )
         output[:num_tokens] = attn_output
         return output
 
@@ -918,7 +950,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
-        sink_logits: torch.Tensor | None = None,
+        query_bf16: torch.Tensor | None = None,
+        sink_key: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One QFA call per step for the whole batch (decode + prefill alike).
 
@@ -933,8 +966,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if not attn_metadata.causal:
             raise NotImplementedError("C8_MXFP attention does not support non-causal attention yet.")
-        if self.sliding_window is not None:
-            raise NotImplementedError("C8_MXFP attention does not support sliding window attention yet.")
 
         # T as QFA sees it: the query rows actually fed to the operator
         # (forward slices query[:num_actual_tokens] before quantizing), so
@@ -960,12 +991,40 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # raises it, so an inflated value is never walked back.
         max_seqlen_q = attn_metadata.max_query_len or num_tokens
 
-        # Drop the mask entirely when every request contributes a single query
-        # row. hasAttenMask is one of the tiling-key axes, so NO_MASK selects
-        # a kernel template that never reads the mask; at Q_S == 1 that is
-        # exactly equivalent to CAUSAL (the KV range is bounded by seqused_kv).
-        # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
-        mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+        # Sliding-window layers let QFA enforce the window itself. QFA's
+        # ``win_left`` counts the tokens left of the diagonal (self excluded),
+        # so ``win_left = sliding_window - 1`` yields ``sliding_window``
+        # tokens including the query itself -- the HF definition
+        # (transformers.masking_utils: ``kv_idx > q_idx - sliding_window``)
+        # and the one used by the official GPU implementation
+        # (vLLM FlashAttentionImpl stores ``(sliding_window - 1, 0)`` and
+        # FlashAttention's window_size is inclusive on both ends).
+        # NOTE: the BF16 FIA path in this repo passes
+        # ``pre_tokens = sliding_window`` (i.e. one extra token). That is a
+        # pre-existing Ascend-side discrepancy (present since the first
+        # sliding-window support, 2025-08); this backend intentionally matches
+        # the model definition instead of copying it.
+        # The mask stays attached because QFA requires attn_mask for every
+        # non-NO_MASK mode.
+        if self.sliding_window is not None:
+            mask_mode = QFA_MASK_MODE_SLIDING_WINDOW
+            win_left = self.sliding_window - 1
+            win_right = 0
+        else:
+            # Drop the mask entirely when every request contributes a single
+            # query row. hasAttenMask is one of the tiling-key axes, so
+            # NO_MASK selects a kernel template that never reads the mask; at
+            # Q_S == 1 that is exactly equivalent to CAUSAL (the KV range is
+            # bounded by seqused_kv). MTP verify steps keep CAUSAL.
+            mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+            win_left = -1
+            win_right = -1
+
+        # All C8 layers (full attention and sliding window) use the standard
+        # A8C8 MXFP8 mode with FP32 softmax. SLIDING_WINDOW for this mode
+        # requires the patched ops-transformer (cann/ops-transformer PR #16121:
+        # checker relaxation + BAND left-boundary mask fix).
+        quant_mode = QFA_QUANT_MODE_MXFP8
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
@@ -977,6 +1036,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             seqused_kv=seqused_kv,
             max_seqlen_q=max_seqlen_q,
             mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
+            quant_mode=quant_mode,
             layout_q_descale=layout_q_descale,
         )
         return self._run_qfa(
@@ -989,10 +1051,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             qfa_metadata=qfa_metadata,
             max_seqlen_q=max_seqlen_q,
             mask_mode=mask_mode,
+            win_left=win_left,
+            win_right=win_right,
+            quant_mode=quant_mode,
             layout_q_descale=layout_q_descale,
             num_tokens=num_tokens,
             output=output,
-            sink_logits=sink_logits,
+            query_bf16=query_bf16,
+            sink_key=sink_key,
         )
 
     # KV cache writes happen in reshape_and_cache(), invoked from forward()
@@ -1246,21 +1312,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # value, so it only rescales the softmax denominator. QFA owns the
         # cache read, so request its LSE and fold the correction in _run_qfa
         # (same formula as the FIA path in vllm_ascend.models.iquest_q1.
-        # attention). sink_logit = scale * (q . sink_k[kv head]) on the raw
-        # bf16 query, computed before dynamic quantization.
+        # attention). The fused Triton kernel recomputes
+        # sink_logit = scale * (q . sink_k[kv head]) on the raw bf16 query,
+        # before dynamic quantization.
         # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
         # LSE convention).
         sink_key = getattr(layer, "sink_key", None)
         if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
             sink_key = None
-        sink_logits = None
-        if sink_key is not None:
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            group = self.num_heads // self.num_kv_heads
-            q = query[:num_actual_tokens].reshape(num_actual_tokens, self.num_kv_heads, group, self.head_size)
-            sink_logits = ((q.float() * sink_key.float().unsqueeze(1)).sum(-1) * self.scale).reshape(
-                num_actual_tokens, self.num_heads
-            )
 
         record_attention_compute_start()
 
@@ -1273,30 +1332,62 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # their (dummy) K/V would corrupt the shared slots, so only the
         # owner layer quantizes and scatters K/V.
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
-            if self.k_quant_mode == "per_token":
-                key_mxfp8, key_scale = quantize_mxfp_per_token(key[: attn_metadata.num_actual_tokens])
-            else:
-                key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
-                    key[: attn_metadata.num_actual_tokens],
-                    dst_type=torch.float8_e4m3fn,
-                )
-
-            original_value_shape = value.shape
-            value = value.view(original_value_shape[0], -1)
-            value_mxfp8 = torch_npu.npu_quantize(
-                value[: attn_metadata.num_actual_tokens],
-                layer.v_cache_scale_float_reciprocal,
-                None,
-                torch.float8_e4m3fn,
-                -1,
-                False,
+            # The fused Triton kernel wins on decode-sized batches (one tiny
+            # program per token/head) but its per-program dispatch loses to
+            # the native quantize/scatter tiling on large prefill chunks, so
+            # keep the original path above the threshold (TTFT matters).
+            # It emits per-32-group K scales, so the per-token K path
+            # (k_quant_mode == "per_token") must stay on the native ops.
+            use_fused = (
+                envs.VLLM_ASCEND_C8_FUSED_QUANT_SCATTER
+                and attn_metadata.num_actual_tokens <= 2048
+                and self.k_quant_mode != "per_token"
             )
-            value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
+            if use_fused:
+                from vllm_ascend.ops.triton.mxfp_quant_scatter import quant_scatter_mxfp8
 
-            self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
+                num_actual_tokens = attn_metadata.num_actual_tokens
+                quant_scatter_mxfp8(
+                    key[:num_actual_tokens],
+                    value[:num_actual_tokens],
+                    layer.v_cache_scale_float_reciprocal,
+                    kv_cache[0],
+                    kv_cache[1],
+                    kv_cache[2],
+                    attn_metadata.slot_mapping[:num_actual_tokens],
+                )
+                notify_kv_cache_written()
+            else:
+                if self.k_quant_mode == "per_token":
+                    key_mxfp8, key_scale = quantize_mxfp_per_token(key[: attn_metadata.num_actual_tokens])
+                else:
+                    key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
+                        key[: attn_metadata.num_actual_tokens],
+                        dst_type=torch.float8_e4m3fn,
+                    )
+
+                original_value_shape = value.shape
+                value = value.view(original_value_shape[0], -1)
+                value_mxfp8 = torch_npu.npu_quantize(
+                    value[: attn_metadata.num_actual_tokens],
+                    layer.v_cache_scale_float_reciprocal,
+                    None,
+                    torch.float8_e4m3fn,
+                    -1,
+                    False,
+                )
+                value_mxfp8 = value_mxfp8.view((attn_metadata.num_actual_tokens, *original_value_shape[1:]))
+
+                self.reshape_and_cache(key_mxfp8, value_mxfp8, key_scale, kv_cache, attn_metadata)
 
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
         return self._forward_mxfp8_attention(
-            query_mxfp8, query_scale, kv_cache, attn_metadata, output, sink_logits=sink_logits
+            query_mxfp8,
+            query_scale,
+            kv_cache,
+            attn_metadata,
+            output,
+            query_bf16=query[: attn_metadata.num_actual_tokens],
+            sink_key=sink_key,
         )
