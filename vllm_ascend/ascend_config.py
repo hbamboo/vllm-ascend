@@ -590,6 +590,9 @@ class AscendConfig:
     c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
     # Dynamic per-token V selects FIA with paged FP32 K/V descales.
     c8_v_quant_mode: Literal["per_channel", "per_token"] = "per_channel"
+    # Optional post-RoPE Q/K channel smoothing coefficients, independent of
+    # checkpoint weights. Unlisted attention layers retain the original path.
+    c8_qk_smoothing_path: str | None = None
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -680,6 +683,9 @@ class AscendConfig:
     _sparse_li_c4_layer_ids: set[int] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_c4_layer_names: set[str] = dataclasses.field(default_factory=set, init=False, repr=False)
     _sparse_li_layer_filter_enabled: bool = dataclasses.field(default=False, init=False, repr=False)
+    _c8_qk_smoothing_coefficients: dict[str, dict[str, list[list[float]]]] = dataclasses.field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @model_validator(mode="after")
     def _validate_user_input_ranges(self):
@@ -720,6 +726,44 @@ class AscendConfig:
                 raise ValueError("Dynamic per-token KV requires --dtype bfloat16.")
             if vc.kv_transfer_config is not None:
                 raise ValueError("Dynamic per-token KV does not support PD KV transfer.")
+        if self.c8_qk_smoothing_path is not None:
+            if self.c8_k_quant_mode != "per_token" or self.c8_v_quant_mode != "per_token":
+                raise ValueError("c8_qk_smoothing_path requires per-token K/V FIA quantization.")
+            with open(self.c8_qk_smoothing_path, encoding="utf-8") as smoothing_file:
+                smoothing = json.load(smoothing_file)
+            if (
+                not isinstance(smoothing, dict)
+                or type(smoothing.get("format_version")) is not int
+                or (smoothing["format_version"] != 1)
+            ):
+                raise ValueError("c8_qk_smoothing_path requires format_version=1.")
+            tp_size = vc.parallel_config.tensor_parallel_size
+            if type(smoothing.get("tensor_parallel_size")) is not int or smoothing["tensor_parallel_size"] != tp_size:
+                raise ValueError("Q/K smoothing tensor_parallel_size must match the configured tensor parallel size.")
+            ranks = smoothing.get("ranks")
+            if not isinstance(ranks, dict) or set(ranks) != {str(rank) for rank in range(tp_size)}:
+                raise ValueError("Q/K smoothing ranks must contain every configured TP rank exactly once.")
+            for rank, layers in ranks.items():
+                if not isinstance(layers, dict):
+                    raise ValueError(
+                        f"Q/K smoothing rank {rank} must map exact attention layer prefixes to coefficients."
+                    )
+                for prefix, coefficients in layers.items():
+                    if (
+                        not prefix
+                        or not isinstance(coefficients, list)
+                        or not coefficients
+                        or any(not isinstance(row, list) or not row for row in coefficients)
+                        or any(len(row) != len(coefficients[0]) for row in coefficients)
+                    ):
+                        raise ValueError(f"Q/K smoothing {rank}:{prefix} must have shape [local KV heads, head size].")
+                    if any(
+                        type(value) not in (int, float) or not math.isfinite(value) or value <= 0
+                        for row in coefficients
+                        for value in row
+                    ):
+                        raise ValueError(f"Q/K smoothing {rank}:{prefix} coefficients must be positive finite numbers.")
+            self._c8_qk_smoothing_coefficients = ranks
         engram_config = getattr(vc, "engram_config", None)
         if (
             engram_config is not None
@@ -1927,6 +1971,7 @@ def init_ascend_config(vllm_config: VllmConfig) -> AscendConfig:
         "_sparse_li_c4_layer_ids",
         "_sparse_li_c4_layer_names",
         "_sparse_li_layer_filter_enabled",
+        "_c8_qk_smoothing_coefficients",
         # SchedulerConfig-internal top-level legacy keys (resolved internally,
         # then replaced by the typed scheduler_config passed above).
         "enable_balance_scheduling",

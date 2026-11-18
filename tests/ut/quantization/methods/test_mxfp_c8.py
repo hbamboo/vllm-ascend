@@ -401,13 +401,90 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
         with patch(
             "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
-            return_value=SimpleNamespace(c8_k_quant_mode="per_token", c8_v_quant_mode="per_token"),
+            return_value=SimpleNamespace(
+                c8_k_quant_mode="per_token", c8_v_quant_mode="per_token", _c8_qk_smoothing_coefficients={}
+            ),
         ):
             method.create_weights(layer)
-        method.process_weights_after_loading(layer)
+            method.process_weights_after_loading(layer)
         self.assertIsInstance(layer.impl, AscendC8FIAPseudoAttentionBackendImpl)
         self.assertTrue(hasattr(layer, "v_cache_scale"))
         self.assertFalse(hasattr(layer, "v_cache_scale_float_reciprocal"))
+        self.assertIsNone(layer.impl.qk_smoothing_query_scale)
+        self.assertIsNone(layer.impl.qk_smoothing_key_scale)
+
+    def test_qk_smoothing_loads_rank_local_coefficients_with_gqa_mapping(self):
+        layer = self._make_layer(with_impl=True)
+        layer.num_heads = 6
+        layer.head_size = layer.head_size_v = 128
+        layer.impl.sliding_window = 4096
+        layer.impl.kv_sharing_target_layer_name = None
+        coefficients = torch.stack((torch.linspace(0.7, 1.6, 128), torch.linspace(1.7, 2.3, 128)))
+        config = SimpleNamespace(
+            c8_k_quant_mode="per_token",
+            c8_v_quant_mode="per_token",
+            _c8_qk_smoothing_coefficients={"7": {"swa": coefficients.tolist()}},
+        )
+        method = AscendC8MXFPKVCacheAttentionMethod({}, "swa")
+        with (
+            patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config", return_value=config),
+            patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_tensor_model_parallel_rank", return_value=7),
+        ):
+            method.create_weights(layer)
+            method.process_weights_after_loading(layer)
+        torch.testing.assert_close(layer.impl.qk_smoothing_query_scale, coefficients[[0, 0, 0, 1, 1, 1]])
+        torch.testing.assert_close(layer.impl.qk_smoothing_key_scale, coefficients.reciprocal())
+        self.assertEqual(layer.impl.qk_smoothing_query_scale.dtype, torch.float32)
+        self.assertEqual(layer.impl.qk_smoothing_key_scale.dtype, torch.float32)
+        self.assertFalse(layer.impl.qk_smoothing_query_scale.requires_grad)
+        self.assertEqual(layer.impl.qk_smoothing_key_scale.device, layer.v_cache_scale.device)
+
+    def test_qk_smoothing_unlisted_layer_keeps_identity(self):
+        layer = self._make_layer(with_impl=True)
+        layer.head_size = layer.head_size_v = 128
+        config = SimpleNamespace(
+            c8_k_quant_mode="per_token",
+            c8_v_quant_mode="per_token",
+            _c8_qk_smoothing_coefficients={"0": {"other": [[1.0] * 128]}},
+        )
+        with (
+            patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config", return_value=config),
+            patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_tensor_model_parallel_rank", return_value=0),
+        ):
+            method = AscendC8MXFPKVCacheAttentionMethod({}, "unlisted")
+            method.create_weights(layer)
+            method.process_weights_after_loading(layer)
+        self.assertIsNone(layer.impl.qk_smoothing_query_scale)
+        self.assertIsNone(layer.impl.qk_smoothing_key_scale)
+
+    def test_qk_smoothing_rejects_full_attention_alias_and_wrong_local_shape(self):
+        for window, alias, coefficients, message in (
+            (None, None, [[1.0] * 128] * 2, "sliding-window"),
+            (4096, "producer", [[1.0] * 128] * 2, "shared-KV"),
+            (4096, None, [[1.0] * 128], "local shape"),
+        ):
+            with self.subTest(window=window, alias=alias, coefficients=coefficients):
+                layer = self._make_layer(with_impl=True)
+                layer.num_heads = 6
+                layer.head_size = layer.head_size_v = 128
+                layer.impl.sliding_window = window
+                layer.impl.kv_sharing_target_layer_name = alias
+                config = SimpleNamespace(
+                    c8_k_quant_mode="per_token",
+                    c8_v_quant_mode="per_token",
+                    _c8_qk_smoothing_coefficients={"0": {"layer": coefficients}},
+                )
+                method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+                with (
+                    patch("vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config", return_value=config),
+                    patch(
+                        "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_tensor_model_parallel_rank",
+                        return_value=0,
+                    ),
+                ):
+                    method.create_weights(layer)
+                    with self.assertRaisesRegex(ValueError, message):
+                        method.process_weights_after_loading(layer)
 
 
 class TestQuantWeightLoader(TestBase):

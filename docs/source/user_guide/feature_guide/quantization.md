@@ -172,6 +172,61 @@ python -m vllm.entrypoints.api_server \
     --trust-remote-code 
 ```
 
+### Experimental Q/K channel smoothing for FP8 SWA
+
+The BF16-query, dynamic per-token FP8 KV path can load fixed post-RoPE
+channel coefficients through `additional_config.c8_qk_smoothing_path`.
+It computes `Q_attention = BF16(FP32(Q) * a)` and
+`K_cache = BF16(FP32(K) * reciprocal(a))` before K quantization. V is
+unchanged, and learned-key sink correction consumes the original Q.
+Checkpoint weights do not need to be re-quantized.
+
+Generate coefficients from independent calibration and holdout activations:
+
+```bash
+ASCEND_RT_VISIBLE_DEVICES=0 python tools/calibrate_c8_qk_smoothing.py \
+    /path/to/captures /path/to/coefficients --device npu:0
+```
+
+Each capture is a CPU-tensor `.pt` file containing `layer_name`, `tp_rank`,
+`tp_size`, `sample_id`, `split` (`calibration` or `validation`), `phase`
+(`prefill` or `decode`), BF16 `query[Tq,Nq,D]`, `key[Tkv,Nkv,D]`,
+`value[Tkv,Nkv,D]`, int64 `query_positions[Tq]` and `key_positions[Tkv]`,
+`sliding_window`, optional `softmax_scale`, and optional `sink_key[Nkv,D]`.
+Q/K must already have their model normalization and RoPE applied. Capture
+every visible KV position; selected query rows may be a contiguous suffix.
+Use different requests for calibration and validation, independent of the
+accuracy evaluation set.
+
+The tool selects candidates using calibration attention error, then uses
+the holdout data only as a non-regression gate. It writes
+`qk_smoothing.json` and `calibration_report.json`. Its explicit attention
+reference approximates the native FIA effective BF16 scale convention;
+native FIA and model accuracy still require separate validation.
+
+Add the generated path to the existing per-token configuration:
+
+```json
+{
+  "c8_k_quant_mode": "per_token",
+  "c8_v_quant_mode": "per_token",
+  "c8_qk_smoothing_path": "/path/to/coefficients/qk_smoothing.json"
+}
+```
+
+This requires `--dtype bfloat16 --kv-cache-dtype mxfp8`. The JSON uses
+`format_version: 1`, the configured `tensor_parallel_size`, and a `ranks`
+mapping containing every TP rank. Each rank maps exact attention layer
+prefixes to positive finite `[local KV heads, head size]` coefficients.
+Unlisted layers retain the original execution path. Listed layers must use
+sliding-window FIA with independent KV caches; shared-KV aliases are not
+supported. Coefficients are loaded once before graph capture. Restart the
+service and clear existing KV/prefix caches when coefficients change.
+
+FP8 accuracy improvement is not guaranteed. Identity coefficients are kept
+when candidates fail calibration or holdout checks. The Q/K transforms
+also add runtime work; measure inference latency before enabling them.
+
 ## References
 
 - [ModelSlim GitCode](https://gitcode.com/Ascend/msmodelslim)

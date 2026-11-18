@@ -226,6 +226,71 @@ class TestPerTokenKey(unittest.TestCase):
 
 
 class TestSWAPerToken(unittest.TestCase):
+    def test_qk_smoothing_uses_original_sink_query_and_preserves_value(self):
+        for num_tokens in (3, 1):
+            with self.subTest(num_tokens=num_tokens):
+
+                def scatter(cache, indices, payload):
+                    cache[indices[:, 0], indices[:, 1]] = payload
+
+                ops = SimpleNamespace(
+                    npu_dynamic_quant=MagicMock(side_effect=reference_dynamic_quant),
+                    npu_scatter_nd_update_=scatter,
+                    npu_fused_infer_attention_score_v2=MagicMock(
+                        side_effect=lambda **kwargs: (
+                            kwargs["query"].clone(),
+                            torch.zeros(kwargs["query"].shape[0], 6, 1),
+                        )
+                    ),
+                )
+                helpers = load_helpers(ops)
+                impl = helpers.AscendC8FIAPseudoAttentionBackendImpl()
+                impl.kv_sharing_target_layer_name = None
+                impl.num_heads, impl.num_kv_heads, impl.head_size = 6, 1, 128
+                impl.scale, impl.sliding_window = 128**-0.5, 4096
+                coefficients = torch.linspace(0.7, 1.9, 128).reshape(1, 128)
+                impl.qk_smoothing_query_scale = coefficients.expand(6, -1).contiguous()
+                impl.qk_smoothing_key_scale = coefficients.reciprocal()
+                pitch = helpers.mxfp_packet_size_bytes(1, 512, 128, 128)
+                cache = helpers.fia_pseudo_cache_views(
+                    torch.zeros(2 * pitch, dtype=torch.int8),
+                    2,
+                    SimpleNamespace(num_kv_heads=1, head_size=128, head_size_v=128),
+                    512,
+                    page_stride_bytes=pitch,
+                )
+                query = torch.randn(num_tokens + 1, 6, 128, dtype=torch.bfloat16)
+                key = torch.randn(num_tokens + 1, 1, 128, dtype=torch.bfloat16)
+                value = torch.randn_like(key)
+                original_query, original_key, original_value = query.clone(), key.clone(), value.clone()
+                output = torch.full_like(query, -1)
+                metadata = SimpleNamespace(
+                    actual_seq_lengths_q=[num_tokens],
+                    seq_lens_list=[600],
+                    slot_mapping=torch.arange(512, 512 + num_tokens),
+                    block_tables=torch.ones(1, 2, dtype=torch.int32),
+                    attn_mask=None,
+                    causal=True,
+                )
+                sink = MagicMock()
+                impl.forward.__globals__["sink_apply_triton"] = sink
+                impl.forward(SimpleNamespace(sink_key=torch.ones(1, 128)), query, key, value, cache, metadata, output)
+                expected_query = (query[:num_tokens].float() * coefficients).bfloat16()
+                expected_key = (key[:num_tokens].float() * coefficients.reciprocal()).bfloat16()
+                fia_query = ops.npu_fused_infer_attention_score_v2.call_args.kwargs["query"]
+                torch.testing.assert_close(
+                    fia_query, expected_query.expand(2, -1, -1) if num_tokens == 1 else expected_query
+                )
+                torch.testing.assert_close(output[:num_tokens], expected_query)
+                torch.testing.assert_close(output[num_tokens:], torch.full_like(output[num_tokens:], -1))
+                torch.testing.assert_close(sink.call_args.args[0], original_query[:num_tokens])
+                torch.testing.assert_close(ops.npu_dynamic_quant.call_args_list[0].args[0], expected_key.flatten(1))
+                torch.testing.assert_close(
+                    ops.npu_dynamic_quant.call_args_list[1].args[0], original_value[:num_tokens].flatten(1)
+                )
+                for actual, original in ((query, original_query), (key, original_key), (value, original_value)):
+                    torch.testing.assert_close(actual, original)
+
     def test_single_query_padding_preserves_real_cache_output_and_sink_rows(self):
         for ends, query_rows, real_rows in (
             ([1], [0, 0], [1]),

@@ -113,6 +113,33 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         if self.v_quant_mode == "per_token":
             # Load fa_v.scale for checkpoint compatibility; runtime generates
             # and caches a fresh scale for every V token instead.
+            smoothing = get_ascend_config()._c8_qk_smoothing_coefficients
+            if not smoothing:
+                return
+            coefficients = smoothing[str(get_tensor_model_parallel_rank())].get(self.prefix)
+            if coefficients is None:
+                return
+            impl = layer.impl
+            if impl.sliding_window is None:
+                raise ValueError(f"Q/K smoothing is supported only on sliding-window FIA layers: {self.prefix}.")
+            if impl.kv_sharing_target_layer_name is not None:
+                raise ValueError(f"Q/K smoothing does not support shared-KV aliases: {self.prefix}.")
+            if len(coefficients) != layer.num_kv_heads or len(coefficients[0]) != layer.head_size:
+                raise ValueError(
+                    f"Q/K smoothing {self.prefix} requires local shape {(layer.num_kv_heads, layer.head_size)}."
+                )
+            if layer.num_heads % layer.num_kv_heads:
+                raise ValueError(f"Q/K smoothing requires an integral GQA head group: {self.prefix}.")
+            # Validate the FP32 representation on CPU, then keep both tensors
+            # resident on the cache parameter's device before graph capture.
+            key_scale = torch.tensor(coefficients, dtype=torch.float32, device="cpu")
+            key_reciprocal = key_scale.reciprocal()
+            if not bool(torch.isfinite(key_scale).all() & torch.isfinite(key_reciprocal).all()):
+                raise ValueError(f"Q/K smoothing {self.prefix} coefficients and reciprocals must be finite in FP32.")
+            impl.qk_smoothing_query_scale = key_scale.repeat_interleave(
+                layer.num_heads // layer.num_kv_heads, dim=0
+            ).to(layer.v_cache_scale.device)
+            impl.qk_smoothing_key_scale = key_reciprocal.to(layer.v_cache_scale.device)
             return
         vllm_config = get_current_vllm_config()
         target_dtype = vllm_config.model_config.dtype

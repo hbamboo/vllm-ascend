@@ -23,8 +23,9 @@ from importlib.util import find_spec as real_find_spec
 from statistics import NormalDist
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import PropertyMock, patch
+from unittest.mock import PropertyMock, mock_open, patch
 
+import torch
 from vllm.config import DeviceConfig, KVTransferConfig
 from vllm.config import VllmConfig as _VllmConfig
 from vllm.config.compilation import CUDAGraphMode
@@ -118,6 +119,7 @@ class TestAscendConfig(TestBase):
     def test_c8_k_quant_mode_defaults_and_choices(self):
         kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}
         self.assertEqual(AscendConfig(**kwargs).c8_k_quant_mode, "per_token_group")
+        self.assertIsNone(AscendConfig(**kwargs).c8_qk_smoothing_path)
         self.assertEqual(AscendConfig(**kwargs, c8_k_quant_mode="per_token").c8_k_quant_mode, "per_token")
         with self.assertRaisesRegex(ValueError, "c8_k_quant_mode"):
             AscendConfig(**kwargs, c8_k_quant_mode="invalid")
@@ -131,6 +133,47 @@ class TestAscendConfig(TestBase):
         config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_v_quant_mode="per_token")
         with self.assertRaisesRegex(ValueError, "c8_k_quant_mode"):
             config.derive_and_validate(SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="mxfp8")))
+
+    def test_c8_qk_smoothing_requires_per_token_fia(self):
+        config = AscendConfig(
+            sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_qk_smoothing_path="smoothing.json"
+        )
+        with self.assertRaisesRegex(ValueError, "per-token K/V FIA"):
+            config.derive_and_validate(SimpleNamespace(cache_config=SimpleNamespace(cache_dtype="mxfp8")))
+
+    def test_c8_qk_smoothing_rejects_invalid_file_contract(self):
+        vllm_config = SimpleNamespace(
+            cache_config=SimpleNamespace(cache_dtype="mxfp8"),
+            model_config=SimpleNamespace(dtype=torch.bfloat16),
+            kv_transfer_config=None,
+            parallel_config=SimpleNamespace(tensor_parallel_size=8),
+        )
+        for changes, message in (
+            ({"format_version": 2}, "format_version"),
+            ({"tensor_parallel_size": 4}, "tensor_parallel_size"),
+            ({"ranks": {"0": {}}}, "every configured TP rank"),
+            ({"ranks": {str(rank): {"layer": [[1], [1, 2]]} for rank in range(8)}}, "shape"),
+            ({"ranks": {str(rank): {"layer": [[-1]]} for rank in range(8)}}, "positive finite"),
+            ({"ranks": {str(rank): {"layer": [[float("nan")]]} for rank in range(8)}}, "positive finite"),
+        ):
+            with self.subTest(changes=changes):
+                payload = {
+                    "format_version": 1,
+                    "tensor_parallel_size": 8,
+                    "ranks": {str(rank): {} for rank in range(8)},
+                    **changes,
+                }
+                config = AscendConfig(
+                    sparse_kv_offload_config=SimpleNamespace(enabled=False),
+                    c8_k_quant_mode="per_token",
+                    c8_v_quant_mode="per_token",
+                    c8_qk_smoothing_path="smoothing.json",
+                )
+                with (
+                    patch("vllm_ascend.ascend_config.open", mock_open(read_data=json.dumps(payload)), create=True),
+                    self.assertRaisesRegex(ValueError, message),
+                ):
+                    config.derive_and_validate(vllm_config)
 
     @staticmethod
     def _clean_up_ascend_config(func):
@@ -373,6 +416,25 @@ class TestAscendConfig(TestBase):
         ascend_fusion_config = ascend_config.ascend_fusion_config
         self.assertTrue(ascend_fusion_config.fusion_ops_gmmswigluquant)
         self.assertFalse(ascend_config.rl_config.enabled)
+
+    @_clean_up_ascend_config
+    @patch("vllm_ascend.platform.NPUPlatform.check_and_update_config")
+    def test_init_ascend_config_loads_qk_smoothing_once(self, mock_fix_incompatible_config):
+        vllm_config = VllmConfig()
+        vllm_config.model_config.dtype = torch.bfloat16
+        vllm_config.cache_config.cache_dtype = "mxfp8"
+        vllm_config.additional_config = {
+            "c8_k_quant_mode": "per_token",
+            "c8_v_quant_mode": "per_token",
+            "c8_qk_smoothing_path": "smoothing.json",
+        }
+        ranks = {"0": {"model.layers.3.self_attn.attn": [[0.5, 1.5]]}}
+        payload = {"format_version": 1, "tensor_parallel_size": 1, "ranks": ranks}
+        with patch("vllm_ascend.ascend_config.open", mock_open(read_data=json.dumps(payload)), create=True) as opened:
+            config = init_ascend_config(vllm_config)
+            self.assertIs(init_ascend_config(vllm_config), config)
+        opened.assert_called_once_with("smoothing.json", encoding="utf-8")
+        self.assertEqual(config._c8_qk_smoothing_coefficients, ranks)
 
     @_clean_up_ascend_config
     @patch("vllm_ascend.ascend_config.logger")

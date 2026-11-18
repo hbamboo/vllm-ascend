@@ -40,6 +40,10 @@ def scatter_fia_fp8_cache(key, value, key_scale, value_scale, kv_cache, slot_map
 
 class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
     supports_quant_query_input = False
+    # create_weights installs this implementation with __class__ assignment,
+    # so no constructor runs. The optional tensors are populated after load.
+    qk_smoothing_query_scale: torch.Tensor | None = None
+    qk_smoothing_key_scale: torch.Tensor | None = None
 
     def forward(
         self,
@@ -62,9 +66,15 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
         query = query[:num_tokens].contiguous()
         if num_tokens == 0:
             return output
+        attention_query = query
+        if self.qk_smoothing_query_scale is not None:
+            attention_query = (query.float() * self.qk_smoothing_query_scale).to(query.dtype)
         if key is not None and value is not None and self.kv_sharing_target_layer_name is None:
+            key = key[:num_tokens]
+            if self.qk_smoothing_key_scale is not None:
+                key = (key.float() * self.qk_smoothing_key_scale).to(key.dtype)
             key8, key_scale = torch_npu.npu_dynamic_quant(
-                key[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+                key.reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
             )
             value8, value_scale = torch_npu.npu_dynamic_quant(
                 value[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
@@ -87,14 +97,14 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
         pad_single_query = self.sliding_window is not None and any(
             end - start == 1 for start, end in zip([0, *ends[:-1]], ends)
         )
-        fia_query = query
+        fia_query = attention_query
         real_slices = []
         if pad_single_query:
             chunks, padded_ends = [], []
             padded_start = 0
             for start, end in zip([0, *ends[:-1]], ends):
                 singleton = end - start == 1
-                chunk = query[start:end]
+                chunk = attention_query[start:end]
                 if singleton:
                     chunk = chunk.expand(2, -1, -1)
                 chunks.append(chunk)
