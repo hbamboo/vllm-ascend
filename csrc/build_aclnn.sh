@@ -212,6 +212,8 @@ elif [[ "$SOC_VERSION" =~ ^ascend950 ]]; then
         "quant_lightning_indexer_v2_metadata"
         "kv_quant_sparse_attn_sharedkv"
         "kv_quant_sparse_flash_attention_vllm"
+        "quant_flash_attn_vllm"
+        "quant_flash_attn_vllm_metadata"
         "kv_quant_sparse_attn_sharedkv_metadata"
         "hc_post"
         "hc_pre"

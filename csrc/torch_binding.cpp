@@ -58,6 +58,7 @@
 #include "attention/k2q_csr/k2q_csr_torch_adpt.h"
 #include "attention/msa_index_score/msa_index_score_torch_adpt.h"
 #include "attention/sparse_attention_score/sparse_attention_score_torch_adpt.h"
+#include "attention/quant_flash_attn_vllm/quant_flash_attn_vllm_torch_adpt.h"
 #include "moe/dequant_situ_quant/dequant_situ_quant_torch_adpt.h"
 #include "moe/situ_mx_quant/situ_mx_quant_torch_adpt.h"
 #include "moe/grouped_matmul_situ_quant/grouped_matmul_situ_quant_torch_adpt.h"
@@ -3041,6 +3042,28 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
     );
     ops.impl("npu_kv_quant_sparse_flash_attention_vllm", torch::kPrivateUse1,
              &vllm_ascend::npu_kv_quant_sparse_flash_attention_vllm);
+
+    ops.def(
+        "npu_quant_flash_attn_vllm(Tensor q, Tensor k, Tensor v, Tensor q_descale, Tensor k_descale, "
+        "Tensor v_descale, int quant_mode, *, Tensor? block_table=None, Tensor? p_scale=None, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_kv=None, Tensor? seqused_q=None, "
+        "Tensor? seqused_kv=None, Tensor? sinks=None, Tensor? attn_mask=None, Tensor? metadata=None, "
+        "float softmax_scale=1.0, int mask_mode=0, int win_left=-1, int win_right=-1, "
+        "int max_seqlen_q=-1, int max_seqlen_kv=-1, str layout_q='BSND', str layout_q_descale='BSND', "
+        "str layout_kv='BSND', str layout_out='BSND', bool return_softmax_lse=False) -> (Tensor, Tensor)"
+    );
+    ops.impl("npu_quant_flash_attn_vllm", torch::kPrivateUse1,
+             &vllm_ascend::npu_quant_flash_attn_vllm);
+
+    ops.def(
+        "npu_quant_flash_attn_vllm_metadata(int num_heads_q, int num_heads_kv, int head_dim, int quant_mode, *, "
+        "Tensor? cu_seqlens_q=None, Tensor? cu_seqlens_kv=None, Tensor? seqused_q=None, Tensor? seqused_kv=None, "
+        "int batch_size=0, int max_seqlen_q=-1, int max_seqlen_kv=-1, int head_dim_v=-1, int mask_mode=0, "
+        "int win_left=-1, int win_right=-1, str layout_q='BSND', str layout_q_descale='BSND', "
+        "str layout_kv='BSND', str layout_out='BSND', bool is_grad_enabled=False, str device='npu') -> Tensor"
+    );
+    ops.impl("npu_quant_flash_attn_vllm_metadata", torch::kPrivateUse1,
+             &vllm_ascend::npu_quant_flash_attn_vllm_metadata);
 
     ops.def(
         "dispatch_ffn_combine(Tensor x, Tensor[] weight1, Tensor[] weight2, Tensor expert_idx,"
