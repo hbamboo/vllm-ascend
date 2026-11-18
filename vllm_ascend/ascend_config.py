@@ -590,8 +590,8 @@ class AscendConfig:
     c8_k_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
     # Per-token Q selects QFA FP8 mode 6 with FP32 Q/K descales.
     c8_q_quant_mode: Literal["per_token_group", "per_token"] = "per_token_group"
-    # Dynamic per-token V selects FIA with paged FP32 K/V descales.
-    c8_v_quant_mode: Literal["per_channel", "per_token"] = "per_channel"
+    # Dynamic per-token V selects FIA; dynamic per-head V selects QFA mode 6.
+    c8_v_quant_mode: Literal["per_channel", "per_token", "per_head"] = "per_channel"
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -717,14 +717,16 @@ class AscendConfig:
                 raise ValueError("c8_q_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
             if self.c8_k_quant_mode != "per_token":
                 raise ValueError("c8_q_quant_mode=per_token requires c8_k_quant_mode=per_token.")
-            if self.c8_v_quant_mode != "per_channel":
-                raise ValueError("QFA FP8 per-token Q/K currently requires c8_v_quant_mode=per_channel.")
+            if self.c8_v_quant_mode != "per_head":
+                raise ValueError("c8_q_quant_mode=per_token requires c8_v_quant_mode=per_head.")
             if vc.model_config.dtype != torch.bfloat16:
                 raise ValueError("QFA FP8 per-token Q/K requires --dtype bfloat16.")
             if vc.kv_transfer_config is not None:
                 raise ValueError("QFA FP8 per-token Q/K does not support PD KV transfer.")
         elif self.c8_k_quant_mode == "per_token" and vc.cache_config.cache_dtype != "mxfp8":
             raise ValueError("c8_k_quant_mode=per_token requires --kv-cache-dtype mxfp8.")
+        if self.c8_v_quant_mode == "per_head" and self.c8_q_quant_mode != "per_token":
+            raise ValueError("c8_v_quant_mode=per_head requires c8_q_quant_mode=per_token.")
         if self.c8_v_quant_mode == "per_token":
             # Keep torch lazy: this module is imported during platform discovery.
             import torch

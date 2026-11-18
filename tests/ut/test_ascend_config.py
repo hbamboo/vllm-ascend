@@ -127,13 +127,18 @@ class TestAscendConfig(TestBase):
         cases = (
             ({}, "auto", torch.bfloat16, None, "--kv-cache-dtype mxfp8"),
             ({"c8_k_quant_mode": "per_token_group"}, "mxfp8", torch.bfloat16, None, "c8_k_quant_mode"),
+            ({"c8_v_quant_mode": "per_channel"}, "mxfp8", torch.bfloat16, None, "c8_v_quant_mode"),
             ({"c8_v_quant_mode": "per_token"}, "mxfp8", torch.bfloat16, None, "c8_v_quant_mode"),
             ({}, "mxfp8", torch.float16, None, "--dtype bfloat16"),
             ({}, "mxfp8", torch.bfloat16, object(), "PD KV transfer"),
         )
         for overrides, cache_dtype, dtype, transfer, message in cases:
             with self.subTest(message=message):
-                kwargs = {"c8_q_quant_mode": "per_token", "c8_k_quant_mode": "per_token"}
+                kwargs = {
+                    "c8_q_quant_mode": "per_token",
+                    "c8_k_quant_mode": "per_token",
+                    "c8_v_quant_mode": "per_head",
+                }
                 kwargs.update(overrides)
                 config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), **kwargs)
                 vc = SimpleNamespace(
@@ -143,6 +148,11 @@ class TestAscendConfig(TestBase):
                 )
                 with self.assertRaisesRegex(ValueError, message):
                     config.derive_and_validate(vc)
+
+    def test_c8_v_per_head_mode_requires_per_token_q(self):
+        config = AscendConfig(sparse_kv_offload_config=SimpleNamespace(enabled=False), c8_v_quant_mode="per_head")
+        with self.assertRaisesRegex(ValueError, "c8_q_quant_mode=per_token"):
+            config.derive_and_validate(SimpleNamespace())
 
     def test_c8_k_quant_mode_defaults_and_choices(self):
         kwargs = {"sparse_kv_offload_config": SimpleNamespace(enabled=False)}

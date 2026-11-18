@@ -56,7 +56,8 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
     K/V are cached as FP8 E4M3 and their E8M0 scales are stored in extra
     cache tensors: K uses dynamic per-token-group scales written at scatter
     time, V uses the static per-channel E8M0 scale stored in the ModelSlim
-    checkpoint. Enabled with ``--kv-cache-dtype mxfp8``.
+    checkpoint. QFA FP8 mode instead uses FP32 token Q/K scales and a
+    dynamic per-head V scale. Enabled with ``--kv-cache-dtype mxfp8``.
     """
 
     v_quant_mode = "per_channel"
@@ -79,15 +80,13 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             self.q_quant_mode = config.c8_q_quant_mode
             self.v_quant_mode = config.c8_v_quant_mode
             if self.q_quant_mode == "per_token":
-                from vllm_ascend.attention.attention_c8_qfa_fp8 import (
-                    AscendC8QFAFP8AttentionBackend,
-                    AscendC8QFAFP8AttentionBackendImpl,
-                )
+                from vllm_ascend.attention.attention_c8_mxfp import AscendC8QFAFP8AttentionBackend
 
                 if (layer.head_size, layer.head_size_v) != (128, 128):
                     raise ValueError("QFA FP8 per-token Q/K requires K/V head dimensions of 128.")
                 layer.attn_backend = AscendC8QFAFP8AttentionBackend
-                layer.impl.__class__ = AscendC8QFAFP8AttentionBackendImpl
+                layer.impl.__class__ = AscendC8MXFPAttentionBackendImpl
+                layer.impl.supports_quant_query_input = False
             elif self.v_quant_mode == "per_token":
                 from vllm_ascend.attention.attention_c8_fia import (
                     AscendC8FIAPseudoAttentionBackend,
@@ -104,6 +103,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             # Changing __class__ does not invoke the new class's __init__, so
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
+            layer.impl.q_quant_mode = self.q_quant_mode
             layer.impl.k_quant_mode = config.c8_k_quant_mode
             if (
                 self.q_quant_mode != "per_token"
@@ -112,7 +112,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             ):
                 raise ValueError("Per-token C8 K requires at most 1024 local KV channels; increase tensor parallelism.")
 
-        # The checkpoint supplies the static V-cache scale.
+        # Keep the checkpoint parameter even when runtime V scales are dynamic.
         hidden_size = layer.num_kv_heads * layer.head_size_v
         weight_param = torch.nn.Parameter(
             torch.full((hidden_size,), 127, dtype=torch.uint8),
@@ -123,6 +123,18 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         weight_param.weight_loader = _quant_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if self.v_quant_mode == "per_head":
+            initial_scale = torch.finfo(torch.float32).tiny
+            fp8_max = torch.finfo(torch.float8_e4m3fn).max
+            device = layer.v_cache_scale.device
+            layer.impl.qfa_v_head_bound = torch.full(
+                (layer.num_kv_heads,), initial_scale * fp8_max, dtype=torch.bfloat16, device=device
+            )
+            layer.impl.qfa_v_descale = torch.full(
+                (layer.num_kv_heads,), initial_scale, dtype=torch.float32, device=device
+            )
+            layer.impl.qfa_p_scale = torch.tensor([fp8_max], dtype=torch.float32, device=device)
+            return
         if self.v_quant_mode == "per_token":
             # Load fa_v.scale for checkpoint compatibility; runtime generates
             # and caches a fresh scale for every V token instead.
@@ -143,12 +155,6 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             (1 / descale).to(target_dtype),
             requires_grad=False,
         )
-        if self.q_quant_mode == "per_token":
-            layer.impl.qfa_v_descale = torch.ones(layer.num_kv_heads, dtype=torch.float32, device=raw.device)
-            layer.impl.qfa_p_scale = torch.tensor(
-                [torch.finfo(torch.float8_e4m3fn).max], dtype=torch.float32, device=raw.device
-            )
-            layer.impl.qfa_v_output_scale = descale.reshape(layer.num_kv_heads, layer.head_size_v)
 
     def apply(
         self,

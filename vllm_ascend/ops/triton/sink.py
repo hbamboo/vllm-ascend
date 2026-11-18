@@ -172,3 +172,112 @@ def sink_apply_triton(
         BLOCK_ROWS=_SINK_BLOCK_ROWS,
         SINK_1D=(num_kv_heads == 1),
     )
+
+
+@triton.jit
+def _triton_qfa_sink_apply(
+    q_ptr,
+    q_scale_ptr,
+    attn_ptr,
+    lse_ptr,
+    sink_ptr,
+    out_ptr,
+    scale,
+    num_rows,
+    NUM_HEADS: tl.constexpr,
+    GROUP: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    Q_TOKEN_STRIDE: tl.constexpr,
+    Q_HEAD_STRIDE: tl.constexpr,
+    LSE_HEAD_STRIDE: tl.constexpr,
+    LSE_TOKEN_STRIDE: tl.constexpr,
+    BLOCK_ROWS: tl.constexpr,
+    SINK_1D: tl.constexpr,
+):
+    rows = tl.program_id(0) * BLOCK_ROWS + tl.arange(0, BLOCK_ROWS)
+    dim = tl.arange(0, HEAD_DIM)
+    valid = rows < num_rows
+    token = rows // NUM_HEADS
+    head = rows % NUM_HEADS
+    if Q_TOKEN_STRIDE == NUM_HEADS * HEAD_DIM and Q_HEAD_STRIDE == HEAD_DIM:
+        q_offsets = rows[:, None] * HEAD_DIM + dim[None, :]
+    else:
+        q_offsets = token[:, None] * Q_TOKEN_STRIDE + head[:, None] * Q_HEAD_STRIDE + dim[None, :]
+    query = tl.load(
+        q_ptr + q_offsets,
+        mask=valid[:, None],
+        other=0.0,
+    ).to(tl.float32)
+    query_scale = tl.load(q_scale_ptr + token, mask=valid, other=0).to(tl.float32)
+    query = query * query_scale[:, None]
+    if SINK_1D:
+        sink_row = tl.load(sink_ptr + dim).to(tl.float32)
+        sink = tl.broadcast_to(sink_row[None, :], (BLOCK_ROWS, HEAD_DIM))
+    else:
+        kv_head = head // GROUP
+        sink = tl.load(
+            sink_ptr + kv_head[:, None] * HEAD_DIM + dim[None, :],
+            mask=valid[:, None],
+            other=0,
+        ).to(tl.float32)
+    logit = tl.sum(query * sink, axis=1) * scale
+    lse = tl.load(
+        lse_ptr + head * LSE_HEAD_STRIDE + token * LSE_TOKEN_STRIDE,
+        mask=valid,
+        other=0,
+    ).to(tl.float32)
+    factor = tl.sigmoid(lse - logit)
+    offsets = rows[:, None] * HEAD_DIM + dim[None, :]
+    attn = tl.load(attn_ptr + offsets, mask=valid[:, None], other=0).to(tl.float32)
+    # QFA already applied V's per-head descale. Keep the sink calculation
+    # in FP32 and round only the final result written to the caller's buffer.
+    tl.store(out_ptr + offsets, attn * factor[:, None], mask=valid[:, None])
+
+
+def qfa_sink_apply_triton(
+    query: torch.Tensor,
+    query_scale: torch.Tensor,
+    attn_output: torch.Tensor,
+    lse: torch.Tensor,
+    sink_key: torch.Tensor,
+    scale: float,
+    num_tokens: int,
+    num_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+    output: torch.Tensor,
+) -> None:
+    """Write QFA output with the learned-key sink directly to ``output``.
+
+    ``query`` is TND FP8 and ``query_scale`` contains one FP32 descale per
+    token. QFA's ``lse`` is head-major ``(num_heads, num_tokens)``. The
+    attention input and destination are contiguous TND BF16 buffers; unlike
+    the FIA path, Qhat, sink logits and the factor stay FP32 until the final
+    output store. The QFA attention input is left unchanged.
+    """
+    num_rows = num_tokens * num_heads
+    if num_rows == 0:
+        return
+    query = query.reshape(num_tokens, num_heads, head_dim)
+    lse = lse.reshape(num_heads, num_tokens)
+    init_device_properties_triton()
+    grid = triton.cdiv(num_rows, _SINK_BLOCK_ROWS)
+    _triton_qfa_sink_apply[(grid,)](
+        query,
+        query_scale,
+        attn_output,
+        lse,
+        sink_key,
+        output,
+        scale,
+        num_rows,
+        NUM_HEADS=num_heads,
+        GROUP=num_heads // num_kv_heads,
+        HEAD_DIM=head_dim,
+        Q_TOKEN_STRIDE=query.stride(0),
+        Q_HEAD_STRIDE=query.stride(1),
+        LSE_HEAD_STRIDE=lse.stride(0),
+        LSE_TOKEN_STRIDE=lse.stride(1),
+        BLOCK_ROWS=_SINK_BLOCK_ROWS,
+        SINK_1D=(num_kv_heads == 1),
+    )

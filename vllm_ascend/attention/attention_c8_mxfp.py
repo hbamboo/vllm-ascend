@@ -336,7 +336,7 @@ def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride
         raise ValueError("QFA FP8 per-token requires 128-token kernel pages and 128-wide K/V heads.")
     kv_bytes = spec.num_kv_heads * block_size * spec.head_size
     scale_bytes = spec.num_kv_heads * block_size * 4
-    payload_bytes = 2 * kv_bytes + scale_bytes
+    payload_bytes = 2 * kv_bytes + scale_bytes + spec.num_kv_heads * 4
     pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
     if (
         raw_tensor.ndim != 1
@@ -355,6 +355,7 @@ def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride
         (kv_shape, 0, torch.float8_e4m3fn, 1),
         (kv_shape, kv_bytes, torch.float8_e4m3fn, 1),
         (scale_shape, 2 * kv_bytes, torch.float32, 4),
+        ((num_blocks, spec.num_kv_heads), 2 * kv_bytes + scale_bytes, torch.float32, 4),
     ):
         strides = (pitch // size, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
         views.append(
@@ -562,6 +563,14 @@ class AscendC8MXFPAttentionBackend(AscendAttentionBackend):
         return [512]
 
 
+class AscendC8QFAFP8AttentionBackend(AscendC8MXFPAttentionBackend):
+    """Native FP8 QFA with FP32 token Q/K scales and dynamic V head scales."""
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [128]
+
+
 class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
     """Metadata builder for the C8-MXFP (QFA) backend.
 
@@ -607,6 +616,8 @@ class AscendC8MXFPMetadataBuilder(AscendAttentionMetadataBuilder):
 
 
 QFA_QUANT_MODE_MXFP8 = 1
+QFA_QUANT_MODE_FP8_PER_TOKEN = 6
+QFA_V_HEAD_SENTINEL_SIZE = 32
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
 QFA_LAYOUT_TND = "TND"
@@ -671,6 +682,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     # required for objects that predate the class swap.
     enable_hamming_sparse: bool = False
     k_quant_mode: str = "per_token_group"
+    q_quant_mode: str = "per_token_group"
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata) -> dict:
         cache = getattr(attn_metadata, "qfa_metadata_cache", None)
@@ -1010,6 +1022,21 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         num_actual_tokens = quant_key.shape[0]
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         key_cache, value_cache = kv_cache[0], kv_cache[1]
+        if self.q_quant_mode == "per_token":
+            from cann_ops_transformer.ops import scatter_pa_kv_cache_with_k_scale
+
+            scatter_pa_kv_cache_with_k_scale(
+                quant_key,
+                quant_value,
+                key_cache,
+                value_cache,
+                slot_mapping,
+                key_scale[:, None].expand(-1, self.num_kv_heads),
+                kv_cache[2].unsqueeze(-1),
+                cache_layout="BNBD",
+            )
+            notify_kv_cache_written()
+            return
         # 5-D PA_NZ packet-packed views: (kernel_blocks, N, D//32, Bs, 32).
         block_size = key_cache.shape[3]
 
@@ -1032,6 +1059,125 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
         )
         notify_kv_cache_written()
+
+    def _forward_fp8_per_token(self, layer, query, key, value, kv_cache, attn_metadata, output):
+        """Native mode 6, preserving V head-scale coherence across cached pages."""
+        from cann_ops_transformer.ops import quant_flash_attn, quant_flash_attn_metadata
+
+        from vllm_ascend.ops.triton.qfa_v_head_scale import qfa_v_history_pages, rescale_qfa_v_cache
+        from vllm_ascend.ops.triton.sink import qfa_sink_apply_triton
+
+        num_tokens = attn_metadata.num_actual_tokens
+        if num_tokens == 0:
+            return output
+        query = query[:num_tokens].reshape(num_tokens, self.num_heads, self.head_size)
+        query8, query_scale = torch_npu.npu_dynamic_quant(
+            query.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+        )
+        query8 = query8.reshape_as(query)
+        cu_q, used_kv = self._qfa_step_lengths(attn_metadata, num_tokens)
+        step_cache = self._qfa_step_cache(attn_metadata)
+        owner = self
+        if self.kv_sharing_target_layer_name is not None:
+            owner = self.vllm_config.compilation_config.static_forward_context[self.kv_sharing_target_layer_name].impl
+        elif key is not None and value is not None:
+            key8, key_scale = torch_npu.npu_dynamic_quant(
+                key[:num_tokens].reshape(num_tokens, -1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+            )
+            # Native QFA has one V scale per head for the whole visible cache.
+            # Include the previous head bound so ordinary decode retains its scale.
+            # A 32-element sentinel tail keeps the quantizer's row width aligned.
+            value_by_head = value[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size)
+            value_by_head = value_by_head.permute(1, 0, 2).reshape(self.num_kv_heads, -1)
+            bounded_value = torch.cat(
+                (value_by_head, self.qfa_v_head_bound[:, None].expand(-1, QFA_V_HEAD_SENTINEL_SIZE)), dim=1
+            )
+            value8, value_scale = torch_npu.npu_dynamic_quant(
+                bounded_value, dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+            )
+            value8 = value8[:, : num_tokens * self.head_size].reshape(self.num_kv_heads, num_tokens, self.head_size)
+            value8 = value8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
+            num_pages = kv_cache[0].shape[0]
+            history_key = ("fp8_v_history", num_pages)
+            history = step_cache.get(history_key)
+            if history is None:
+                history = qfa_v_history_pages(attn_metadata.block_tables, cu_q, used_kv, num_pages)
+                step_cache[history_key] = history
+            # Only referenced historical rows are rescaled; shared prefix pages
+            # have one writer. New/overlaid pages never read their former bytes.
+            rescale_qfa_v_cache(
+                kv_cache[1], kv_cache[3], value_scale, history, self.qfa_v_head_bound, self.qfa_v_descale
+            )
+            self.reshape_and_cache(
+                key8.reshape(num_tokens, self.num_kv_heads, self.head_size), value8, key_scale, kv_cache, attn_metadata
+            )
+
+        record_attention_compute_start()
+        max_q = attn_metadata.max_query_len or num_tokens
+        mask_mode = QFA_MASK_MODE_NO_MASK if max_q == 1 else QFA_MASK_MODE_CAUSAL
+        plan_key = ("fp8_token", self.num_heads, self.num_kv_heads, self.head_size, max_q, mask_mode)
+        metadata = step_cache.get(plan_key)
+        if metadata is None:
+            metadata = quant_flash_attn_metadata(
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                QFA_QUANT_MODE_FP8_PER_TOKEN,
+                cu_seqlens_q=cu_q,
+                seqused_kv=used_kv,
+                max_seqlen_q=max_q,
+                max_seqlen_kv=-1,
+                mask_mode=mask_mode,
+                layout_q="NTD",
+                layout_q_descale="NT",
+                layout_kv="PA_BNBD",
+                layout_out="TND",
+            )
+            step_cache[plan_key] = metadata
+        query_ntd = query8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
+        scale_nt = query_scale[None, :].expand(self.num_heads, -1).contiguous()
+        sink_key = getattr(layer, "sink_key", None)
+        attn_output, lse = quant_flash_attn(
+            query_ntd,
+            kv_cache[0],
+            kv_cache[1],
+            scale_nt,
+            kv_cache[2],
+            owner.qfa_v_descale,
+            QFA_QUANT_MODE_FP8_PER_TOKEN,
+            p_scale=self.qfa_p_scale,
+            block_table=attn_metadata.block_tables,
+            cu_seqlens_q=cu_q,
+            seqused_kv=used_kv,
+            metadata=metadata,
+            softmax_scale=self.scale,
+            mask_mode=mask_mode,
+            attn_mask=self._qfa_int8_mask(attn_metadata) if mask_mode else None,
+            max_seqlen_q=max_q,
+            max_seqlen_kv=-1,
+            layout_q="NTD",
+            layout_q_descale="NT",
+            layout_kv="PA_BNBD",
+            layout_out="TND",
+            return_softmax_lse=sink_key is not None,
+        )
+        if sink_key is not None:
+            qfa_sink_apply_triton(
+                query8,
+                query_scale,
+                attn_output,
+                lse,
+                sink_key,
+                self.scale,
+                num_tokens,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                output[:num_tokens].view(num_tokens, self.num_heads, self.head_size),
+            )
+        else:
+            output[:num_tokens] = attn_output.reshape_as(output[:num_tokens])
+        return output
 
     def forward(
         self,
@@ -1074,6 +1220,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 f"tuple, got: {type(kv_cache)} with length "
                 f"{len(kv_cache) if kv_cache is not None else 0}."
             )
+
+        if self.q_quant_mode == "per_token":
+            return self._forward_fp8_per_token(layer, query, key, value, kv_cache, attn_metadata, output)
 
         # IQuest-Q1 learned-key sink: an always-visible KV entry with a zero
         # value, so it only rescales the softmax denominator. QFA owns the

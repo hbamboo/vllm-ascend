@@ -7,7 +7,6 @@ loaded without initializing vLLM distributed groups. All quantizers, cache
 writes and attention calls execute the installed Ascend 950 operators.
 """
 
-import ast
 import importlib.machinery
 import importlib.util
 import runpy
@@ -16,6 +15,7 @@ import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 # The sibling triton/ test directory shadows the installed compiler when
 # this file is executed directly rather than through pytest.
@@ -29,18 +29,7 @@ import torch_npu
 def load_qfa_helpers():
     root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
     loader = runpy.run_path(str(root / "tests/ut/attention/test_c8_k_per_token.py"))["load_helpers"]
-    namespace = vars(loader(torch_npu)).copy()
-    path = root / "vllm_ascend/attention/attention_c8_qfa_fp8.py"
-    definitions = [
-        node
-        for node in ast.parse(path.read_text(encoding="utf-8")).body
-        if isinstance(node, ast.FunctionDef)
-        or isinstance(node, ast.ClassDef)
-        and node.name == "AscendC8QFAFP8AttentionBackendImpl"
-    ]
-    future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
-    module = ast.fix_missing_locations(ast.Module(body=[future, *definitions], type_ignores=[]))
-    exec(compile(module, str(path), "exec"), namespace)
+    helpers = loader(torch_npu)
 
     # Import the actual installed QFA wrapper without the package __init__,
     # which eagerly JIT-builds unrelated operators in a standalone process.
@@ -59,8 +48,37 @@ def load_qfa_helpers():
     ops.__path__ = [str(package / "ops")]
     ops.quant_flash_attn = native.quant_flash_attn
     ops.quant_flash_attn_metadata = native.quant_flash_attn_metadata
+    scatter_path = package / "ops/attention/scatter_pa_kv_cache_with_k_scale/scatter_pa_kv_cache_with_k_scale.py"
+    scatter_spec = importlib.util.spec_from_file_location("c8_qfa_scatter_native_api", scatter_path)
+    scatter = importlib.util.module_from_spec(scatter_spec)
+    sys.modules[scatter_spec.name] = scatter
+    scatter_spec.loader.exec_module(scatter)
+    ops.scatter_pa_kv_cache_with_k_scale = scatter.scatter_pa_kv_cache_with_k_scale
     sys.modules[ops.__name__] = ops
-    return SimpleNamespace(**namespace), native
+    for name in ("qfa_v_head_scale", "sink"):
+        load_triton_helper(root, name)
+    return helpers, native
+
+
+def load_triton_helper(root, name):
+    import triton
+    import triton.language as tl
+
+    module_name = f"vllm_ascend.ops.triton.{name}"
+    spec = importlib.util.spec_from_file_location(module_name, root / f"vllm_ascend/ops/triton/{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    # Only bypass plugin-dependent initialization; the kernels execute the
+    # installed compiler/runtime on the real NPU with their production tiles.
+    with patch.dict(
+        sys.modules,
+        {
+            "vllm.triton_utils": SimpleNamespace(triton=triton, tl=tl),
+            "vllm_ascend.ops.triton.triton_utils": SimpleNamespace(init_device_properties_triton=lambda: None),
+        },
+    ):
+        spec.loader.exec_module(module)
+    return module
 
 
 class TestC8QFAFP8NPU(unittest.TestCase):
@@ -72,22 +90,26 @@ class TestC8QFAFP8NPU(unittest.TestCase):
         cls.helpers, cls.native = load_qfa_helpers()
         print("NPU", torch.npu.get_device_name(0), torch.__version__, torch_npu.__version__, flush=True)
 
-    def make_case(self, q_len, padding=0):
+    def make_case(self, q_len, padding=0, kv_heads=1):
         torch.manual_seed(101)
         heads, dim, kv_len, kernel_block_size = 6, 128, 529, 128
         logical_block_size, logical_blocks = 512, 3
-        pitch = self.helpers.mxfp_packet_size_bytes(1, logical_block_size, dim, dim) // 4 + padding
+        pitch = self.helpers.mxfp_packet_size_bytes(kv_heads, logical_block_size, dim, dim) // 4 + padding
         raw = torch.full((logical_blocks * 4 * pitch,), 23, dtype=torch.int8, device="npu")
         spec = SimpleNamespace(
-            num_kv_heads=1, head_size=dim, head_size_v=dim, block_size=logical_block_size, page_size_bytes=pitch * 4
+            num_kv_heads=kv_heads,
+            head_size=dim,
+            head_size_v=dim,
+            block_size=logical_block_size,
+            page_size_bytes=pitch * 4,
         )
         cache = self.helpers.mxfp_cache_views_for_spec(raw, spec, kernel_block_size, qfa_fp8=True)
         query = (torch.randn(q_len, heads, dim) / 4).bfloat16().npu()
         magnitude = torch.exp2(torch.arange(kv_len).remainder(7).float() - 3).reshape(-1, 1, 1)
-        key = (torch.randn(kv_len, 1, dim) * magnitude).bfloat16().npu()
-        value = (torch.randn(kv_len, 1, dim) / 4).bfloat16().npu()
-        channel_scale = torch.exp2(torch.arange(dim).remainder(5).float() - 8).reshape(1, dim).npu()
-        layer = SimpleNamespace(v_cache_scale_float_reciprocal=channel_scale.reciprocal().flatten().bfloat16())
+        key = (torch.randn(kv_len, kv_heads, dim) * magnitude).bfloat16().npu()
+        value = (torch.randn(kv_len, kv_heads, dim) / 4).bfloat16().npu()
+        value.mul_(torch.exp2(torch.arange(kv_heads, device="npu").float() * 3)[None, :, None])
+        layer = SimpleNamespace()
         positions = torch.arange(kv_len, device="npu", dtype=torch.int64)
         slots = torch.where(positions < logical_block_size, positions + 2 * logical_block_size, positions)
         metadata = SimpleNamespace(
@@ -109,13 +131,17 @@ class TestC8QFAFP8NPU(unittest.TestCase):
         producer_metadata.slot_mapping = slots
         producer_query = query[:1].expand(kv_len, -1, -1).contiguous()
         producer_output = torch.empty_like(producer_query)
-        impl = self.helpers.AscendC8QFAFP8AttentionBackendImpl()
-        impl.num_heads, impl.num_kv_heads, impl.head_size = heads, 1, dim
+        impl = self.helpers.AscendC8MXFPAttentionBackendImpl()
+        impl.num_heads, impl.num_kv_heads, impl.head_size = heads, kv_heads, dim
         impl.scale, impl.sliding_window = dim**-0.5, None
         impl.kv_sharing_target_layer_name = None
-        impl.qfa_v_descale = torch.ones(1, dtype=torch.float32, device="npu")
+        impl.q_quant_mode = "per_token"
+        impl.vllm_config = SimpleNamespace(kv_transfer_config=None)
+        tiny = torch.finfo(torch.float32).tiny
+        impl.qfa_v_descale = torch.full((kv_heads,), tiny, dtype=torch.float32, device="npu")
+        impl.qfa_v_head_bound = torch.full((kv_heads,), tiny * 448, dtype=torch.bfloat16, device="npu")
         impl.qfa_p_scale = torch.tensor([448.0], dtype=torch.float32, device="npu")
-        impl.qfa_v_output_scale = channel_scale
+        reference_v_bound = torch.zeros(kv_heads)
         output = torch.empty_like(query)
         return SimpleNamespace(**locals())
 
@@ -134,32 +160,43 @@ class TestC8QFAFP8NPU(unittest.TestCase):
     def reference(self, case):
         q8, qs = torch_npu.npu_dynamic_quant(case.query.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
         k8, ks = torch_npu.npu_dynamic_quant(case.key.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
-        v8 = torch_npu.npu_quantize(
-            case.value.flatten(1), case.layer.v_cache_scale_float_reciprocal, None, torch.float8_e4m3fn, -1, False
+        case.reference_v_bound = torch.maximum(case.reference_v_bound, case.value.cpu().float().abs().amax(dim=(0, 2)))
+        bounded_v = torch.cat(
+            (
+                case.value.permute(1, 0, 2).reshape(case.kv_heads, -1),
+                case.reference_v_bound.bfloat16().npu()[:, None].expand(-1, 32),
+            ),
+            dim=1,
         )
-        q8, qs, k8, ks, v8 = (x.cpu() for x in (q8, qs, k8, ks, v8))
+        v8, vs = torch_npu.npu_dynamic_quant(bounded_v, dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
+        q8, qs, k8, ks, v8, vs = (x.cpu() for x in (q8, qs, k8, ks, v8, vs))
+        v8 = v8.view(torch.uint8)[:, : 529 * 128].reshape(case.kv_heads, 529, 128).permute(1, 0, 2).contiguous()
+        v8 = v8.view(torch.float8_e4m3fn)
         q = q8.reshape(case.q_len, case.heads, case.dim).float() * qs[:, None, None]
-        k = k8.reshape(529, 1, case.dim).float() * ks[:, None, None]
-        v = v8.reshape(529, 1, case.dim).float() * case.channel_scale.cpu()[None]
-        scores = torch.einsum("thd,shd->hts", q, k[: case.kv_len].repeat_interleave(case.heads, 1)) * case.impl.scale
+        k = k8.reshape(529, case.kv_heads, case.dim).float() * ks[:, None, None]
+        v = v8.float() * vs[None, :, None]
+        group = case.heads // case.kv_heads
+        scores = torch.einsum("thd,shd->hts", q, k[: case.kv_len].repeat_interleave(group, 1)) * case.impl.scale
         mask = torch.arange(case.kv_len)[None] > torch.arange(case.q_len)[:, None] + case.kv_len - case.q_len
         scores.masked_fill_(mask[None], float("-inf"))
-        expected = torch.einsum("hts,shd->thd", scores.softmax(-1), v[: case.kv_len].repeat_interleave(case.heads, 1))
+        expected = torch.einsum("hts,shd->thd", scores.softmax(-1), v[: case.kv_len].repeat_interleave(group, 1))
         if hasattr(case.layer, "sink_key"):
             sink_logits = (q * case.layer.sink_key.cpu()).sum(-1) * case.impl.scale
             expected *= torch.sigmoid(scores.logsumexp(-1).t() - sink_logits)[..., None]
-        return expected, scores, (q8, qs, k8, ks, v8)
+        return expected, scores, (q8, qs, k8, ks, v8, vs)
 
     def check_case(self, case):
-        expected, _, (_, _, k8, ks, v8) = self.reference(case)
+        expected, _, (_, _, k8, ks, v8, vs) = self.reference(case)
         pages, offsets = case.slots.cpu() // 128, case.slots.cpu() % 128
         for cached, source in zip(case.cache[:2], (k8, v8)):
             gathered = cached.cpu().view(torch.uint8)[pages, :, offsets, :].reshape(529, -1)
-            torch.testing.assert_close(gathered, source.view(torch.uint8), rtol=0, atol=0)
+            torch.testing.assert_close(gathered, source.reshape(529, -1).view(torch.uint8), rtol=0, atol=0)
         cached_scales = case.cache[2].cpu()[pages, :, offsets]
-        torch.testing.assert_close(cached_scales, ks[:, None], rtol=0, atol=0)
+        torch.testing.assert_close(cached_scales, ks[:, None].expand(-1, case.kv_heads), rtol=0, atol=0)
+        torch.testing.assert_close(case.cache[3].cpu()[pages], vs[None].expand(529, -1), rtol=0, atol=0)
+        torch.testing.assert_close(case.impl.qfa_v_descale.cpu(), vs, rtol=0, atol=0)
         self.assertGreater(ks.unique().numel(), 1)
-        payload_bytes = 2 * 128 * 128 + 128 * 4
+        payload_bytes = (2 * 128 * 128 + 128 * 4 + 4) * case.kv_heads
         self.assertTrue(torch.all(case.raw.cpu().reshape(-1, case.pitch)[:, payload_bytes:] == 23))
         torch.testing.assert_close(case.output.cpu(), expected.bfloat16(), rtol=0.03, atol=0.03)
         print(
@@ -184,11 +221,94 @@ class TestC8QFAFP8NPU(unittest.TestCase):
                     torch.npu.synchronize()
                     self.check_case(case)
 
+    def test_multiple_kv_heads_use_independent_dynamic_v_scales(self):
+        case = self.make_case(6, 256, kv_heads=2)
+        self.run_case(case)
+        torch.npu.synchronize()
+        self.check_case(case)
+        self.assertNotEqual(*case.impl.qfa_v_descale.cpu().tolist())
+
+    def forward_step(self, case, query, key, value, cu_q, seq_lens, block_tables, slots):
+        metadata = SimpleNamespace(
+            causal=True,
+            max_query_len=max(end - start for start, end in zip(cu_q, cu_q[1:])),
+            num_actual_tokens=query.shape[0],
+            actual_seq_lengths_q=cu_q[1:],
+            seq_lens_list=seq_lens,
+            query_start_loc_gpu=torch.tensor(cu_q, dtype=torch.int32, device="npu"),
+            seq_lens_gpu=torch.tensor(seq_lens, dtype=torch.int32, device="npu"),
+            block_tables=torch.tensor(block_tables, dtype=torch.int32, device="npu"),
+            slot_mapping=torch.tensor(slots, dtype=torch.int64, device="npu"),
+            attn_mask=case.metadata.attn_mask,
+        )
+        output = torch.empty_like(query)
+        case.impl.forward(case.layer, query, key, value, case.cache, metadata, output=output)
+        return output
+
+    def test_v_scale_growth_preserves_history_and_ignores_new_page_garbage(self):
+        case = self.make_case(1)
+        case.cache[3][8].fill_(float("nan"))
+        before = case.raw.cpu().reshape(-1, case.pitch).clone()
+        query = torch.zeros(1, 6, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.zeros(1, 1, 128, dtype=torch.bfloat16, device="npu")
+        value = torch.ones_like(key)
+        first = self.forward_step(case, query, key, value, [0, 1], [1], [[8]], [8 * 128])
+        torch.testing.assert_close(first.cpu(), torch.ones_like(first.cpu()), rtol=0.01, atol=0.01)
+        second = self.forward_step(case, query, key, value * 100, [0, 1], [2], [[8]], [8 * 128 + 1])
+        torch.npu.synchronize()
+        torch.testing.assert_close(second.cpu(), torch.full_like(second.cpu(), 50.5), rtol=0.01, atol=0.02)
+        historical_value = case.cache[1].cpu()[8, 0, 0].float() * case.impl.qfa_v_descale.cpu()[0]
+        torch.testing.assert_close(historical_value, torch.ones(128), rtol=0.02, atol=0.002)
+        untouched = torch.arange(before.shape[0]) != 8
+        torch.testing.assert_close(case.raw.cpu().reshape(-1, case.pitch)[untouched], before[untouched], rtol=0, atol=0)
+
+    def test_shared_prefix_rescales_once_and_unreferenced_pages_stay_untouched(self):
+        case = self.make_case(1)
+        before = case.raw.cpu().reshape(-1, case.pitch).clone()
+        prefix_query = torch.zeros(128, 6, 128, dtype=torch.bfloat16, device="npu")
+        prefix_key = torch.zeros(128, 1, 128, dtype=torch.bfloat16, device="npu")
+        self.forward_step(
+            case,
+            prefix_query,
+            prefix_key,
+            torch.ones_like(prefix_key),
+            [0, 128],
+            [128],
+            [[8]],
+            list(range(8 * 128, 9 * 128)),
+        )
+        query = torch.zeros(2, 6, 128, dtype=torch.bfloat16, device="npu")
+        key = torch.zeros(2, 1, 128, dtype=torch.bfloat16, device="npu")
+        value = torch.tensor([100.0, 50.0], dtype=torch.bfloat16, device="npu")[:, None, None].expand(2, 1, 128)
+        result = self.forward_step(
+            case, query, key, value, [0, 1, 2], [129, 129], [[8, 9], [8, 10]], [9 * 128, 10 * 128]
+        )
+        torch.npu.synchronize()
+        old_value = case.cache[1].cpu()[8, 0].float() * case.impl.qfa_v_descale.cpu()[0]
+        torch.testing.assert_close(old_value, torch.ones_like(old_value), rtol=0.02, atol=0.002)
+        expected = torch.stack(((old_value.sum(0) + 100) / 129, (old_value.sum(0) + 50) / 129))
+        expected = expected[:, None, :].expand(2, 6, 128).bfloat16()
+        torch.testing.assert_close(result.cpu(), expected, rtol=0.02, atol=0.02)
+        untouched = ~torch.isin(torch.arange(before.shape[0]), torch.tensor([8, 9, 10]))
+        torch.testing.assert_close(case.raw.cpu().reshape(-1, case.pitch)[untouched], before[untouched], rtol=0, atol=0)
+
+    def test_history_marking_skips_stale_zero_query_rows(self):
+        helper = sys.modules["vllm_ascend.ops.triton.qfa_v_head_scale"]
+        history = helper.qfa_v_history_pages(
+            torch.tensor([[8, 9], [8, 10], [1, 2]], dtype=torch.int32, device="npu"),
+            torch.tensor([0, 1, 2, 2], dtype=torch.int32, device="npu"),
+            torch.tensor([129, 129, 128], dtype=torch.int32, device="npu"),
+            12,
+        )
+        expected = torch.zeros(12, dtype=torch.int32)
+        expected[8], expected[9], expected[10] = 129, 1, 1
+        torch.testing.assert_close(history.cpu(), expected, rtol=0, atol=0)
+
     def test_lse_and_learned_key_sink_use_quantized_query(self):
         for q_len in (1, 6):
             with self.subTest(q_len=q_len):
                 case = self.make_case(q_len)
-                _, scores, (q8, qs, _, _, _) = self.reference(case)
+                _, scores, (q8, qs, _, _, _, _) = self.reference(case)
                 q_hat = q8.reshape(q_len, 6, 128).float() * qs[:, None, None]
                 direction = q_hat[0, 0]
                 delta = case.query.cpu()[0, 0].float() - direction
@@ -201,7 +321,7 @@ class TestC8QFAFP8NPU(unittest.TestCase):
                 case.layer.sink_key = sink[None].npu()
                 self.run_case(case)
                 self.check_case(case)
-                expected, scores, (q8, qs, _, _, _) = self.reference(case)
+                expected, scores, (q8, qs, _, _, _, _) = self.reference(case)
                 relative_error = (case.output.cpu()[0, 0].float() - expected[0, 0]).norm() / expected[0, 0].norm()
                 self.assertLess(relative_error.item(), 0.08)
                 q_ntd = q8.reshape(q_len, 6, 128).view(torch.uint8).permute(1, 0, 2).contiguous().npu()
@@ -237,25 +357,30 @@ class TestC8QFAFP8NPU(unittest.TestCase):
 
     def test_graph_replay_refreshes_lengths_and_dynamic_scales(self):
         case = self.make_case(1, 256)
+        scale_address = case.impl.qfa_v_descale.data_ptr()
         for _ in range(3):
             self.run_case(case)
+        self.assertEqual(case.impl.qfa_v_descale.data_ptr(), scale_address)
         torch.npu.synchronize()
         case.metadata.qfa_metadata_cache = {}
         case.producer_metadata.qfa_metadata_cache = {}
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
             self.run_case(case)
-        for factor, kv_len in ((2.0, 513), (0.125, 529)):
+        for factor, kv_len in ((2.0, 513), (0.125, 529), (16.0, 513)):
             case.key.mul_(factor)
             case.query.mul_(1 / factor)
+            case.value.mul_(factor)
             case.kv_len = kv_len
             case.metadata.seq_lens_gpu.fill_(kv_len)
             graph.replay()
             torch.npu.synchronize()
+            self.assertEqual(case.impl.qfa_v_descale.data_ptr(), scale_address)
             self.check_case(case)
             graph_output = case.output.clone()
             self.run_case(case)
             torch.npu.synchronize()
+            self.assertEqual(case.impl.qfa_v_descale.data_ptr(), scale_address)
             torch.testing.assert_close(case.output, graph_output, rtol=0, atol=0)
 
     def test_key_extrema_are_not_clipped_to_mx_power_of_two_range(self):
@@ -266,6 +391,90 @@ class TestC8QFAFP8NPU(unittest.TestCase):
         torch.npu.synchronize()
         reconstructed = case.cache[0].cpu()[8, 0, 0].float() * case.cache[2].cpu()[8, 0, 0]
         torch.testing.assert_close(reconstructed[[0, 3]].bfloat16(), row.cpu()[[0, 3]], rtol=0, atol=0)
+
+
+class TestQFASinkNPU(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        torch.npu.set_device(0)
+        if torch_npu.npu.get_soc_version() != 260:
+            raise RuntimeError("This integration test requires an Ascend 950 NPU.")
+        root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
+        cls.sink = load_triton_helper(root, "sink")
+
+    def make_case(self, tokens, heads, kv_heads, *, strided=False, sink_dtype=torch.float32):
+        torch.manual_seed(91)
+        dim = 128
+        query = torch.randn(tokens, heads, dim, device="npu", dtype=torch.bfloat16)
+        quantized, query_scale = torch_npu.npu_dynamic_quant(
+            query.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+        )
+        query8 = quantized.reshape_as(query)
+        if strided:
+            storage = torch.empty(tokens, heads + 1, dim, dtype=torch.uint8, device="npu")
+            storage[:, :heads].copy_(query8.view(torch.uint8))
+            query8 = storage[:, :heads].view(torch.float8_e4m3fn)
+        attn = torch.randn(tokens, heads, dim, device="npu", dtype=torch.bfloat16)
+        lse = torch.randn(heads, tokens + 3, device="npu")[:, :tokens]
+        sink_key = torch.randn(kv_heads, dim, device="npu", dtype=sink_dtype)
+        destination = torch.full((tokens + 3, heads, dim), 23, dtype=torch.bfloat16, device="npu")
+        output = destination[:tokens]
+        scale = dim**-0.5
+        return SimpleNamespace(**locals())
+
+    def run_case(self, case):
+        self.sink.qfa_sink_apply_triton(
+            case.query8,
+            case.query_scale,
+            case.attn,
+            case.lse,
+            case.sink_key,
+            case.scale,
+            case.tokens,
+            case.heads,
+            case.kv_heads,
+            case.dim,
+            case.output,
+        )
+
+    def check_case(self, case, before):
+        q_hat = case.query8.cpu().float() * case.query_scale.cpu()[:, None, None]
+        sink = case.sink_key.cpu().float().repeat_interleave(case.heads // case.kv_heads, dim=0)
+        logit = (q_hat * sink[None]).sum(-1) * case.scale
+        factor = torch.sigmoid(case.lse.cpu().t() - logit)
+        expected = (case.attn.cpu().float() * factor[..., None]).bfloat16()
+        torch.testing.assert_close(case.output.cpu(), expected, rtol=0.008, atol=0.002)
+        torch.testing.assert_close(case.attn, before, rtol=0, atol=0)
+        self.assertTrue(torch.all(case.destination[case.tokens :].cpu() == 23))
+
+    def test_fp8_query_head_major_lse_and_direct_output(self):
+        for tokens, heads, kv_heads, strided, sink_dtype in (
+            (1, 6, 1, False, torch.float32),
+            (6, 6, 1, True, torch.bfloat16),
+            (129, 8, 2, True, torch.float32),
+            (6144, 6, 1, False, torch.float32),
+        ):
+            with self.subTest(tokens=tokens, heads=heads, kv_heads=kv_heads, strided=strided):
+                case = self.make_case(tokens, heads, kv_heads, strided=strided, sink_dtype=sink_dtype)
+                before = case.attn.clone()
+                self.run_case(case)
+                torch.npu.synchronize()
+                self.check_case(case, before)
+
+    def test_graph_replay_uses_updated_scale_and_lse(self):
+        case = self.make_case(6, 6, 1, strided=True)
+        before = case.attn.clone()
+        for _ in range(3):
+            self.run_case(case)
+        torch.npu.synchronize()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            self.run_case(case)
+        case.query_scale.mul_(2)
+        case.lse.add_(1)
+        graph.replay()
+        torch.npu.synchronize()
+        self.check_case(case, before)
 
 
 if __name__ == "__main__":

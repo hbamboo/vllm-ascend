@@ -34,19 +34,23 @@ class TestQfaFp8CacheViews(unittest.TestCase):
         self.kernel_block_size = 128
         self.kv_bytes = self.spec.num_kv_heads * self.kernel_block_size * self.spec.head_size
         self.scale_bytes = self.spec.num_kv_heads * self.kernel_block_size * 4
-        self.payload_bytes = 2 * self.kv_bytes + self.scale_bytes
+        self.payload_bytes = 2 * self.kv_bytes + self.scale_bytes + self.spec.num_kv_heads * 4
 
     def test_scheduler_pages_split_into_four_padded_kernel_pages(self):
         pitch = self.payload_bytes + 64
         self.spec.page_size_bytes = 4 * pitch
         raw = torch.zeros(2 * self.spec.page_size_bytes, dtype=torch.int8)
-        key, value, scale = self.helpers.mxfp_cache_views_for_spec(raw, self.spec, self.kernel_block_size, qfa_fp8=True)
+        key, value, scale, v_scale = self.helpers.mxfp_cache_views_for_spec(
+            raw, self.spec, self.kernel_block_size, qfa_fp8=True
+        )
 
         self.assertEqual(key.shape, (8, 2, 128, 128))
         self.assertEqual(value.shape, key.shape)
         self.assertEqual(scale.shape, (8, 2, 128))
+        self.assertEqual(v_scale.shape, (8, 2))
         self.assertEqual((key.dtype, value.dtype, scale.dtype), (torch.float8_e4m3fn,) * 2 + (torch.float32,))
-        for view in (key, value, scale):
+        self.assertEqual(v_scale.dtype, torch.float32)
+        for view in (key, value, scale, v_scale):
             self.assertEqual(view.untyped_storage().data_ptr(), raw.untyped_storage().data_ptr())
             self.assertEqual(view.stride(0) * view.element_size(), pitch)
             self.assertEqual(view[4].data_ptr() - view[0].data_ptr(), self.spec.page_size_bytes)
@@ -55,9 +59,11 @@ class TestQfaFp8CacheViews(unittest.TestCase):
         key.view(torch.uint8).fill_(17)
         value.view(torch.uint8).fill_(29)
         scale.fill_(2.5)
+        v_scale.fill_(0.75)
         self.assertTrue(torch.all(key.view(torch.uint8) == 17))
         self.assertTrue(torch.all(value.view(torch.uint8) == 29))
         self.assertTrue(torch.all(scale == 2.5))
+        self.assertTrue(torch.all(v_scale == 0.75))
         self.assertTrue(torch.all(raw.view(8, pitch)[:, self.payload_bytes :] == 0))
 
         # Recycling scheduler page 0 clears its four kernel pages, not page 1.
@@ -66,6 +72,7 @@ class TestQfaFp8CacheViews(unittest.TestCase):
         for view in (key, value):
             self.assertTrue(torch.all(view[:4].view(torch.uint8) == 0))
         self.assertTrue(torch.all(scale[:4] == 0))
+        self.assertTrue(torch.all(v_scale[:4] == 0))
         torch.testing.assert_close(raw[self.spec.page_size_bytes :], neighbor)
 
     def test_aligned_slice_preserves_absolute_storage_offsets(self):
@@ -73,16 +80,20 @@ class TestQfaFp8CacheViews(unittest.TestCase):
         pitch = self.payload_bytes + 64
         allocation = torch.full((prefix_bytes + 2 * pitch + 16,), 73, dtype=torch.int8)
         raw = allocation[prefix_bytes : prefix_bytes + 2 * pitch]
-        key, value, scale = self.helpers.qfa_fp8_cache_views(
+        key, value, scale, v_scale = self.helpers.qfa_fp8_cache_views(
             raw, 2, self.spec, self.kernel_block_size, page_stride_bytes=pitch
         )
 
         self.assertEqual(key.storage_offset(), prefix_bytes)
         self.assertEqual(value.storage_offset(), prefix_bytes + self.kv_bytes)
         self.assertEqual(scale.storage_offset() * scale.element_size(), prefix_bytes + 2 * self.kv_bytes)
+        self.assertEqual(
+            v_scale.storage_offset() * v_scale.element_size(), prefix_bytes + 2 * self.kv_bytes + self.scale_bytes
+        )
         key.view(torch.uint8).zero_()
         value.view(torch.uint8).zero_()
         scale.zero_()
+        v_scale.zero_()
         self.assertTrue(torch.all(allocation[:prefix_bytes] == 73))
         self.assertTrue(torch.all(allocation[prefix_bytes + 2 * pitch :] == 73))
 
