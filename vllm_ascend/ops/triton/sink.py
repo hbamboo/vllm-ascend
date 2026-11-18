@@ -234,11 +234,17 @@ def _triton_qfa_sink_apply(
     offsets = rows[:, None] * HEAD_DIM + dim[None, :]
     attn = tl.load(attn_ptr + offsets, mask=valid[:, None], other=0).to(tl.float32)
     if HAS_V_SCALE:
-        channel_scale = tl.load(
-            v_scale_ptr + (head // GROUP)[:, None] * V_SCALE_HEAD_STRIDE + dim[None, :] * V_SCALE_DIM_STRIDE,
-            mask=valid[:, None],
-            other=0,
-        ).to(tl.float32)
+        if SINK_1D:
+            # One KV head shares one channel vector across all query rows.
+            # Use a vector load instead of the non-affine repeated gather.
+            channel_row = tl.load(v_scale_ptr + dim * V_SCALE_DIM_STRIDE).to(tl.float32)
+            channel_scale = tl.broadcast_to(channel_row[None, :], (BLOCK_ROWS, HEAD_DIM))
+        else:
+            channel_scale = tl.load(
+                v_scale_ptr + (head // GROUP)[:, None] * V_SCALE_HEAD_STRIDE + dim[None, :] * V_SCALE_DIM_STRIDE,
+                mask=valid[:, None],
+                other=0,
+            ).to(tl.float32)
         attn = attn * channel_scale
     if HAS_SINK:
         attn = attn * factor[:, None]

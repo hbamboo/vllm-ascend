@@ -295,18 +295,20 @@ class TestC8QFAFP8NPU(unittest.TestCase):
         self.assertNotEqual(*case.impl.qfa_v_descale.cpu().tolist())
 
     def test_token_head_qk_with_checkpoint_v_and_optional_sink(self):
-        for with_sink in (False, True):
-            with self.subTest(with_sink=with_sink):
-                case = self.make_case(6, 256, kv_heads=2, static_per_channel=True)
+        for kv_heads, with_sink in ((1, False), (1, True), (2, False), (2, True)):
+            with self.subTest(kv_heads=kv_heads, with_sink=with_sink):
+                case = self.make_case(6, 256, kv_heads=kv_heads, static_per_channel=True)
+                selected_heads = (0,) if kv_heads == 1 else (0, 3)
                 _, scores, (q8, qs, _, ks, _, _) = self.reference(case)
                 self.assertEqual(qs.shape, (6, 6))
-                self.assertEqual(ks.shape, (529, 2))
+                self.assertEqual(ks.shape, (529, kv_heads))
                 self.assertTrue(torch.all(qs[:, 1:] != qs[:, :-1]))
-                self.assertTrue(torch.all(ks[:, 0] != ks[:, 1]))
+                if kv_heads > 1:
+                    self.assertTrue(torch.all(ks[:, 0] != ks[:, 1]))
                 if with_sink:
                     q_hat = q8.float() * qs[..., None]
-                    sink = torch.empty(2, 128)
-                    for kv_head, head in enumerate((0, 3)):
+                    sink = torch.empty(kv_heads, 128)
+                    for kv_head, head in enumerate(selected_heads):
                         direction = q_hat[0, head]
                         delta = case.query.cpu()[0, head].float() - direction
                         orthogonal = delta - direction * delta.dot(direction) / direction.square().sum()
@@ -319,7 +321,7 @@ class TestC8QFAFP8NPU(unittest.TestCase):
                 self.check_case(case)
                 if with_sink:
                     expected, _, _ = self.reference(case)
-                    for head in (0, 3):
+                    for head in selected_heads:
                         error = (case.output.cpu()[0, head].float() - expected[0, head]).norm()
                         self.assertLess((error / expected[0, head].norm()).item(), 0.1)
 
