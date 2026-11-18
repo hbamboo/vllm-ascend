@@ -24,6 +24,7 @@ from vllm.v1.kv_cache_interface import (
     KVCacheTensor,
     MambaSpec,
     MLAAttentionSpec,
+    SlidingWindowSpec,
     UniformTypeKVCacheSpecs,
 )
 from vllm.v1.utils import CpuGpuBuffer
@@ -2070,6 +2071,15 @@ class TestNPUModelRunnerKVCache(unittest.TestCase):
         runner.vllm_config.cache_config.cache_dtype = "auto"
         spec = FullAttentionSpec(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
         self.assertFalse(runner._is_c8_mxfp_kv_cache(spec))
+
+    def test_c8_mxfp_sliding_cache_selection_preserves_skip_dtype(self):
+        runner = self._build_runner()
+        runner.vllm_config.cache_config.cache_dtype = "mxfp8"
+        spec = SlidingWindowSpec(
+            block_size=512, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn, sliding_window=4096
+        )
+        self.assertTrue(runner._is_c8_mxfp_kv_cache(spec))
+        self.assertFalse(runner._is_c8_mxfp_kv_cache(replace(spec, dtype=torch.bfloat16)))
 
     def test_allocate_kv_cache_uses_layer_spec_for_draft_gqa(self):
         runner = self._build_runner()

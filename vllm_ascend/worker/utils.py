@@ -7,7 +7,7 @@ from vllm.triton_utils import tl, triton
 from vllm.utils.math_utils import largest_power_of_2_divisor
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, MLAAttentionSpec, SlidingWindowSpec
 from vllm.v1.worker.utils import AttentionGroup, KVBlockZeroer
 
 from vllm_ascend.ops.triton.triton_utils import get_vectorcore_num
@@ -266,7 +266,9 @@ class AscendKVBlockZeroer(KVBlockZeroer):
 
         for group in attn_groups_iter:
             spec = group.kv_cache_spec
-            if not isinstance(spec, FullAttentionSpec):
+            if not isinstance(spec, FullAttentionSpec) and not (
+                cache_dtype == "mxfp8" and type(spec) is SlidingWindowSpec and spec.dtype == torch.float8_e4m3fn
+            ):
                 continue
             if group.kv_cache_group_id >= len(kernel_block_sizes):
                 continue

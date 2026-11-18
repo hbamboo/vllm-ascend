@@ -79,22 +79,55 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
                 attn_metadata.slot_mapping[:num_tokens],
             )
         record_attention_compute_start()
-        kwargs = self._fia_kwargs(query, kv_cache, attn_metadata)
+        # CANN's single-query FP8 path only accepts dense attention. Prepend
+        # one temporary query to each SWA singleton so the banded kernel is
+        # selected. The last row keeps its original absolute KV position;
+        # no dummy KV token is written to the cache.
+        ends = attn_metadata.actual_seq_lengths_q
+        pad_single_query = self.sliding_window is not None and any(
+            end - start == 1 for start, end in zip([0, *ends[:-1]], ends)
+        )
+        fia_query = query
+        real_slices = []
+        if pad_single_query:
+            chunks, padded_ends = [], []
+            padded_start = 0
+            for start, end in zip([0, *ends[:-1]], ends):
+                singleton = end - start == 1
+                chunk = query[start:end]
+                if singleton:
+                    chunk = chunk.expand(2, -1, -1)
+                chunks.append(chunk)
+                padded_end = padded_start + chunk.shape[0]
+                real_slices.append(slice(padded_start + singleton, padded_end))
+                padded_ends.append(padded_end)
+                padded_start = padded_end
+            fia_query = torch.cat(chunks)
+        kwargs = self._fia_kwargs(fia_query, kv_cache, attn_metadata)
+        if pad_single_query:
+            kwargs["actual_seq_qlen"] = padded_ends
         if _EXTRA_CTX.capturing:
             workspace = get_capture_resource(
-                _FIA_V2_WORKSPACE_KEY,
+                (_FIA_V2_WORKSPACE_KEY, "fp8_per_token", self.sliding_window),
                 lambda: torch_npu._npu_fused_infer_attention_score_v2_get_max_workspace(**kwargs),
                 self._use_max_workspace_for_fia_graph,
             )
-            lse = torch.empty((num_tokens, self.num_heads, 1), dtype=torch.float32, device=query.device)
-            attn_output = output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+            lse = torch.empty((fia_query.shape[0], self.num_heads, 1), dtype=torch.float32, device=query.device)
+            attn_output = (
+                torch.empty_like(fia_query)
+                if pad_single_query
+                else output[:num_tokens].view(num_tokens, self.num_heads, self.head_size)
+            )
             register_task(
                 torch_npu.npu_fused_infer_attention_score_v2.out,
                 {**kwargs, "workspace": workspace, "out": [attn_output, lse]},
-                FIAV2ParamProvider(self._graph_metadata_layer_name(layer)),
+                FIAV2ParamProvider(self._graph_metadata_layer_name(layer), pad_single_query=pad_single_query),
             )
         else:
             attn_output, lse = torch_npu.npu_fused_infer_attention_score_v2(**kwargs)
+        if pad_single_query:
+            attn_output = torch.cat([attn_output[rows] for rows in real_slices])
+            lse = torch.cat([lse[rows] for rows in real_slices])
         sink_key = getattr(layer, "sink_key", None)
         if sink_key is not None:
             sink_apply_triton(
@@ -108,13 +141,14 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
                 self.num_kv_heads,
                 self.head_size,
             )
-        if not _EXTRA_CTX.capturing:
+        if not _EXTRA_CTX.capturing or pad_single_query:
             output[:num_tokens] = attn_output
         return output
 
     def _fia_kwargs(self, query, kv_cache, metadata):
         ends = metadata.actual_seq_lengths_q
         causal = metadata.causal and any(end - start > 1 for start, end in zip([0, *ends[:-1]], ends))
+        windowed = self.sliding_window is not None
         return {
             "query": query,
             "key": kv_cache[0],
@@ -132,9 +166,9 @@ class AscendC8FIAPseudoAttentionBackendImpl(AscendC8MXFPAttentionBackendImpl):
             "block_size": kv_cache[0].shape[1],
             "actual_seq_qlen": ends,
             "actual_seq_kvlen": metadata.seq_lens_list,
-            "atten_mask": metadata.attn_mask if causal else None,
-            "sparse_mode": 3 if causal else 0,
-            "pre_tokens": SWA_INT_MAX,
-            "next_tokens": 0 if causal else SWA_INT_MAX,
+            "atten_mask": metadata.attn_mask if windowed or causal else None,
+            "sparse_mode": 4 if windowed else 3 if causal else 0,
+            "pre_tokens": self.sliding_window if windowed else SWA_INT_MAX,
+            "next_tokens": 0 if windowed or causal else SWA_INT_MAX,
             "return_softmax_lse": True,
         }

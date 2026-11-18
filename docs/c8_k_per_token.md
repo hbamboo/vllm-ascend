@@ -1,6 +1,6 @@
 # IQuest-Q1 C8：K/V 动态 per-token 量化
 
-基于 `5125962e71149b6f1423bc47e4a9459dfb823e6b`，使用权重
+本分支基于 `fix/c8-kv-fp32-pertoken`（`54d59ba212347214a0b177b162dac8f67e8f4f76`），使用权重
 `/mnt/sfs_turbo/work/liuhaiyang/modelslim_full/out_full_c8`，无需转换权重。
 
 ## 启用
@@ -10,12 +10,13 @@
 ```bash
 --dtype bfloat16 \
 --kv-cache-dtype mxfp8 \
---kv-cache-dtype-skip-layers sliding_window \
 --block-size 512 \
 --additional-config '{"c8_k_quant_mode":"per_token","c8_v_quant_mode":"per_token"}'
 ```
 
 完整 TP8 eager 示例为 `examples/serve_iquest_c8_k_per_token.sh`，默认端口 8003。
+本分支会让 full attention 和 SWA 都使用 FP8 KV。需要从原启动命令中移除
+`--kv-cache-dtype-skip-layers sliding_window`；保留该选项则 SWA 继续使用 C16。
 V 的默认配置仍为 `per_channel`；只设置 `c8_k_quant_mode=per_token` 时，
 继续使用上一版 K-only QFA 路径。
 
@@ -53,12 +54,29 @@ FIA 内部反量化 K/V；Python 不展开或反量化历史 KV cache。
 只写本次 token；decode 不重新量化历史 token。
 V1/V2 runner 不再填充 checkpoint V scale，zeroer 同时清理两份动态 scale。
 `fa_v.scale` 仍加载以兼容权重文件，但动态路径不使用它。
-目标 TP8/D128 下可复用现有 mxfp8 page 预算，其他形状页预算不足时初始化报错。
+FIA page 预算包含 FP8 K/V 和每 token 两份 FP32 scale，保留 scheduler 的物理 page stride。
 
-本路径面向 Ascend 950、BF16、full attention、相同 K/V head_dim。
+本路径面向 Ascend 950、BF16、full attention 或 SWA、相同 K/V head_dim。
 本地 KV 宽度最大 1024，D 须被 64 整除；PCP/DCP 沿用基线限制，
-当前不支持 PD KV transfer。滑窗层继续由 skip-layers 配置使用 C16。
+当前不支持 PD KV transfer。
 图模式复用 FIA 的 UpdatableGraph task 和现有长度参数 provider。
+
+## SWA FP8 KV
+
+SWA 同样使用 BF16 Q、动态 per-token FP8 K/V 和独立 FP32 scale。
+计算使用 `sparse_mode=4`、`pre_tokens=sliding_window`、`next_tokens=0`，
+沿用现有 C16 的窗口口径：当前位置及前 W 个位置可见。保留原始 SlidingWindowSpec
+及窗口回收信息；禁用 hybrid manager 时上游仍可将其提升为 FullAttentionSpec，
+计算的滑窗约束不变。缓存清零和复用同时覆盖 K/V 及两份 scale。
+
+CANN 9.2.1 的单 query FP8 路径只接受 sparse_mode=0，直接传 band mask 会被拒绝。
+本实现只对 SWA 单 query 序列在 FIA 调用前补一个临时 query，按 Q=2 走滑窗计算，
+最后仅保留真实 query 的输出和 LSE。KV cache 不写入 dummy token，也不在 Python 中
+反量化历史缓存。混合 Q=1/Q>1 batch 分别恢复各序列的真实行；图重放的 provider
+同步更新补齐后的 query ends 和实际 KV 长度。
+
+原有 291/300 的整模型评测结果属于 SWA 使用 C16 的基线，不能作为本次 SWA FP8 的精度结论。
+本次 SWA 的验证范围、实测结果见同目录 `c8_swa_fp8.md`。
 
 后续性能项：用 profiling 确认量化前 reshape 是否产生拷贝，以及能否省略。
 当前精度验证保持该实现不变。

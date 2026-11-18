@@ -177,6 +177,7 @@ class TestPerTokenKey(unittest.TestCase):
         helpers = load_helpers(ops)
         impl = helpers.AscendC8FIAPseudoAttentionBackendImpl()
         impl.kv_sharing_target_layer_name = None
+        impl.sliding_window = None
         impl.num_heads, impl.num_kv_heads, impl.head_size, impl.scale = 6, 1, 128, 128**-0.5
         spec = SimpleNamespace(num_kv_heads=1, head_size=128, head_size_v=128)
         pitch = helpers.mxfp_packet_size_bytes(1, 512, 128, 128)
@@ -222,6 +223,86 @@ class TestPerTokenKey(unittest.TestCase):
         provider = context["register_task"].call_args.args[2]
         metadata.seq_lens_list = [9]
         self.assertEqual(provider.resolve({"attention": metadata})["actual_seq_kvlen"], [9])
+
+
+class TestSWAPerToken(unittest.TestCase):
+    def test_single_query_padding_preserves_real_cache_output_and_sink_rows(self):
+        for ends, query_rows, real_rows in (
+            ([1], [0, 0], [1]),
+            ([1, 7, 8, 9], [0, 0, 1, 2, 3, 4, 5, 6, 7, 7, 8, 8], [1, 2, 3, 4, 5, 6, 7, 9, 11]),
+        ):
+            with self.subTest(query_ends=ends):
+
+                def scatter(cache, indices, payload):
+                    cache[indices[:, 0], indices[:, 1]] = payload
+
+                def attention(**kwargs):
+                    q = kwargs["query"]
+                    rows = torch.arange(q.shape[0]).reshape(-1, 1, 1)
+                    return q + rows, rows.expand(-1, 6, 1).float()
+
+                ops = SimpleNamespace(
+                    npu_dynamic_quant=MagicMock(side_effect=reference_dynamic_quant),
+                    npu_scatter_nd_update_=MagicMock(side_effect=scatter),
+                    npu_fused_infer_attention_score_v2=MagicMock(side_effect=attention),
+                )
+                helpers = load_helpers(ops)
+                impl = helpers.AscendC8FIAPseudoAttentionBackendImpl()
+                impl.kv_sharing_target_layer_name = None
+                impl.num_heads, impl.num_kv_heads, impl.head_size = 6, 1, 128
+                impl.scale, impl.sliding_window = 128**-0.5, 64
+                spec = SimpleNamespace(num_kv_heads=1, head_size=128, head_size_v=128)
+                pitch = helpers.mxfp_packet_size_bytes(1, 512, 128, 128)
+                cache = helpers.fia_pseudo_cache_views(
+                    torch.zeros(3 * pitch, dtype=torch.int8), 3, spec, 512, page_stride_bytes=pitch
+                )
+                n = ends[-1]
+                query = torch.arange(n + 2).reshape(-1, 1, 1).expand(-1, 6, 128).bfloat16().contiguous()
+                key = torch.ones(n + 2, 1, 128, dtype=torch.bfloat16)
+                value = key * 2
+                output = torch.full_like(query, -1)
+                metadata = SimpleNamespace(
+                    actual_seq_lengths_q=ends,
+                    seq_lens_list=[100] * len(ends),
+                    slot_mapping=torch.arange(512, 512 + n),
+                    block_tables=torch.ones(len(ends), 1, dtype=torch.int32),
+                    attn_mask=torch.ones(2048, 2048, dtype=torch.bool),
+                    causal=True,
+                )
+                sink = MagicMock()
+                impl.forward.__globals__["sink_apply_triton"] = sink
+                layer = SimpleNamespace(sink_key=torch.ones(1, 128), layer_name="swa")
+                impl.forward(layer, query, key, value, cache, metadata, output=output)
+                kwargs = ops.npu_fused_infer_attention_score_v2.call_args.kwargs
+                torch.testing.assert_close(kwargs["query"], query[query_rows])
+                self.assertEqual(kwargs["actual_seq_qlen"], [2] if n == 1 else [2, 8, 10, 12])
+                self.assertEqual((kwargs["sparse_mode"], kwargs["pre_tokens"], kwargs["next_tokens"]), (4, 64, 0))
+                torch.testing.assert_close(output[:n], query[:n] + torch.tensor(real_rows).reshape(-1, 1, 1))
+                torch.testing.assert_close(output[n:], torch.full_like(output[n:], -1))
+                torch.testing.assert_close(sink.call_args.args[0], query[:n])
+                torch.testing.assert_close(
+                    sink.call_args.args[2], torch.tensor(real_rows).reshape(-1, 1, 1).expand(-1, 6, 1).float()
+                )
+                self.assertEqual(ops.npu_dynamic_quant.call_count, 2)
+                for call in ops.npu_dynamic_quant.call_args_list:
+                    self.assertEqual(call.args[0].shape, (n, 128))
+                for call in ops.npu_scatter_nd_update_.call_args_list:
+                    self.assertEqual(call.args[1].shape, (n, 2))
+
+    def test_graph_provider_recomputes_padded_query_ends(self):
+        helpers = load_helpers(SimpleNamespace())
+        metadata = SimpleNamespace(actual_seq_lengths_q=[1, 7, 8, 9], seq_lens_list=[1, 20, 30, 40])
+        provider = helpers.FIAV2ParamProvider("swa", pad_single_query=True)
+        resolved = provider.resolve({"swa": metadata})
+        self.assertEqual(resolved["actual_seq_qlen"], [2, 8, 10, 12])
+        self.assertEqual(metadata.actual_seq_lengths_q, [1, 7, 8, 9])
+        metadata.actual_seq_lengths_q = [1, 5, 6, 7]
+        metadata.seq_lens_list = [2, 21, 31, 41]
+        resolved = provider.resolve({"swa": metadata})
+        self.assertEqual(resolved["actual_seq_qlen"], [2, 6, 8, 10])
+        self.assertIs(resolved["actual_seq_kvlen"], metadata.seq_lens_list)
+        unchanged = helpers.FIAV2ParamProvider("swa").resolve({"swa": metadata})
+        self.assertIs(unchanged["actual_seq_qlen"], metadata.actual_seq_lengths_q)
 
 
 if __name__ == "__main__":

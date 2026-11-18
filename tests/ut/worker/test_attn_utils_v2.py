@@ -2685,6 +2685,20 @@ def test_get_kv_cache_spec_keeps_plain_spec_without_mxfp8(monkeypatch):
     assert spec.state_content_bytes is None
 
 
+@pytest.mark.parametrize("dtype", [torch.float8_e4m3fn, torch.bfloat16])
+def test_get_kv_cache_spec_preserves_sliding_fp8_and_skip_dtype(monkeypatch, dtype):
+    config = _c8_mxfp_vllm_config()
+    config.additional_config.update(c8_k_quant_mode="per_token", c8_v_quant_mode="per_token")
+    original = SlidingWindowSpec(
+        block_size=512, num_kv_heads=1, head_size=128, dtype=dtype, sliding_window=4096, extra_retained_tokens=5
+    )
+    spec = _run_get_kv_cache_spec(monkeypatch, config, original)["attn"]
+    assert type(spec) is SlidingWindowSpec
+    assert spec.dtype == dtype
+    assert (spec.sliding_window, spec.extra_retained_tokens) == (4096, 5)
+    assert spec.state_content_bytes == (264 if dtype == torch.float8_e4m3fn else None)
+
+
 @pytest.mark.parametrize("head_size_v,dynamic_v", [(64, False), (128, False), (64, True)])
 def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dynamic_v):
     spec = mxfp_cache_spec(_plain_full_attention_spec(head_size_v))

@@ -37,7 +37,7 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -217,15 +217,18 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
+def mxfp_cache_spec(
+    spec: "FullAttentionSpec | SlidingWindowSpec", *, fia_pseudo: bool = False
+) -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
         raise ValueError("MXFP cache requires one stored state per token and one slot per KV head.")
     mxfp_packet_section_sizes(spec.num_kv_heads, spec.block_size, k_dim, v_dim)
-    result = replace(
-        spec, dtype=torch.float8_e4m3fn, state_content_bytes=k_dim + v_dim + (k_dim + v_dim) // MXFP8_GROUP_SIZE
+    scale_bytes = (
+        math.ceil(2 * FIA_SCALE_DTYPE_SIZE / spec.num_kv_heads) if fia_pseudo else (k_dim + v_dim) // MXFP8_GROUP_SIZE
     )
+    result = replace(spec, dtype=torch.float8_e4m3fn, state_content_bytes=k_dim + v_dim + scale_bytes)
     if result.page_size_padded is not None and result.page_size_padded < result.unpadded_page_size_bytes:
         raise ValueError("MXFP padded page is smaller than its K/V and scale payload.")
     return result
@@ -234,17 +237,12 @@ def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
 def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
     """Whether ``spec`` describes an MXFP8 packet-packed KV cache.
 
-    ``--kv-cache-dtype mxfp8`` is a global switch, but
-    ``--kv-cache-dtype-skip-layers`` keeps some layers (every sliding window
-    layer, plus a sliding-window draft model) on the model dtype. vLLM
-    promotes those ``SlidingWindowSpec`` entries to ``FullAttentionSpec``
-    whenever the layers share one block pool -- the hybrid KV cache manager
-    does it, and so does ``unify_hybrid_kv_cache_specs`` when it is disabled for
-    a hybrid model -- so ``type(spec) is FullAttentionSpec`` alone also matches
-    BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
-    rewrites the dtype, so test the dtype instead of the global flag.
+    ``--kv-cache-dtype-skip-layers`` may retain BF16 attention layers even
+    under the global mxfp8 setting. A shared pool can also promote a sliding
+    spec to a full spec. Recognize either attention type by its resolved FP8
+    dtype rather than treating every member of the pool as quantized.
     """
-    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+    return type(spec) in (FullAttentionSpec, SlidingWindowSpec) and spec.dtype == torch.float8_e4m3fn
 
 
 def mxfp_paged_cache_views(

@@ -526,11 +526,20 @@ class FIAParamProvider:
 @dataclass(frozen=True, slots=True)
 class FIAV2ParamProvider:
     layer_name: str | None
+    pad_single_query: bool = False
 
     def resolve(self, attn_metadata) -> dict[str, Any]:
         metadata = attn_metadata[self.layer_name]
+        query_ends = metadata.actual_seq_lengths_q
+        if self.pad_single_query:
+            padded_ends = []
+            padding = 0
+            for start, end in zip([0, *query_ends[:-1]], query_ends):
+                padding += end - start == 1
+                padded_ends.append(end + padding)
+            query_ends = padded_ends
         return {
-            "actual_seq_qlen": metadata.actual_seq_lengths_q,
+            "actual_seq_qlen": query_ends,
             "actual_seq_kvlen": metadata.seq_lens_list,
         }
 

@@ -216,6 +216,7 @@ class TestC8KVPerTokenNPU(TestC8KPerTokenNPU):
         case.value.mul_(torch.exp2(torch.arange(529, device="npu").remainder(5).float() - 2)[:, None, None])
         case.impl = self.helpers.AscendC8FIAPseudoAttentionBackendImpl()
         case.impl.num_heads, case.impl.num_kv_heads, case.impl.head_size, case.impl.scale = 6, 1, 128, 128**-0.5
+        case.impl.sliding_window = None
         case.impl.kv_sharing_target_layer_name = None
         case.metadata.actual_seq_lengths_q = [q_len]
         case.metadata.seq_lens_list = [529]

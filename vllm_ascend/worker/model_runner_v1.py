@@ -124,6 +124,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
@@ -4700,11 +4701,7 @@ class NPUModelRunner(GPUModelRunner):
         # The dtype, not the global flag: --kv-cache-dtype-skip-layers keeps
         # some layers on BF16 and vLLM promotes their SlidingWindowSpec to
         # FullAttentionSpec when the layers share one block pool.
-        return (
-            type(spec) is FullAttentionSpec
-            and is_c8_mxfp_kv_quant(self.vllm_config)
-            and spec.dtype == torch.float8_e4m3fn
-        )
+        return is_c8_mxfp_kv_quant(self.vllm_config) and is_mxfp_cache_spec(spec)
 
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         """Initialize V scales and retain views for physical-page reassignment.
@@ -5244,6 +5241,7 @@ class NPUModelRunner(GPUModelRunner):
                     "linear_attn" in layer_name
                     or self.hybrid_with_attn_and_mamba
                     or layer_name in strided_attention_cache_layers
+                    or self._is_c8_mxfp_kv_cache(layer_kv_cache_spec[layer_name])
                     or "cache_only_layers" in layer_name
                     or is_hidden_state_cache_spec(layer_kv_cache_spec.get(layer_name))
                 ) and layer_name not in kv_cache_raw_tensors:
@@ -6364,7 +6362,7 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
-                        spec = mxfp_cache_spec(spec)
+                        spec = mxfp_cache_spec(spec, fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token")
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):

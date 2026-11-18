@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_ascend.attention.attention_c8_mxfp import (
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
     mxfp_packet_section_sizes,
@@ -78,6 +79,55 @@ def test_spec_keeps_real_head_dimensions_and_metadata():
     assert spec.state_content_bytes == 396
     assert spec.page_size_bytes == 512 * 396
     assert original.state_content_bytes is None
+
+
+@pytest.mark.parametrize("heads,head_dim", [(1, 64), (1, 128), (2, 128), (3, 128)])
+def test_fia_sliding_spec_preserves_window_and_budgets_fp32_scales(heads, head_dim):
+    original = SlidingWindowSpec(
+        block_size=512,
+        num_kv_heads=heads,
+        head_size=head_dim,
+        dtype=torch.float8_e4m3fn,
+        sliding_window=4096,
+        extra_retained_tokens=5,
+    )
+    spec = mxfp_cache_spec(original, fia_pseudo=True)
+    assert type(spec) is SlidingWindowSpec
+    assert (spec.sliding_window, spec.extra_retained_tokens) == (4096, 5)
+    assert (spec.head_size, spec.head_size_v) == (head_dim, head_dim)
+    assert is_mxfp_cache_spec(spec)
+    assert not is_mxfp_cache_spec(replace(spec, dtype=torch.bfloat16))
+    raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.int8)
+    k, v, ks, vs = mxfp_cache_views_for_spec(raw, spec, 512, fia_pseudo=True)
+    assert k.shape == v.shape == (2, 512, heads * head_dim)
+    assert ks.shape == vs.shape == (2, 512)
+    assert ks.dtype == vs.dtype == torch.float32
+    assert k.stride(0) == v.stride(0) == spec.page_size_bytes
+    payload_bytes = 512 * (2 * heads * head_dim + 8)
+    assert payload_bytes <= spec.page_size_bytes < payload_bytes + 512 * heads
+    assert original.state_content_bytes is None
+
+
+def test_zeroing_sliding_fp8_pages_clears_both_dynamic_scales():
+    spec = mxfp_cache_spec(
+        SlidingWindowSpec(
+            block_size=512, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn, sliding_window=4096
+        ),
+        fia_pseudo=True,
+    )
+    raw = torch.full((2 * spec.page_size_bytes,), 37, dtype=torch.int8)
+    views = mxfp_cache_views_for_spec(raw, spec, 512, fia_pseudo=True)
+    zeroer = AscendKVBlockZeroer(torch.device("cpu"), pin_memory=False)
+    group = SimpleNamespace(kv_cache_spec=spec, kv_cache_group_id=0, layer_names=["swa"])
+    zeroer.init_meta([group], [512], "mxfp8", set(), {"swa": SimpleNamespace(kv_cache=views)})
+    addresses, sizes, _, _, count = zeroer._meta
+    assert count == 4
+    for address, size, stride in zip(addresses.tolist(), sizes.tolist(), zeroer._seg_page_strides.tolist()):
+        start = address - raw.data_ptr() + 4 * stride
+        raw[start : start + size * 4].zero_()
+    assert (raw[: spec.page_size_bytes] == 37).all()
+    for view in views:
+        assert (view[1].view(torch.uint8) == 0).all()
 
 
 def test_d256_page_budget_includes_both_scales_once():

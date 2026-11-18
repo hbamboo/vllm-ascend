@@ -594,6 +594,27 @@ class TestGetCacheScaleMapper(TestBase):
             "model.layers.3.self_attn.attn.v_cache_scale",
         )
 
+    def test_mxfp_attention_route_preserves_skipped_layers_and_limits_swa_to_fia(self):
+        cases = [
+            (None, torch.float8_e4m3fn, "per_channel", True),
+            (4096, torch.float8_e4m3fn, "per_token", True),
+            (4096, torch.float8_e4m3fn, "per_channel", False),
+            (4096, torch.bfloat16, "per_token", False),
+            (None, torch.bfloat16, "per_token", False),
+        ]
+        for window, dtype, mode, expected in cases:
+            with self.subTest(window=window, dtype=dtype, mode=mode):
+                layer = MagicMock(spec=Attention)
+                layer.sliding_window = window
+                layer.kv_cache_torch_dtype = dtype
+                config = SimpleNamespace(additional_config={"c8_v_quant_mode": mode})
+                with patch(
+                    "vllm_ascend.quantization.configs.modelslim_config.get_current_vllm_config",
+                    return_value=config,
+                ):
+                    self.assertEqual(AscendModelSlimConfig._is_mxfp_attention_layer(layer), expected)
+        self.assertFalse(AscendModelSlimConfig._is_mxfp_attention_layer(MagicMock(spec=AttentionLayerBase)))
+
     def test_mxfp_c8_stands_fa_quant_down(self):
         # Both recipes declared for the same layer: MXFP8 has to win, or the
         # FAKQuant regex renames fa_v.scale into an MLA submodule a dense model

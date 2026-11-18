@@ -14,7 +14,6 @@ exec python -m vllm.entrypoints.cli.main serve \
     --dtype bfloat16 \
     --quantization ascend \
     --kv-cache-dtype mxfp8 \
-    --kv-cache-dtype-skip-layers sliding_window \
     --block-size 512 \
     --additional-config '{"c8_k_quant_mode":"per_token","c8_v_quant_mode":"per_token"}' \
     --enforce-eager \

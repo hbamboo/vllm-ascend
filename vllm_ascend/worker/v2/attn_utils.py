@@ -339,7 +339,9 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # the packet-packed FP8 layout made the BF16 kernels write into an FP8
         # cache (Invalid_Argument_Tensor_Dtype in ScatterPaKvCache).
         if is_c8_mxfp_kv_quant(vllm_config) and is_mxfp_cache_spec(spec):
-            spec = mxfp_cache_spec(spec)
+            spec = mxfp_cache_spec(
+                spec, fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token"
+            )
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -1380,6 +1382,10 @@ def _allocate_kv_cache(
             k_size = kv_cache_tensor_size
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(k_size, alignment, device)
+        elif is_mxfp_cache_spec(example_spec) and is_c8_mxfp_kv_quant(vllm_config):
+            for layer_name in shared_names:
+                layer_size = kv_cache_config.num_blocks * layer_kv_cache_spec[layer_name].page_size_bytes
+                kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
         elif type(example_spec) is FullAttentionSpec and not enable_sfa(vllm_config):
             for layer_name in shared_names:
                 layer_spec = layer_kv_cache_spec[layer_name]
@@ -1586,7 +1592,7 @@ def _reshape_kv_cache_v2(
 
             # Per-layer spec, not the global cache_dtype: skip-quantized
             # (BF16) layers reach here as promoted FullAttentionSpecs.
-            if is_mxfp_cache_spec(kv_cache_spec):
+            if is_mxfp_cache_spec(kv_cache_spec) and is_c8_mxfp_kv_quant(vllm_config):
                 raw_cache = kv_cache_raw_tensors[layer_name]
                 if not isinstance(raw_cache, torch.Tensor):
                     raise ValueError("C8_MXFP requires one combined raw allocation per layer.")
