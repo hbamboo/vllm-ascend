@@ -548,13 +548,22 @@ class NPUModelRunner(GPUModelRunner):
         num_blocks = self.kv_cache_config.num_blocks
         if num_blocks <= 0:
             return
+        from vllm_ascend.attention.attention_c8_fia import AscendC8FIAPseudoAttentionBackendImpl
+
         for layer in self.compilation_config.static_forward_context.values():
-            if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
-                value_scale_cache = layer.kv_cache[3]
-                assert value_scale_cache.shape[0] % num_blocks == 0
-                kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
-                self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
-                fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
+            impl = getattr(layer, "impl", None)
+            if not isinstance(impl, AscendC8MXFPAttentionBackendImpl):
+                continue
+            if isinstance(impl, AscendC8FIAPseudoAttentionBackendImpl):
+                # FIA C8 layers (every sliding layer, and every layer when V
+                # is quantized per token) cache a dynamic FP32 per-token
+                # scale instead of the checkpoint's static E8M0 V scale.
+                continue
+            value_scale_cache = layer.kv_cache[3]
+            assert value_scale_cache.shape[0] % num_blocks == 0
+            kernel_blocks_per_page = value_scale_cache.shape[0] // num_blocks
+            self._c8_mxfp_v_scale_caches.append((layer.v_cache_scale, value_scale_cache, kernel_blocks_per_page))
+            fill_mxfp_v_scale_cache(layer.v_cache_scale, value_scale_cache)
 
     def shutdown(self) -> None:
         # Drop C8 packet views before the parent collects tensors and

@@ -727,7 +727,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 scheme = AscendC8KVCacheAttentionMethod(self.quant_description, prefix)
                 logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
-            elif self.enable_mxfp_c8_quant and self._is_full_attention_layer(layer):
+            elif self.enable_mxfp_c8_quant and self._is_c8_mxfp_attention_layer(layer, prefix):
                 if self._has_mxfp_c8_recipe is False:
                     logger.warning_once(
                         "[quantization] --kv-cache-dtype mxfp8 is set but the checkpoint "
@@ -803,27 +803,33 @@ class AscendModelSlimConfig(QuantizationConfig):
         return False
 
     @staticmethod
-    def _is_full_attention_layer(layer: torch.nn.Module) -> bool:
-        """C8-MXFP only applies to standard full-attention ``Attention``
-        layers. Other AttentionLayerBase subclasses (GDN/Mamba, encoder
-        attention, ...) must not get the MXFP KV-cache method: they have no
-        ``num_kv_heads``/``head_size_v`` and install the QFA backend on the
-        wrong layer type.
+    def _is_c8_mxfp_attention_layer(layer: torch.nn.Module, prefix: str) -> bool:
+        """C8-MXFP applies to standard ``Attention`` layers, including
+        per-layer sliding-window ones.
 
-        Per-layer sliding-window ``Attention`` layers are excluded as well:
-        the C8-MXFP QFA path raises NotImplementedError for sliding-window
-        attention (AscendC8MXFPAttentionBackendImpl), and their
-        SlidingWindowSpec would neither be converted by ``mxfp_cache_spec``
-        nor receive the (k, v, k_scale, v_scale) cache tuple -- the mismatch
-        crashes ``_fill_c8_mxfp_v_scale_caches`` (``cache[3]`` on a raw K/V
-        tuple). Those layers keep their unquantized KV cache instead.
+        Other AttentionLayerBase subclasses (GDN/Mamba, encoder attention,
+        ...) must not get the MXFP KV-cache method: they have no
+        ``num_kv_heads``/``head_size_v`` and would install the attention
+        backend on the wrong layer type.
+
+        Sliding-window layers store the same dense FP8 per-token K/V but run
+        FIA v2 (``AscendC8FIAPseudoAttentionBackendImpl``), whose BAND mask
+        mode is the sliding-window control; the delivered QFA rejects
+        SLIDING_WINDOW.
+
+        The MTP draft (``*.mtp_model_layer.*``) is excluded: its checkpoint
+        carries no C8 V scale and its attention keeps the generic BF16 FIA
+        path. Layers kept on the model dtype by
+        ``--kv-cache-dtype-skip-layers`` hold ``kv_cache_dtype="auto"`` and
+        must stay unquantized as well.
         """
         from vllm.model_executor.layers.attention import Attention
 
-        return (
-            isinstance(layer, Attention)
-            and getattr(layer, "sliding_window", None) is None
-        )
+        if "mtp_model_layer" in prefix:
+            return False
+        if not str(getattr(layer, "kv_cache_dtype", "")).startswith("mxfp8"):
+            return False
+        return isinstance(layer, Attention)
 
     @property
     def enable_mxfp_c8_quant(self) -> bool:
