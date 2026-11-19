@@ -28,7 +28,7 @@
     2. Reinterpret source scales as uint8 and make the source contiguous. Read head/group counts and all six destination strides from cache metadata.
     3. Launch one Triton program per 256 flattened source bytes, masking elements beyond `T * H * G * 2`.
     4. Decompose each flattened index into token, head, group, and pair coordinates. Load this cache group's raw slot using its actual stride, promote to int64, clamp negative slots to the reserved null slot, and derive block/segment/fragment coordinates.
-    5. Calculate the destination offset in int64 and store the unchanged source byte directly. No index buffers, cache-wide temporary view, or writeback is created.
+    5. Calculate the physical page base in int64. A compile-time bound selects int32 page-internal arithmetic when all internal offsets fit, reducing wide vector temporaries; larger internal strides retain int64 arithmetic. Add the internal offset to the int64 page base and store the unchanged source byte directly. No index buffers, cache-wide temporary view, or writeback is created.
 - **Supported modes**: Ascend NPU eager execution and ACL graph capture/replay with Triton-Ascend. Hardware validation was performed on 950DT (Ascend A5). Atlas A2, Atlas A3, and 950PR validation is N/A; this document does not establish additional hardware support.
 
 ## Parameters
@@ -57,7 +57,7 @@ All three arguments are required. The Python function returns `None` and updates
 - Source and slot storage must not overlap the destination writes. Concurrent writers must address disjoint destination bytes. This kernel preserves writes to unselected pages; it does not synchronize competing writes to the same bytes or replace transfer-completion dependencies required by readers.
 - Byte patterns are preserved exactly, including any non-finite E8M0 encoding already present in the input. Scale validation, saturation, and NaN correction are N/A.
 - Capture and replay keep buffer addresses, shapes, strides, and launch arguments fixed. Values in the captured source/slot buffers may change before replay; each replay loads and decomposes the current raw slots. `num_elements` is a runtime scalar excluded from JIT specialization, so varying token counts between eager calls or separate captures reuses the compiled kernel when other specialization attributes stay fixed. Layout attributes remain compile-time parameters; different layouts can produce different compiled variants.
-- Address arithmetic uses int64. The caller must still supply valid allocated storage for every destination.
+- Raw slots, page decomposition, physical page bases and final destination offsets use int64. Bounded page-internal offsets may use int32 without narrowing the physical page pitch. The caller must still supply valid allocated storage for every destination.
 - Forward inference only; autograd backward support is N/A.
 
 ## Origin and Differences

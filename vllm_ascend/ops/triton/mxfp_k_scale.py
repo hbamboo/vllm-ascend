@@ -39,14 +39,34 @@ def _scatter_k_scale_kernel(
     offset_in_block = slot % block_tokens
     segment = offset_in_block // token_fragment
     fragment = offset_in_block % token_fragment
-    offset = (
-        block * block_stride
-        + head.to(tl.int64) * head_stride
-        + segment * segment_stride
-        + group.to(tl.int64) * group_stride
-        + fragment * fragment_stride
-        + pair.to(tl.int64) * pair_stride
+    max_page_offset: tl.constexpr = (
+        (num_heads - 1) * head_stride
+        + (block_tokens // token_fragment - 1) * segment_stride
+        + (num_groups - 1) * group_stride
+        + (token_fragment - 1) * fragment_stride
+        + pair_stride
     )
+    # Normal packed pages fit INT32 internally. Keep the physical page base
+    # INT64 without carrying six wide address vectors through the writer.
+    # The constexpr branch also preserves views with larger internal strides.
+    max_int32_offset: tl.constexpr = 2**31 - 1
+    if max_page_offset <= max_int32_offset:
+        page_offset = (
+            head * head_stride
+            + segment.to(tl.int32) * segment_stride
+            + group * group_stride
+            + fragment.to(tl.int32) * fragment_stride
+            + pair * pair_stride
+        )
+    else:
+        page_offset = (
+            head.to(tl.int64) * head_stride
+            + segment * segment_stride
+            + group.to(tl.int64) * group_stride
+            + fragment * fragment_stride
+            + pair.to(tl.int64) * pair_stride
+        )
+    offset = block * block_stride + page_offset.to(tl.int64)
     value = tl.load(source + index, mask=valid, other=0)
     tl.store(cache + offset, value, mask=valid)
 

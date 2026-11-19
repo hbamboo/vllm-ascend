@@ -190,7 +190,6 @@ def _triton_qfa_sink_apply(
     HEAD_DIM: tl.constexpr,
     Q_TOKEN_STRIDE: tl.constexpr,
     Q_HEAD_STRIDE: tl.constexpr,
-    Q_DIM_STRIDE: tl.constexpr,
     Q_SCALE_TOKEN_STRIDE: tl.constexpr,
     Q_SCALE_HEAD_STRIDE: tl.constexpr,
     LSE_HEAD_STRIDE: tl.constexpr,
@@ -209,10 +208,10 @@ def _triton_qfa_sink_apply(
     token = rows // NUM_HEADS
     head = rows % NUM_HEADS
     if HAS_SINK:
-        if Q_TOKEN_STRIDE == NUM_HEADS * HEAD_DIM and Q_HEAD_STRIDE == HEAD_DIM and Q_DIM_STRIDE == 1:
+        if Q_TOKEN_STRIDE == NUM_HEADS * HEAD_DIM and Q_HEAD_STRIDE == HEAD_DIM:
             q_offsets = rows[:, None] * HEAD_DIM + dim[None, :]
         else:
-            q_offsets = token[:, None] * Q_TOKEN_STRIDE + head[:, None] * Q_HEAD_STRIDE + dim[None, :] * Q_DIM_STRIDE
+            q_offsets = token[:, None] * Q_TOKEN_STRIDE + head[:, None] * Q_HEAD_STRIDE + dim[None, :]
         query = tl.load(
             q_ptr + q_offsets,
             mask=valid[:, None],
@@ -281,6 +280,10 @@ def qfa_sink_apply_triton(
     if num_rows == 0:
         return
     query = query.reshape(num_tokens, num_heads, head_dim)
+    # Avoid the nonunit-D-stride variant that fails in the current Ascend
+    # Triton compiler. Token/head-strided D1 views still need no copy.
+    if query.stride(-1) != 1:
+        query = query.contiguous()
     if sink_key is not None:
         lse = lse.reshape(num_heads, num_tokens)
     init_device_properties_triton()
@@ -300,7 +303,6 @@ def qfa_sink_apply_triton(
         HEAD_DIM=head_dim,
         Q_TOKEN_STRIDE=query.stride(0),
         Q_HEAD_STRIDE=query.stride(1),
-        Q_DIM_STRIDE=query.stride(2),
         Q_SCALE_TOKEN_STRIDE=query_scale.stride(0) if query_scale is not None else 0,
         Q_SCALE_HEAD_STRIDE=query_scale.stride(1) if query_scale is not None and query_scale.ndim == 2 else 0,
         LSE_HEAD_STRIDE=lse.stride(0) if sink_key is not None else 0,

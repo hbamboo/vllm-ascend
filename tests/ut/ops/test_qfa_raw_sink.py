@@ -54,7 +54,7 @@ class TestQFARawSinkLaunch(unittest.TestCase):
             )
 
     def test_raw_query_preserves_strides_and_direct_output(self):
-        case = self.make_case(dim_stride=2)
+        case = self.make_case()
         kernel = MagicMock()
         self.launch(case, None, kernel)
         kernel.__getitem__.assert_called_once_with((3,))
@@ -70,11 +70,23 @@ class TestQFARawSinkLaunch(unittest.TestCase):
         self.assertEqual(kwargs["Q_SCALE_HEAD_STRIDE"], 0)
         self.assertEqual(kwargs["Q_TOKEN_STRIDE"], case.query.stride(0))
         self.assertEqual(kwargs["Q_HEAD_STRIDE"], case.query.stride(1))
-        self.assertEqual(kwargs["Q_DIM_STRIDE"], 2)
         self.assertEqual(kwargs["LSE_HEAD_STRIDE"], case.lse.stride(0))
         self.assertEqual(kwargs["LSE_TOKEN_STRIDE"], case.lse.stride(1))
         self.assertTrue(kwargs["HAS_SINK"])
         self.assertFalse(kwargs["HAS_V_SCALE"])
+
+    def test_raw_query_materializes_nonunit_dim_stride(self):
+        case = self.make_case(dim_stride=2)
+        case.query.copy_(torch.randn_like(case.query))
+        kernel = MagicMock()
+        self.launch(case, None, kernel)
+        args, kwargs = kernel.__getitem__.return_value.call_args
+        self.assertNotEqual(args[0].data_ptr(), case.query.data_ptr())
+        self.assertTrue(args[0].is_contiguous())
+        torch.testing.assert_close(args[0], case.query, rtol=0, atol=0)
+        self.assertEqual(kwargs["Q_TOKEN_STRIDE"], case.heads * case.dim)
+        self.assertEqual(kwargs["Q_HEAD_STRIDE"], case.dim)
+        self.assertFalse(kwargs["HAS_Q_SCALE"])
 
     def test_quantized_query_retains_token_and_head_scale_strides(self):
         case = self.make_case()
@@ -86,7 +98,6 @@ class TestQFARawSinkLaunch(unittest.TestCase):
                 args, kwargs = kernel.__getitem__.return_value.call_args
                 self.assertIs(args[1], query_scale)
                 self.assertTrue(kwargs["HAS_Q_SCALE"])
-                self.assertEqual(kwargs["Q_DIM_STRIDE"], 1)
                 self.assertEqual(kwargs["Q_SCALE_TOKEN_STRIDE"], query_scale.stride(0))
                 self.assertEqual(kwargs["Q_SCALE_HEAD_STRIDE"], query_scale.stride(1) if query_scale.ndim == 2 else 0)
 
