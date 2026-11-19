@@ -12,7 +12,6 @@ import torch_npu  # noqa: F401
 from vllm_ascend.attention.attention_c8_mxfp import (
     MXFP_K_SCALE_NZ_TOKEN_FRAG,
     MXFP_KV_SCALE_GROUP_SIZE,
-    mxfp_k_scale_slot_index,
     mxfp_packet_size_bytes,
     mxfp_paged_cache_views,
     scatter_mxfp_k_scale_cache,
@@ -20,8 +19,9 @@ from vllm_ascend.attention.attention_c8_mxfp import (
 from vllm_ascend.ops.triton.mxfp_k_scale import _scatter_k_scale_kernel
 
 
-def _write_reference(raw, slots, values, blocks, heads, pitch, offset):
-    cache = mxfp_paged_cache_views(raw[offset:], blocks, heads, 256, 256, 512, page_stride_bytes=pitch)[2]
+def _write_reference(raw, slots, values, blocks, heads, pitch, offset, dim=256):
+    cache = mxfp_paged_cache_views(raw[offset:], blocks, heads, dim, dim, 512, page_stride_bytes=pitch)[2]
+    slots = slots.to(torch.int64).clamp(min=0)
     cache[slots // 512, :, slots % 512 // 16, :, slots % 16, :] = values
 
 
@@ -37,7 +37,7 @@ def test_scatter_matches_reference_and_graph_replay(heads, padding, offset, nonc
     cache = mxfp_paged_cache_views(raw[offset:], blocks, heads, dim, dim, 512, page_stride_bytes=pitch)[2]
     expected = raw.cpu()
     slots = torch.arange(tokens, dtype=torch.int64) * 73 + 512
-    indices = mxfp_k_scale_slot_index(slots.npu(), 512)
+    device_slots = slots.npu()
     values = torch.arange(tokens * heads * 8, dtype=torch.int32).remainder(251).to(torch.uint8)
     values = values.reshape(tokens, heads, dim // 64, 2)
     if noncontiguous_source:
@@ -48,24 +48,80 @@ def test_scatter_matches_reference_and_graph_replay(heads, padding, offset, nonc
         source_bytes = values.npu()
     source = source_bytes.view(torch.float8_e8m0fnu) if offset else source_bytes
     _write_reference(expected, slots, values, blocks, heads, pitch, offset)
-    scatter_mxfp_k_scale_cache(source, cache, indices)
+    scatter_mxfp_k_scale_cache(source, cache, device_slots)
     torch.npu.synchronize()
     # Compare the complete allocation, including other cache components and padding.
     torch.testing.assert_close(raw.cpu(), expected, rtol=0, atol=0)
 
     graph = torch.npu.NPUGraph()
     with torch.npu.graph(graph):
-        scatter_mxfp_k_scale_cache(source, cache, indices)
+        scatter_mxfp_k_scale_cache(source, cache, device_slots)
     new_slots = slots + 19
-    indices[0].copy_((new_slots // 512).npu())
-    indices[1].copy_((new_slots % 512 // 16).npu())
-    indices[2].copy_((new_slots % 16).npu())
+    device_slots.copy_(new_slots.npu())
     new_values = values + 1
     source_bytes.copy_(new_values.npu())
     _write_reference(expected, new_slots, new_values, blocks, heads, pitch, offset)
     graph.replay()
     torch.npu.synchronize()
     torch.testing.assert_close(raw.cpu(), expected, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("slot_dtype", [torch.int32, torch.int64])
+@pytest.mark.parametrize("slot_stride", [1, 2])
+def test_raw_group_slots_and_graph_replay(slot_dtype, slot_stride):
+    """Distinct groups read their own raw slots, including updated padded rows."""
+    blocks, heads, dim, tokens = 4, 1, 128, 12
+    pitch = mxfp_packet_size_bytes(heads, 512, dim, dim)
+    raw = [torch.full((blocks * pitch,), 13, dtype=torch.int8, device="npu") for _ in range(2)]
+    caches = [mxfp_paged_cache_views(storage, blocks, heads, dim, dim, 512)[2] for storage in raw]
+    expected = [storage.cpu() for storage in raw]
+    slots = torch.stack([torch.arange(tokens) * 17 + 512, torch.arange(tokens) * 19 + 1024]).to(slot_dtype)
+    slots[:, -1] = torch.iinfo(slot_dtype).min
+    slot_storage = torch.empty((2, tokens * slot_stride), dtype=slot_dtype, device="npu")
+    device_slots = slot_storage[:, ::slot_stride]
+    device_slots.copy_(slots.npu())
+    values = [torch.full((tokens, heads, dim // 64, 2), 120 + group, dtype=torch.uint8) for group in range(2)]
+    sources = [value.npu() for value in values]
+    for group in range(2):
+        scatter_mxfp_k_scale_cache(sources[group], caches[group], device_slots[group])
+        _write_reference(expected[group], slots[group], values[group], blocks, heads, pitch, 0, dim)
+    torch.npu.synchronize()
+    for storage, reference in zip(raw, expected):
+        torch.testing.assert_close(storage.cpu(), reference, rtol=0, atol=0)
+
+    graph = torch.npu.NPUGraph()
+    with torch.npu.graph(graph):
+        for group in range(2):
+            scatter_mxfp_k_scale_cache(sources[group], caches[group], device_slots[group])
+    slots[:, :-1] += 31
+    slots[:, -1] = -7
+    device_slots.copy_(slots.npu())
+    for group in range(2):
+        values[group] += 1
+        sources[group].copy_(values[group].npu())
+        _write_reference(expected[group], slots[group], values[group], blocks, heads, pitch, 0, dim)
+    graph.replay()
+    torch.npu.synchronize()
+    for storage, reference in zip(raw, expected):
+        torch.testing.assert_close(storage.cpu(), reference, rtol=0, atol=0)
+
+
+def test_scatter_uses_int64_cache_offsets():
+    # Only the two 4-KiB K-scale regions are initialized/read. The >2-GiB
+    # packet stride catches truncation of the destination byte offset.
+    block_bytes = 32 * 4 * 16 * 2
+    pitch = (1 << 31) + 256
+    raw = torch.empty(pitch + block_bytes, dtype=torch.uint8, device="npu")
+    raw[:block_bytes].fill_(13)
+    raw[pitch:].fill_(13)
+    cache = torch.as_strided(raw, (2, 1, 32, 4, 16, 2), (pitch, block_bytes, 128, 32, 2, 1))
+    expected = torch.full(cache.shape, 13, dtype=torch.uint8)
+    values = torch.stack([torch.full((1, 4, 2), 200 + token, dtype=torch.uint8) for token in range(2)])
+    expected[1, :, 0, :, 15, :] = values[0]
+    expected[0, :, 0, :, 1, :] = values[1]
+    scatter_mxfp_k_scale_cache(values.npu(), cache, torch.tensor([527, 1], dtype=torch.int32, device="npu"))
+    torch.npu.synchronize()
+    torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
 
 
 @pytest.mark.parametrize("heads", [1, 2])
@@ -77,7 +133,7 @@ def test_token_counts_reuse_compilation(heads, monkeypatch):
     cache = mxfp_paged_cache_views(raw, blocks, heads, dim, dim, 512)[2]
     expected = raw.cpu()
     slots = torch.arange(max_tokens, dtype=torch.int64) * 7 + 512
-    indices = mxfp_k_scale_slot_index(slots.npu(), 512)
+    device_slots = slots.npu()
     values = torch.arange(max_tokens * heads * 8, dtype=torch.int32).remainder(251).to(torch.uint8)
     values = values.reshape(max_tokens, heads, dim // 64, 2)
     source = values.npu()
@@ -92,7 +148,7 @@ def test_token_counts_reuse_compilation(heads, monkeypatch):
     first_count = None
     for tokens in (1, 2, 31, 32, 33, 63, 64, 65, 129):
         # Prefix slices keep pointer specializations and layout strides fixed.
-        scatter_mxfp_k_scale_cache(source[:tokens], cache, tuple(index[:tokens] for index in indices))
+        scatter_mxfp_k_scale_cache(source[:tokens], cache, device_slots[:tokens])
         torch.npu.synchronize()
         _write_reference(expected, slots[:tokens], values[:tokens], blocks, heads, pitch, 0)
         torch.testing.assert_close(raw.cpu(), expected, rtol=0, atol=0)
@@ -105,8 +161,8 @@ def test_empty_scatter_preserves_cache():
     raw = torch.full((2 * mxfp_packet_size_bytes(1, 512, 256, 256),), 13, dtype=torch.int8, device="npu")
     cache = mxfp_paged_cache_views(raw, 2, 1, 256, 256, 512)[2]
     before = raw.cpu()
-    indices = mxfp_k_scale_slot_index(torch.empty(0, dtype=torch.int64, device="npu"), 512)
-    scatter_mxfp_k_scale_cache(torch.empty((0, 1, 4, 2), dtype=torch.uint8, device="npu"), cache, indices)
+    slots = torch.empty(0, dtype=torch.int32, device="npu")
+    scatter_mxfp_k_scale_cache(torch.empty((0, 1, 4, 2), dtype=torch.uint8, device="npu"), cache, slots)
     torch.testing.assert_close(raw.cpu(), before, rtol=0, atol=0)
 
 
@@ -116,7 +172,7 @@ def test_graph_scatter_preserves_concurrent_transfer_to_unselected_page():
     pitch = mxfp_packet_size_bytes(heads, 512, dim, dim)
     raw = torch.zeros(blocks * pitch, dtype=torch.int8, device="npu")
     cache = mxfp_paged_cache_views(raw, blocks, heads, dim, dim, 512)[2]
-    indices = mxfp_k_scale_slot_index(torch.arange(tokens, dtype=torch.int64, device="npu") * 11 + 512, 512)
+    slots = torch.arange(tokens, dtype=torch.int32, device="npu") * 11 + 512
     source = torch.full((tokens, heads, dim // 64, 2), 120, dtype=torch.uint8, device="npu")
     marker_bytes = 4096
     # The scatter addresses block 1; SDMA writes directly into block 50.
@@ -141,11 +197,11 @@ def test_graph_scatter_preserves_concurrent_transfer_to_unselected_page():
         stream = allocate(acl.rt.create_stream, acl.rt.destroy_stream)
         read_buffer = ctypes.create_string_buffer(marker_bytes)
         for _ in range(2):
-            scatter_mxfp_k_scale_cache(source, cache, indices)
+            scatter_mxfp_k_scale_cache(source, cache, slots)
         torch.npu.synchronize()
         graph = torch.npu.NPUGraph()
         with torch.npu.graph(graph):
-            scatter_mxfp_k_scale_cache(source, cache, indices)
+            scatter_mxfp_k_scale_cache(source, cache, slots)
         for writer_first in (False, True):
             for delay_bytes in (0, 1 << 18, 1 << 20, 1 << 22, 1 << 24):
                 for _ in range(4):
@@ -182,11 +238,11 @@ def test_graph_scatter_preserves_concurrent_transfer_to_unselected_page():
 def test_scatter_preserves_unselected_dense_view_elements():
     cache = torch.full((3, 2, 2, 4, 16, 2), 13, dtype=torch.uint8, device="npu")
     expected = cache.cpu()
-    slots = (torch.tensor([1, 2]), torch.tensor([0, 1]), torch.tensor([3, 9]))
+    slots = torch.tensor([35, 89], dtype=torch.int32, device="npu")
     values = torch.arange(32, dtype=torch.uint8).reshape(2, 2, 4, 2)
     expected[1, :, 0, :, 3, :] = values[0]
     expected[2, :, 1, :, 9, :] = values[1]
-    scatter_mxfp_k_scale_cache(values.npu(), cache, tuple(index.npu() for index in slots))
+    scatter_mxfp_k_scale_cache(values.npu(), cache, slots)
     torch.npu.synchronize()
     torch.testing.assert_close(cache.cpu(), expected, rtol=0, atol=0)
 
@@ -219,8 +275,7 @@ class TestKScaleScatterPadding(TestCase):
 
     def _scatter(self, key_scale, slot_mapping, cache=None):
         cache = self.key_scale_cache if cache is None else cache
-        indices = mxfp_k_scale_slot_index(slot_mapping.npu(), self.block_size)
-        scatter_mxfp_k_scale_cache(key_scale.npu(), cache, indices)
+        scatter_mxfp_k_scale_cache(key_scale.npu(), cache, slot_mapping.npu())
         torch.npu.synchronize()
         return cache.cpu()
 

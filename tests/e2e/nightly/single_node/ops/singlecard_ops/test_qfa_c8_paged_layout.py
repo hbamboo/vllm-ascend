@@ -15,7 +15,6 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
-    mxfp_k_scale_slot_index,
     scatter_mxfp_k_scale_cache,
     scatter_mxfp_pa_nz_kv_cache,
 )
@@ -50,7 +49,7 @@ def test_qfa_strided_scales_match_contiguous_reference(query_tokens, ratio):
     )
     value = torch.randint(0, 112, key.shape, dtype=torch.int8, device=device).view(torch.float8_e4m3fn)
     scatter_mxfp_pa_nz_kv_cache(key, value, caches[0], caches[1], slots)
-    scatter_mxfp_k_scale_cache(key_scale, caches[2], mxfp_k_scale_slot_index(slots, 512))
+    scatter_mxfp_k_scale_cache(key_scale, caches[2], slots)
     fill_mxfp_v_scale_cache(torch.full((256,), 127, dtype=torch.uint8, device=device), caches[3])
     query, query_scale = torch_npu.npu_dynamic_mx_quant(
         torch.randn(query_tokens, 2, 256, dtype=torch.bfloat16, device=device),

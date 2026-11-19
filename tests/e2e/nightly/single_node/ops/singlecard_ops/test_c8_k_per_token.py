@@ -96,11 +96,15 @@ class TestC8KPerTokenNPU(unittest.TestCase):
         v8 = torch_npu.npu_quantize(case.value.flatten(1), case.reciprocal, None, torch.float8_e4m3fn, -1, False)
         v8 = v8.reshape_as(case.value)
         self.helpers.scatter_mxfp_pa_nz_kv_cache(k8, v8, *case.cache[:2], case.slots)
-        self.helpers.scatter_mxfp_k_scale_cache(
-            ks, case.cache[2], self.helpers.mxfp_k_scale_slot_index(case.slots, 512)
-        )
+        self.helpers.scatter_mxfp_k_scale_cache(ks, case.cache[2], case.slots)
         case.impl._forward_mxfp8_attention(
-            q8, qs, case.cache, case.metadata, case.output, sink_logits=getattr(case, "sink_logits", None)
+            q8,
+            qs,
+            case.cache,
+            case.metadata,
+            case.output,
+            sink_query=case.query if hasattr(case, "sink_key") else None,
+            sink_key=getattr(case, "sink_key", None),
         )
         return q8, qs, k8, ks, v8
 
@@ -177,6 +181,7 @@ class TestC8KPerTokenNPU(unittest.TestCase):
             with self.subTest(q_len=q_len):
                 case = self.make_case(q_len)
                 sink_key = torch.randn(128, device="npu", dtype=torch.float32) / 4
+                case.sink_key = sink_key.reshape(1, 128)
                 case.sink_logits = (case.query.float() * sink_key).sum(-1) / math.sqrt(128)
                 quantized = self.run_case(case)
                 torch.npu.synchronize()

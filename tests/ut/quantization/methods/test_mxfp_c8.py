@@ -2,7 +2,6 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import torch
-from torch.utils._python_dispatch import TorchDispatchMode
 
 import vllm_ascend.attention.attention_c8_mxfp as mxfp_kv_cache
 from tests.ut.base import TestBase
@@ -11,7 +10,6 @@ from vllm_ascend.attention.attention_c8_mxfp import (
     fill_mxfp_v_scale_cache,
     mxfp_k_scale_cache_shape,
     mxfp_k_scale_page_bytes,
-    mxfp_k_scale_slot_index,
     mxfp_packet_size_bytes,
     mxfp_paged_cache_views,
     mxfp_v_scale_cache_shape,
@@ -22,28 +20,6 @@ from vllm_ascend.quantization.methods.kv_cache.mxfp_c8 import (
     AscendC8MXFPKVCacheAttentionMethod,
     _quant_weight_loader,
 )
-
-
-class _RecordOps(TorchDispatchMode):
-    """Record the aten ops a block dispatches, views aside.
-
-    Every recorded op is a device kernel on the NPU -- one line in a profile,
-    one node in a captured graph -- whereas views launch nothing.
-    """
-
-    _VIEWS = frozenset(
-        {"view", "_unsafe_view", "reshape", "slice", "select", "expand", "unsqueeze", "squeeze", "alias", "detach"}
-    )
-
-    def __init__(self):
-        super().__init__()
-        self.kernels: list[str] = []
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        name = func.overloadpacket.__name__
-        if name not in self._VIEWS:
-            self.kernels.append(name)
-        return func(*args, **(kwargs or {}))
 
 
 class TestMXFPScaleCacheShapes(TestBase):
@@ -233,18 +209,6 @@ class TestFillMXFPVScaleCache(TestBase):
         # any zero left in the cache is a slot the fill missed.
         _, cache = self._fill(64)
         self.assertTrue(bool((cache != 0).all()))
-
-
-class TestMXFPKScaleSlotIndex(TestBase):
-    def test_slot_index_needs_no_validity_mask(self):
-        slots = torch.tensor([2, 513, -1], dtype=torch.int32)
-        with _RecordOps() as ops:
-            block_ids, seg_ids, frag_ids = mxfp_k_scale_slot_index(slots, 512)
-        self.assertEqual(block_ids.tolist(), [0, 1, 0])
-        self.assertEqual(seg_ids.tolist(), [0, 0, 0])
-        self.assertEqual(frag_ids.tolist(), [2, 1, 0])
-        self.assertEqual([op for op in ops.kernels if op in ("ge", "where", "zeros_like")], [])
-        self.assertLessEqual(len(ops.kernels), 6)
 
 
 class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):

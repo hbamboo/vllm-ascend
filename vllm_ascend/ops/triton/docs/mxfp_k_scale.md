@@ -7,9 +7,10 @@
 - **Formula**: For token `t`, head `h`, scale group `g`, and pair element `p`:
 
   ```text
-  b = block_ids[t]
-  s = segment_ids[t]
-  f = fragment_ids[t]
+  q = max(int64(slot_mapping[t]), 0)
+  b = q // B
+  s = (q % B) // 16
+  f = (q % B) % 16
   cache[b, h, s, g, f, p] = key_scale[t, h, g, p]
 
   destination_offset = b * cache.stride(0)
@@ -20,14 +21,14 @@
                      + p * cache.stride(5)
   ```
 
-  All destination offsets are relative to `cache.data_ptr()`, which already includes the view's storage offset. For a slot `q` and kernel block size `B`, the caller derives `b = q // B`, `s = (q % B) // 16`, and `f = q % 16`.
+  All destination offsets are relative to `cache.data_ptr()`, which already includes the view's storage offset. Slot decomposition runs inside the writer; the caller does not allocate index tensors or launch Cast/Clamp/Div/Mod operations. `B` is derived from the cache's segment and fragment dimensions.
 
 - **Algorithm flow**:
-    1. Return without launching a kernel when the block-index tensor is empty.
+    1. Return without launching a kernel when the slot-mapping tensor is empty.
     2. Reinterpret source scales as uint8 and make the source contiguous. Read head/group counts and all six destination strides from cache metadata.
     3. Launch one Triton program per 256 flattened source bytes, masking elements beyond `T * H * G * 2`.
-    4. Decompose each flattened index into token, head, group, and pair coordinates. Load block/segment/fragment indices using their actual strides.
-    5. Promote address coordinates to int64, calculate the destination offset, and store the unchanged source byte directly. No cache-wide temporary view or writeback is created.
+    4. Decompose each flattened index into token, head, group, and pair coordinates. Load this cache group's raw slot using its actual stride, promote to int64, clamp negative slots to the reserved null slot, and derive block/segment/fragment coordinates.
+    5. Calculate the destination offset in int64 and store the unchanged source byte directly. No index buffers, cache-wide temporary view, or writeback is created.
 - **Supported modes**: Ascend NPU eager execution and ACL graph capture/replay with Triton-Ascend. Hardware validation was performed on 950DT (Ascend A5). Atlas A2, Atlas A3, and 950PR validation is N/A; this document does not establish additional hardware support.
 
 ## Parameters
@@ -38,23 +39,24 @@ All three arguments are required. The Python function returns `None` and updates
 | --- | --- | --- | --- | --- |
 | `key_scale` | Input | Source scales of shape `[T, H, G, 2]`; viewed as raw bytes without numerical conversion | One-byte storage; uint8 and E8M0 views are tested | ND; noncontiguous sources are made contiguous |
 | `cache` | Input/Output | K-scale view of shape `[num_blocks, H, B // 16, G, 16, 2]`, backed by packet-packed KV storage | uint8 | PA_NZ, with explicit six-dimensional strides and an optional storage offset |
-| `slot_index` | Input | Tuple `(block_ids, segment_ids, fragment_ids)`; each tensor has shape `[T]` | int64 in the caller and tests | 1D; each index tensor's stride is used |
+| `slot_mapping` | Input | This cache group's raw token slots, shape `[T]`; negative slots map to null slot 0 | int32 or int64 | 1D; actual slot stride is used |
 | Return value | Output | N/A; the destination view is modified in place | `None` | N/A |
 | `num_elements` | Internal attribute | `T * H * G * 2`; excluded from JIT specialization with `do_not_specialize` | Integer, runtime | Scalar |
 | `num_heads`, `num_groups` | Internal attributes | `H` and `G` | Integer, constexpr | Scalars |
-| Cache and index strides | Internal attributes | Element strides supplied by the input tensor metadata | Integer, constexpr | Scalars |
+| Cache and slot strides | Internal attributes | Element strides supplied by the input tensor metadata | Integer, constexpr | Scalars |
+| `block_tokens`, `token_fragment` | Internal attributes | `cache.shape[2] * cache.shape[4]` and `cache.shape[4]` | Integer, constexpr | Scalars |
 | `BLOCK_SIZE`, `num_warps` | Internal attributes | 256 bytes per program and 4 warps | Integer, compile-time launch settings | Scalars |
 
 ## Constraints
 
-- Source, destination, and all index tensors must reside on the same NPU. CPU inference is not supported by this update path. CPU unit tests mock the Triton entry point; numerical comparisons execute the real kernel on NPU against test-only CPU references.
-- Source shape and element size must satisfy `key_scale.view(torch.uint8).numel() == T * H * G * 2`. The current C8 caller uses `B=512`, `D=256`, and local KV-head counts of 1 or 2. The test allocation may use fewer pages than a model deployment while preserving these model layout dimensions.
+- Source, destination, and the slot tensor must reside on the same NPU. CPU inference is not supported by this update path. CPU unit tests mock the Triton entry point; numerical comparisons execute the real kernel on NPU against test-only CPU references.
+- Source shape and element size must satisfy `key_scale.view(torch.uint8).numel() == T * H * G * 2`. C8 cases use `B=512`, `D=128/256`, and local KV-head counts of 1 or 2. The test allocation may use fewer pages than a model deployment while preserving these model layout dimensions.
 - The cache must be a valid, non-overlapping PA_NZ byte view. Its last dimension is 2 and its token-fragment dimension is 16. Actual page strides may include K/V payloads, V scales, and padding; the kernel uses the supplied strides rather than assuming contiguous pages.
-- Indices must already be valid: `0 <= block_ids < num_blocks`, `0 <= segment_ids < B // 16`, and `0 <= fragment_ids < 16`. The kernel does not clamp or bounds-check their values. The attention caller clamps padded slot `-1` to the reserved null slot before constructing these indices.
+- Nonnegative slots must satisfy `slot < num_blocks * B`; the kernel does not bounds-check them. Negative slots are clamped to reserved null slot 0 inside the writer, preserving the former caller's behavior. Different cache groups retain their own slot mappings even when their dtype, shape, and strides match.
 - Real tokens must not target the same destination element. Padded rows may target the reserved null slot, whose final value is ignored. Deterministic ordering for overlapping writes is N/A.
-- Source and index storage must not overlap the destination writes. Concurrent writers must address disjoint destination bytes. This kernel preserves writes to unselected pages; it does not synchronize competing writes to the same bytes or replace transfer-completion dependencies required by readers.
+- Source and slot storage must not overlap the destination writes. Concurrent writers must address disjoint destination bytes. This kernel preserves writes to unselected pages; it does not synchronize competing writes to the same bytes or replace transfer-completion dependencies required by readers.
 - Byte patterns are preserved exactly, including any non-finite E8M0 encoding already present in the input. Scale validation, saturation, and NaN correction are N/A.
-- Capture and replay keep buffer addresses, shapes, strides, and launch arguments fixed. Values in the captured source/index buffers may change before replay. `num_elements` is a runtime scalar excluded from JIT specialization, so varying token counts between eager calls or separate captures reuses the compiled kernel when other specialization attributes stay fixed. Layout attributes remain compile-time parameters; different layouts can produce different compiled variants.
+- Capture and replay keep buffer addresses, shapes, strides, and launch arguments fixed. Values in the captured source/slot buffers may change before replay; each replay loads and decomposes the current raw slots. `num_elements` is a runtime scalar excluded from JIT specialization, so varying token counts between eager calls or separate captures reuses the compiled kernel when other specialization attributes stay fixed. Layout attributes remain compile-time parameters; different layouts can produce different compiled variants.
 - Address arithmetic uses int64. The caller must still supply valid allocated storage for every destination.
 - Forward inference only; autograd backward support is N/A.
 
@@ -82,11 +84,12 @@ pytest --confcutdir=tests/e2e/nightly/single_node/ops -q \
   tests/e2e/nightly/single_node/ops/singlecard_ops/triton/test_mxfp_k_scale_scatter.py
 ```
 
-The suite defines 58 NPU cases covering:
+The NPU cases cover:
 
 - Model layout dimensions `B=512`, `D=256`, and `H=1/2`, with 1, 64, and 65 token rows. Page padding of 0/256 bytes, storage offsets of 0/4096 bytes, and contiguous/noncontiguous sources yield 48 combinations. Both uint8 and E8M0 source views are exercised, including partial 256-byte programs.
-- Eager and ACL graph replay in each combination, changing source values and slot indices in the captured buffers. The complete raw allocation, including unrelated cache components and padding, is checked against a CPU reference.
-- An empty source/index batch preserving the complete cache allocation.
+- Eager and ACL graph replay in each combination, changing source values and raw slots in the captured buffers. The complete raw allocation, including unrelated cache components and padding, is checked against a CPU reference.
+- Four raw-slot regressions with int32/int64 and contiguous/stride-2 mappings at the current `D=128`, `T=12` decode geometry. Two cache groups use different mappings, negative slots map to 0, and graph replay refreshes both source values and raw slots. A separate regression writes across a packet stride greater than 2 GiB to exercise int64 destination offsets. These new cases require NPU validation after the slot-fusion change.
+- An empty source/slot batch preserving the complete cache allocation.
 - Six migrated numerical cases: preservation of unselected elements in a dense view; valid/padded slots; all-padding batches; real tokens alongside padding; prefill equivalence to the former read-modify-write reference; and padded-decode equivalence outside the null slot. The null-slot cases use `D=64` and `H=2`; reference writes remain test-only on CPU.
 - Two compilation-reuse cases with `H=1/2`, checking byte-exact results at token counts 1, 2, 31, 32, 33, 63, 64, 65, and 129. Prefix slices keep buffer addresses and strides fixed, and a JIT compilation hook verifies that changing only the token count does not trigger further compilation after the first call.
 - An independently scheduled ACL SDMA transfer of a 4096-byte marker into an unselected page during graph replay. Two submission orders, five delays, and four repetitions exercise 40 interleavings. The scatter addresses block 1 and the transfer addresses block 50.
@@ -99,7 +102,7 @@ CPU dispatch tests remain in the unit-test suite with a mocked Triton entry poin
 pytest -q tests/ut/attention/test_mxfp_k_scale_scatter.py
 ```
 
-Those tests verify a single delegation without inspecting the cache device and an empty-batch return without importing the kernel or accessing cache storage. Numerical cache writes, padding behavior, and concurrent-transfer preservation are tested on NPU.
+Those tests verify a single delegation without inspecting the cache device, an empty-batch return without importing the kernel or accessing cache storage, and separate raw group mappings through the SWA cache-write path. Numerical cache writes, padding behavior, and concurrent-transfer preservation are tested on NPU.
 
 ## Example
 
@@ -110,7 +113,6 @@ import torch
 import torch_npu  # noqa: F401
 
 from vllm_ascend.attention.attention_c8_mxfp import (
-    mxfp_k_scale_slot_index,
     mxfp_packet_size_bytes,
     mxfp_paged_cache_views,
 )
@@ -121,12 +123,13 @@ pitch = mxfp_packet_size_bytes(heads, block_size, dim, dim)
 raw = torch.zeros(blocks * pitch, dtype=torch.int8, device="npu")
 cache = mxfp_paged_cache_views(raw, blocks, heads, dim, dim, block_size)[2]
 slots = torch.tensor([512, 527, 528, 1023], dtype=torch.int64, device="npu")
-indices = mxfp_k_scale_slot_index(slots, block_size)
 values = torch.full((4, heads, dim // 64, 2), 120, dtype=torch.uint8, device="npu")
 
-scatter_k_scales(values, cache, indices)
+scatter_k_scales(values, cache, slots)
 torch.npu.synchronize()
-block_ids, segment_ids, fragment_ids = (index.cpu() for index in indices)
+safe_slots = slots.cpu().clamp(min=0)
+block_ids = safe_slots // block_size
+segment_ids, fragment_ids = safe_slots % block_size // 16, safe_slots % 16
 actual = cache.cpu()[block_ids, :, segment_ids, :, fragment_ids, :]
 torch.testing.assert_close(actual, values.cpu(), rtol=0, atol=0)
 ```

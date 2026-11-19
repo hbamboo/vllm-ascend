@@ -10,9 +10,7 @@ from vllm.triton_utils import tl, triton
 def _scatter_k_scale_kernel(
     source,
     cache,
-    block_ids,
-    segment_ids,
-    fragment_ids,
+    slot_mapping,
     num_elements,
     num_heads: tl.constexpr,
     num_groups: tl.constexpr,
@@ -22,9 +20,9 @@ def _scatter_k_scale_kernel(
     group_stride: tl.constexpr,
     fragment_stride: tl.constexpr,
     pair_stride: tl.constexpr,
-    block_index_stride: tl.constexpr,
-    segment_index_stride: tl.constexpr,
-    fragment_index_stride: tl.constexpr,
+    slot_stride: tl.constexpr,
+    block_tokens: tl.constexpr,
+    token_fragment: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
     index = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
@@ -33,9 +31,14 @@ def _scatter_k_scale_kernel(
     head = index // (num_groups * 2) % num_heads
     group = index // 2 % num_groups
     pair = index % 2
-    block = tl.load(block_ids + token * block_index_stride, mask=valid, other=0).to(tl.int64)
-    segment = tl.load(segment_ids + token * segment_index_stride, mask=valid, other=0).to(tl.int64)
-    fragment = tl.load(fragment_ids + token * fragment_index_stride, mask=valid, other=0).to(tl.int64)
+    # Keep slot decomposition in this writer instead of launching six tensor
+    # operations per cache group. Padding retains the reserved null-slot write.
+    slot = tl.load(slot_mapping + token.to(tl.int64) * slot_stride, mask=valid, other=0).to(tl.int64)
+    slot = tl.maximum(slot, 0)
+    block = slot // block_tokens
+    offset_in_block = slot % block_tokens
+    segment = offset_in_block // token_fragment
+    fragment = offset_in_block % token_fragment
     offset = (
         block * block_stride
         + head.to(tl.int64) * head_stride
@@ -51,30 +54,27 @@ def _scatter_k_scale_kernel(
 def scatter_k_scales(
     key_scale: torch.Tensor,
     cache: torch.Tensor,
-    slot_index: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    slot_mapping: torch.Tensor,
 ) -> None:
     """Update only the addressed token/head/group bytes of a PA_NZ view."""
-    block_ids, segment_ids, fragment_ids = slot_index
-    if block_ids.numel() == 0:
+    if slot_mapping.numel() == 0:
         return
     num_heads, num_groups = cache.shape[1], cache.shape[3]
     source = key_scale.view(torch.uint8).contiguous()
-    assert source.numel() == block_ids.numel() * num_heads * num_groups * 2
+    assert source.numel() == slot_mapping.numel() * num_heads * num_groups * 2
     num_elements = source.numel()
     block_size = 256
     _scatter_k_scale_kernel[(triton.cdiv(num_elements, block_size),)](
         source,
         cache,
-        block_ids,
-        segment_ids,
-        fragment_ids,
+        slot_mapping,
         num_elements,
         num_heads,
         num_groups,
         *cache.stride(),
-        block_ids.stride(0),
-        segment_ids.stride(0),
-        fragment_ids.stride(0),
+        slot_mapping.stride(0),
+        cache.shape[2] * cache.shape[4],
+        cache.shape[4],
         BLOCK_SIZE=block_size,
         num_warps=4,
     )

@@ -485,32 +485,10 @@ def fill_mxfp_v_scale_cache(value_scale: torch.Tensor, value_scale_cache: torch.
     value_scale_cache.copy_(value_scale.view(num_kv_heads, v_dim_frags, 1, v_dim_frag_size, 1))
 
 
-def mxfp_k_scale_slot_index(
-    slot_mapping: torch.Tensor,
-    block_size: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Decompose slots into the index tensors the K-scale scatter indexes with.
-
-    Returns ``(block_ids, seg_ids, frag_ids)`` for the PA_NZ K-scale cache,
-    where a token at in-block offset ``o`` lands at
-    ``[block, n, o // 16, :, o % 16, :]``. Derived once per step and shared
-    across layers (capture-safe for the same reason as the other per-step
-    quantities; see ``_qfa_k_scale_slot_index``).
-
-    Padded rows (slot -1) are clamped to slot 0, keeping the shapes static
-    for graph capture; slot 0 is the null block's, see
-    scatter_mxfp_k_scale_cache.
-    """
-    safe_slots = slot_mapping.to(torch.long).clamp(min=0)
-    block_ids = safe_slots // block_size
-    offsets = safe_slots % block_size
-    return block_ids, offsets // MXFP_K_SCALE_NZ_TOKEN_FRAG, offsets % MXFP_K_SCALE_NZ_TOKEN_FRAG
-
-
 def scatter_mxfp_k_scale_cache(
     key_scale: torch.Tensor,
     key_scale_cache: torch.Tensor,
-    slot_index: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
+    slot_mapping: torch.Tensor,
 ) -> None:
     """Scatter per-token K scales into the paged K-scale cache.
 
@@ -519,22 +497,21 @@ def scatter_mxfp_k_scale_cache(
     ``key_scale_cache`` shape (PA_NZ): ``[num_blocks, num_kv_heads,
     block_size // 16, head_dim // 64, 16, 2]``.
 
-    ``slot_index`` comes from :func:`mxfp_k_scale_slot_index` and is shared
-    across the step's layers; only the write below is per-layer. Capture
-    safe: no host-device sync and no data-dependent shapes.
+    The writer reads this cache group's raw ``slot_mapping`` and decomposes
+    addresses in-kernel. Capture safe: no host-device sync or index tensors.
 
-    Padded rows arrive clamped to slot 0 and are simply written there: slot 0
+    Padded rows are clamped to slot 0 in-kernel and written there: slot 0
     belongs to block 0, the null block BlockPool never hands to a request, so
     only dummy padding requests (whose output is discarded) read it back.
     """
-    if slot_index[0].numel() == 0:
+    if slot_mapping.numel() == 0:
         return
 
     # NPU IndexPut can copy back this strided view, overwriting asynchronous
     # KV transfers to other requests' cache pages. Write only addressed bytes.
     from vllm_ascend.ops.triton.mxfp_k_scale import scatter_k_scales
 
-    scatter_k_scales(key_scale, key_scale_cache, slot_index)
+    scatter_k_scales(key_scale, key_scale_cache, slot_mapping)
 
 
 class AscendC8MXFPAttentionBackend(AscendAttentionBackend):
@@ -718,22 +695,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             cache["lengths"] = lengths
         return lengths
 
-    def _qfa_k_scale_slot_index(
-        self, attn_metadata: AscendMetadata, slot_mapping: torch.Tensor, block_size: int
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        """Return this step's K-scale slot decomposition, derived once.
-
-        Same story as _qfa_step_lengths: six device ops over slot_mapping
-        that every layer used to repeat, cached inside the captured region so
-        replay re-derives them exactly once.
-        """
-        cache = self._qfa_step_cache(attn_metadata)
-        slot_index = cache.get("k_scale_slots")
-        if slot_index is None:
-            slot_index = mxfp_k_scale_slot_index(slot_mapping, block_size)
-            cache["k_scale_slots"] = slot_index
-        return slot_index
-
     def _get_qfa_metadata(
         self,
         attn_metadata: AscendMetadata,
@@ -850,7 +811,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         layout_q_descale: str,
         num_tokens: int,
         output: torch.Tensor,
-        sink_logits: torch.Tensor | None = None,
+        sink_query: torch.Tensor | None = None,
+        sink_key: torch.Tensor | None = None,
     ) -> torch.Tensor:
         key, value, key_scale, value_scale = kv_cache
         # The K/V caches are already the packet-packed PA_NZ 5-D strided
@@ -897,28 +859,32 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_q_descale=layout_q_descale,
             layout_kv=QFA_LAYOUT_PA_NZ,
             layout_out=QFA_LAYOUT_TND,
-            return_softmax_lse=sink_logits is not None,
+            return_softmax_lse=sink_key is not None,
         )
         # return_softmax_lse=False yields an empty LSE tensor in the
         # cann_ops flavor; tolerate both tuple and single-tensor returns.
         attn_output = result[0] if isinstance(result, tuple) else result
         attn_output = attn_output.view(num_tokens, self.num_heads, self.head_size)
-        if sink_logits is not None:
-            # Learned-key sink correction, ported from the FIA path in
-            # vllm_ascend.models.iquest_q1.attention: the sink is an
-            # always-visible entry with a zero value, so it only changes the
-            # softmax denominator. QFA's LSE carries the same ln(sum exp
-            # (scaled logits)) convention as FIA's, but is HEAD-major
-            # ((H, T)) -- verified empirically (single-block probe: max
-            # |lse - ln| = 3e-3 under (H, T) vs 3e-1 under (T, H), identical
-            # for the TND and N2TGD kernels), unlike FIA's token-major
-            # (T, Q_N, 1). Transpose to token-major (T, H, 1) to match
-            # sink_logits.
-            lse = result[1].reshape(-1).view(self.num_heads, num_tokens)
-            lse = lse.t().reshape(num_tokens, self.num_heads, 1)
-            factor = torch.sigmoid(-(sink_logits.unsqueeze(-1) - lse.float()))
-            attn_output = (attn_output.float() * factor).to(attn_output.dtype)
-        output[:num_tokens] = attn_output
+        if sink_key is not None:
+            from vllm_ascend.ops.triton.sink import qfa_sink_apply_triton
+
+            # QFA LSE is head-major [H, T]. Fuse the raw BF16 Q dot product
+            # and FP32 sigmoid correction directly into the output store.
+            qfa_sink_apply_triton(
+                sink_query,
+                None,
+                attn_output,
+                result[1],
+                sink_key,
+                self.scale,
+                num_tokens,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_size,
+                output,
+            )
+        else:
+            output[:num_tokens] = attn_output
         return output
 
     def _forward_mxfp8_attention(
@@ -928,7 +894,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         kv_cache: tuple[torch.Tensor, ...],
         attn_metadata: AscendMetadata,
         output: torch.Tensor,
-        sink_logits: torch.Tensor | None = None,
+        sink_query: torch.Tensor | None = None,
+        sink_key: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """One QFA call per step for the whole batch (decode + prefill alike).
 
@@ -1007,7 +974,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_q_descale=layout_q_descale,
             num_tokens=num_tokens,
             output=output,
-            sink_logits=sink_logits,
+            sink_query=sink_query,
+            sink_key=sink_key,
         )
 
     # KV cache writes happen in reshape_and_cache(), invoked from forward()
@@ -1050,9 +1018,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             )
             notify_kv_cache_written()
             return
-        # 5-D PA_NZ packet-packed views: (kernel_blocks, N, D//32, Bs, 32).
-        block_size = key_cache.shape[3]
-
         # Scatter the K/V payloads through the strided packet views; the
         # operator's tiling consumes the dim0 stride as the block stride.
         scatter_mxfp_pa_nz_kv_cache(
@@ -1069,7 +1034,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             # Byte view: index_put_ on float8 falls back to AICPU.
             key_scale.view(torch.uint8) if key_scale.dtype != torch.uint8 else key_scale,
             kv_cache[2],
-            self._qfa_k_scale_slot_index(attn_metadata, slot_mapping, block_size),
+            slot_mapping,
         )
         notify_kv_cache_written()
 
@@ -1261,22 +1226,13 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # value, so it only rescales the softmax denominator. QFA owns the
         # cache read, so request its LSE and fold the correction in _run_qfa
         # (same formula as the FIA path in vllm_ascend.models.iquest_q1.
-        # attention). sink_logit = scale * (q . sink_k[kv head]) on the raw
-        # bf16 query, computed before dynamic quantization.
+        # attention). The fused correction uses the raw BF16 query and
+        # computes sink_logit = scale * (q . sink_k[kv head]) in FP32.
         # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
         # LSE convention).
         sink_key = getattr(layer, "sink_key", None)
         if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
             sink_key = None
-        sink_logits = None
-        if sink_key is not None:
-            num_actual_tokens = attn_metadata.num_actual_tokens
-            group = self.num_heads // self.num_kv_heads
-            q = query[:num_actual_tokens].reshape(num_actual_tokens, self.num_kv_heads, group, self.head_size)
-            sink_logits = ((q.float() * sink_key.float().unsqueeze(1)).sum(-1) * self.scale).reshape(
-                num_actual_tokens, self.num_heads
-            )
-
         record_attention_compute_start()
 
         query_mxfp8, query_scale = torch_npu.npu_dynamic_mx_quant(
@@ -1313,5 +1269,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # PA_NZ: QFA reads the packet-packed strided cache views directly
         # (built once at allocation) -- no transpose, no storage copy.
         return self._forward_mxfp8_attention(
-            query_mxfp8, query_scale, kv_cache, attn_metadata, output, sink_logits=sink_logits
+            query_mxfp8,
+            query_scale,
+            kv_cache,
+            attn_metadata,
+            output,
+            sink_query=query[: attn_metadata.num_actual_tokens] if sink_key is not None else None,
+            sink_key=sink_key,
         )

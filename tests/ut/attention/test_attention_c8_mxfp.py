@@ -243,44 +243,6 @@ class TestC8MXFPPerStepDerivations(TestBase):
         self.assertEqual(refreshed[1].tolist(), [11, 21])
         self.assertEqual(first[0].tolist(), [0, 4, 8])
 
-    def test_k_scale_slot_index_is_derived_once_per_step(self):
-        slots = torch.tensor([2, 5, -1], dtype=torch.int64)
-        first = self.impl._qfa_k_scale_slot_index(self.attn_metadata, slots, 4)
-        second = self.impl._qfa_k_scale_slot_index(self.attn_metadata, slots, 4)
-        for a, b in zip(first, second):
-            self.assertIs(a, b)
-
-    def test_k_scale_slot_index_decomposes_slots(self):
-        # block_size 4, K-scale token fragment 16: slot 5 -> block 1,
-        # offset 1 -> segment 0, fragment 1. The padded row clamps to slot 0,
-        # the null block's, which keeps every shape static without a mask.
-        slots = torch.tensor([2, 5, -1], dtype=torch.int64)
-        block_ids, seg_ids, frag_ids = self.impl._qfa_k_scale_slot_index(self.attn_metadata, slots, 4)
-        self.assertEqual(block_ids.tolist(), [0, 1, 0])
-        self.assertEqual(seg_ids.tolist(), [0, 0, 0])
-        self.assertEqual(frag_ids.tolist(), [2, 1, 0])
-
-    def test_shared_lengths_do_not_share_group_slot_mappings(self):
-        shared = {}
-        first_metadata = SimpleNamespace(qfa_shared_metadata_cache=shared)
-        second_metadata = SimpleNamespace(qfa_shared_metadata_cache=shared)
-        slots = torch.tensor([[2, 5, -1], [6, 9, -1]], dtype=torch.int64)
-        first = self.impl._qfa_k_scale_slot_index(first_metadata, slots[0], 4)
-        second = self.impl._qfa_k_scale_slot_index(second_metadata, slots[1], 4)
-        self.assertIsNot(first[0], second[0])
-        self.assertEqual(first[0].tolist(), [0, 1, 0])
-        self.assertEqual(second[0].tolist(), [1, 2, 0])
-        self.assertIsNot(first_metadata.qfa_metadata_cache, second_metadata.qfa_metadata_cache)
-
-    def test_the_two_derivations_do_not_collide_in_the_step_cache(self):
-        lengths = self.impl._qfa_step_lengths(self.attn_metadata, 8)
-        slots = self.impl._qfa_k_scale_slot_index(self.attn_metadata, torch.tensor([2, 5, -1], dtype=torch.int64), 4)
-        self.assertIs(self.impl._qfa_step_lengths(self.attn_metadata, 8)[0], lengths[0])
-        self.assertIs(
-            self.impl._qfa_k_scale_slot_index(self.attn_metadata, torch.tensor([2, 5, -1], dtype=torch.int64), 4)[0],
-            slots[0],
-        )
-
 
 class TestC8MXFPQfaMetadataPlan(TestBase):
     """One AICPU metadata plan a step, capture included.

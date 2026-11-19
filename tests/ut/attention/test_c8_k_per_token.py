@@ -4,11 +4,12 @@
 
 import ast
 import math
+import sys
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -163,6 +164,76 @@ class TestPerTokenKey(unittest.TestCase):
                     self.assertNotIn("block_size", quantizer.call_args_list[1].kwargs)
                 self.assertIs(value_quantizer.call_args.args[1], layer.v_cache_scale_float_reciprocal)
                 self.assertEqual(impl.reshape_and_cache.call_args.args[0].shape, (3, 1, 128))
+
+    def test_forward_passes_unquantized_query_to_sink(self):
+        impl = self.helpers.AscendC8MXFPAttentionBackendImpl()
+        impl.vllm_config = SimpleNamespace(kv_transfer_config=None)
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 6, 1, 128
+        impl._forward_mxfp8_attention = MagicMock()
+        query = torch.randn(4, 6, 256, dtype=torch.bfloat16)[..., ::2]
+        sink = torch.randn(1, 128, dtype=torch.bfloat16)
+        impl.forward(
+            SimpleNamespace(sink_key=sink),
+            query,
+            None,
+            None,
+            tuple(object() for _ in range(4)),
+            SimpleNamespace(num_actual_tokens=3),
+            torch.empty(3, 6, 128),
+        )
+        passed = impl._forward_mxfp8_attention.call_args.kwargs
+        self.assertIs(passed["sink_key"], sink)
+        self.assertEqual(passed["sink_query"].data_ptr(), query.data_ptr())
+        torch.testing.assert_close(passed["sink_query"], query[:3], rtol=0, atol=0)
+
+    def test_qfa_sink_fuses_raw_query_and_writes_output_directly(self):
+        impl = self.helpers.AscendC8MXFPAttentionBackendImpl()
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 6, 1, 128
+        impl.scale, impl.sliding_window = 128**-0.5, 4096
+        query = torch.randn(3, 6, 128, dtype=torch.bfloat16)
+        sink = torch.randn(1, 128, dtype=torch.bfloat16)
+        attention = torch.ones_like(query)
+        lse = torch.zeros(6, 3)
+        qfa = MagicMock(return_value=(attention, lse))
+        fused = MagicMock(side_effect=lambda *args: args[10][:3].fill_(2))
+        with patch.dict(
+            sys.modules,
+            {
+                "cann_ops_transformer.ops": SimpleNamespace(quant_flash_attn=qfa),
+                "vllm_ascend.ops.triton.sink": SimpleNamespace(qfa_sink_apply_triton=fused),
+            },
+        ):
+            for has_sink in (False, True):
+                with self.subTest(has_sink=has_sink):
+                    output = torch.full((4, 6, 128), -7, dtype=torch.bfloat16)
+                    result = impl._run_qfa(
+                        query.to(torch.float8_e4m3fn),
+                        torch.full((3, 6, 2, 2), 127, dtype=torch.uint8),
+                        (None, None, torch.zeros(1, dtype=torch.uint8), torch.zeros(1, dtype=torch.uint8)),
+                        SimpleNamespace(block_tables=None),
+                        cu_seqlens_q=torch.tensor([3], dtype=torch.int32),
+                        seqused_kv=torch.tensor([3], dtype=torch.int32),
+                        qfa_metadata=None,
+                        max_seqlen_q=3,
+                        mask_mode=0,
+                        layout_q_descale="TND",
+                        num_tokens=3,
+                        output=output,
+                        sink_query=query if has_sink else None,
+                        sink_key=sink if has_sink else None,
+                    )
+                    self.assertIs(result, output)
+                    self.assertEqual(qfa.call_args.kwargs["return_softmax_lse"], has_sink)
+                    torch.testing.assert_close(output[:3], torch.full_like(query, 2 if has_sink else 1))
+                    self.assertTrue(torch.all(output[3] == -7))
+                    if has_sink:
+                        self.assertIs(fused.call_args.args[0], query)
+                        self.assertIsNone(fused.call_args.args[1])
+                        self.assertIs(fused.call_args.args[3], lse)
+                        self.assertIs(fused.call_args.args[4], sink)
+                        self.assertIs(fused.call_args.args[10], output)
+                    else:
+                        fused.assert_not_called()
 
     def test_dynamic_v_scatter_and_decode_preserve_history(self):
         def scatter(cache, indices, payload):
