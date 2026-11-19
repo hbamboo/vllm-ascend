@@ -975,7 +975,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
-        query_scale, layout_q_descale = self._qfa_query_scale_for_layout(query_scale, max_seqlen_q)
+        if self.sliding_window is not None:
+            # The delivered N2TGD decode template rounds the left boundary
+            # to a KV tile. TND enforces the exact per-token SWA boundary.
+            layout_q_descale = QFA_LAYOUT_TND
+        else:
+            query_scale, layout_q_descale = self._qfa_query_scale_for_layout(query_scale, max_seqlen_q)
 
         qfa_metadata = self._get_qfa_metadata(
             attn_metadata,
