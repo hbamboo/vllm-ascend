@@ -2767,6 +2767,26 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dyna
         assert view.untyped_storage().data_ptr() == raw.untyped_storage().data_ptr()
 
 
+@pytest.mark.parametrize("window", [None, 4096])
+def test_allocate_c8_full_and_sliding_raw_packets(monkeypatch, window):
+    kwargs = dict(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.float8_e4m3fn)
+    spec = FullAttentionSpec(**kwargs) if window is None else SlidingWindowSpec(**kwargs, sliding_window=window)
+    spec = mxfp_cache_spec(spec)
+    config = _c8_mxfp_vllm_config()
+    config.kv_transfer_config = None
+    cache_config = KVCacheConfig(
+        num_blocks=2,
+        kv_cache_tensors=[_make_kv_cache_tensor(2 * spec.page_size_bytes, ["attn"], spec.page_size_bytes)],
+        kv_cache_groups=[KVCacheGroupSpec(layer_names=["attn"], kv_cache_spec=spec)],
+    )
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)
+    raw = attn_utils._allocate_kv_cache(cache_config, shared_layers={}, device=torch.device("cpu"))["attn"]
+    assert isinstance(raw, torch.Tensor)
+    assert raw.numel() == 2 * spec.page_size_bytes
+
+
 def test_reshape_kv_cache_v2_rejects_split_c8_raw(monkeypatch):
     spec = mxfp_cache_spec(_plain_full_attention_spec())
     layer_name = "attn"

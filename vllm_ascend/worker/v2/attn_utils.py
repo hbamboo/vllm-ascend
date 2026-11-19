@@ -1380,6 +1380,11 @@ def _allocate_kv_cache(
             k_size = kv_cache_tensor_size
             for layer_name in shared_names:
                 kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(k_size, alignment, device)
+        elif is_mxfp_cache_spec(example_spec):
+            # Full and SWA QFA caches both store K/V and scales in one packet.
+            for layer_name in shared_names:
+                layer_size = kv_cache_config.num_blocks * layer_kv_cache_spec[layer_name].page_size_bytes
+                kv_cache_raw_tensors[layer_name] = _allocate_int8_cache_tensor(layer_size, alignment, device)
         elif type(example_spec) is FullAttentionSpec and not enable_sfa(vllm_config):
             for layer_name in shared_names:
                 layer_spec = layer_kv_cache_spec[layer_name]
