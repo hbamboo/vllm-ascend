@@ -4317,7 +4317,9 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
     def test_every_c8_mxfp_layer_is_filled(self):
         layers = {f"layer.{i}": self._c8_layer() for i in range(3)}
         kv_caches = {name: self._c8_cache() for name in layers}
-        self._runner(layers)._fill_c8_mxfp_v_scale_caches(kv_caches)
+        runner = self._runner(layers)
+        runner.ascend_config.c8_q_quant_mode = "per_token_head"
+        runner._fill_c8_mxfp_v_scale_caches(kv_caches)
         for name, layer in layers.items():
             self.assertEqual(
                 kv_caches[name][3][0, :, :, 0, :, 0].reshape(-1).tolist(),
@@ -4348,6 +4350,8 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
                 runner = self._runner({"attn": self._c8_layer()})
                 runner.ascend_config.c8_q_quant_mode = q_mode
                 runner.ascend_config.c8_v_quant_mode = v_mode
+                runner.compilation_config.static_forward_context["attn"].impl.q_quant_mode = q_mode
+                runner.compilation_config.static_forward_context["attn"].impl.v_quant_mode = v_mode
                 page_v_scale = torch.zeros((self.NUM_BLOCKS, self.NUM_KV_HEADS), dtype=torch.float32)
                 runner._fill_c8_mxfp_v_scale_caches({"attn": (MagicMock(), MagicMock(), MagicMock(), page_v_scale)})
                 self.assertEqual(runner._c8_mxfp_v_scale_caches, [])

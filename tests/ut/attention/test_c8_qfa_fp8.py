@@ -151,7 +151,7 @@ class TestQfaSlidingPlans(unittest.TestCase):
                         self.assertEqual(call["mask_mode"], expected_mask)
                         self.assertEqual(call["win_left"], window - 1 if window else -1)
                         self.assertEqual(call["win_right"], 0 if window else -1)
-                        self.assertEqual(call["layout_q_descale"], "N2TGD" if q_len == 1 else "TND")
+                        self.assertEqual(call["layout_q_descale"], "N2TGD" if 6 * q_len <= 80 else "TND")
                 self.assertEqual(native.quant_flash_attn_metadata.call_count, 3)
                 for call, window in zip(native.quant_flash_attn_metadata.call_args_list, (None, 4, 7)):
                     self.assertEqual(call.args[3], 1)

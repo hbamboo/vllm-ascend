@@ -683,6 +683,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     enable_hamming_sparse: bool = False
     k_quant_mode: str = "per_token_group"
     q_quant_mode: str = "per_token_group"
+    v_quant_mode: str = "per_channel"
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata) -> dict:
         cache = getattr(attn_metadata, "qfa_metadata_cache", None)

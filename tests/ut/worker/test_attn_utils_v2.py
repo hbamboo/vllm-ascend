@@ -2714,6 +2714,9 @@ def test_reshape_kv_cache_v2_builds_c8_mxfp_views(monkeypatch, head_size_v, dyna
     if q_mode is not None:
         config.additional_config["c8_q_quant_mode"] = q_mode
         config.additional_config["c8_v_quant_mode"] = "per_head" if q_mode == "per_token" else "per_channel"
+    config.compilation_config = SimpleNamespace(
+        static_forward_context={layer_name: SimpleNamespace(impl=SimpleNamespace(q_quant_mode=q_mode))}
+    )
     monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
     monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _cfg: False)
     monkeypatch.setattr(attn_utils, "enable_sfa", lambda _cfg: False)

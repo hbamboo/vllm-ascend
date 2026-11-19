@@ -1663,6 +1663,8 @@ def test_fill_c8_mxfp_v_scale_caches_fills_and_registers():
     v_scale = torch.zeros(mxfp_v_scale_cache_shape(2, 128, 2, 64), dtype=torch.uint8)
     layer.kv_cache = (MagicMock(), MagicMock(), MagicMock(), v_scale)
     runner = _c8_mxfp_runner({"attn": layer})
+    # Global mode describes full attention; this SWA layer still uses E8M0.
+    runner.ascend_config.c8_q_quant_mode = "per_token_head"
 
     runner._fill_c8_mxfp_v_scale_caches()
 
@@ -1691,6 +1693,8 @@ def test_fill_c8_mxfp_v_scale_caches_skips_qfa_fp32_page_tags(q_mode, v_mode):
     runner = _c8_mxfp_runner({"attn": layer})
     runner.ascend_config.c8_q_quant_mode = q_mode
     runner.ascend_config.c8_v_quant_mode = v_mode
+    layer.impl.q_quant_mode = q_mode
+    layer.impl.v_quant_mode = v_mode
     runner._fill_c8_mxfp_v_scale_caches()
     assert runner._c8_mxfp_v_scale_caches == []
     assert torch.all(page_v_scale == 0)
