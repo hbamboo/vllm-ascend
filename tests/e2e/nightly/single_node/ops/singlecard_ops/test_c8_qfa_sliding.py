@@ -22,7 +22,7 @@ class TestQfaSlidingNPU(unittest.TestCase):
         root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
         loaders = runpy.run_path(str(Path(__file__).with_name("test_c8_qfa_fp8.py")))
         cls.helpers, _ = loaders["load_qfa_helpers"]()
-        loaders["load_triton_helper"](root, "mxfp_k_scale_scatter")
+        loaders["load_triton_helper"](root, "mxfp_k_scale")
 
     def make_case(self, q_len, window, kv_len=1025):
         torch.manual_seed(42)
@@ -114,6 +114,24 @@ class TestQfaSlidingNPU(unittest.TestCase):
                 torch.npu.synchronize()
                 torch.testing.assert_close(case.output.cpu(), self.reference(case), rtol=0.03, atol=0.005)
                 print("SWA_PASS", q_len, window, kv_len, flush=True)
+
+    def test_window_includes_exactly_window_tokens(self):
+        case = self.make_case(1, 128)
+        case.query.zero_()
+        case.value.zero_()
+        case.value[-129, :, 0] = 64  # Immediately outside the window.
+        case.value[-128, :, 0] = 32  # First included token.
+        case.value[-1, :, 0] = 16
+        key8, _ = torch_npu.npu_dynamic_mx_quant(case.key, dst_type=torch.float8_e4m3fn)
+        value8 = torch_npu.npu_quantize(
+            case.value.flatten(1), case.layer.v_cache_scale_float_reciprocal, None, torch.float8_e4m3fn, -1, False
+        ).reshape_as(case.value)
+        self.helpers.scatter_mxfp_pa_nz_kv_cache(key8, value8, case.cache[0], case.cache[1], case.metadata.slot_mapping)
+        self.run_case(case)
+        torch.npu.synchronize()
+        expected = torch.zeros_like(case.output.cpu())
+        expected[:, :, 0] = 48 / 128
+        torch.testing.assert_close(case.output.cpu(), expected, rtol=0.01, atol=0.002)
 
     def test_graph_refreshes_query_and_visible_lengths(self):
         case = self.make_case(6, 300)
