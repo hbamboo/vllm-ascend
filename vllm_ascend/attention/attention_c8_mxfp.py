@@ -961,6 +961,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         query_mxfp8, query_scale = torch_npu.npu_dynamic_mx_quant(
             query[: attn_metadata.num_actual_tokens],
             dst_type=torch.float8_e4m3fn,
+            scale_alg=1
         )
 
         # KV-sharing consumer layers reuse another layer's cache; writing
@@ -970,6 +971,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             key_mxfp8, key_scale = torch_npu.npu_dynamic_mx_quant(
                 key[: attn_metadata.num_actual_tokens],
                 dst_type=torch.float8_e4m3fn,
+                scale_alg=1
             )
 
             original_value_shape = value.shape
