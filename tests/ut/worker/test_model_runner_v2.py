@@ -1675,6 +1675,19 @@ def test_fill_c8_mxfp_v_scale_caches_fills_and_registers():
     assert not hasattr(runner, "kv_block_zeroer")
 
 
+@pytest.mark.parametrize("same_scale", [False, True])
+def test_fill_c8_mxfp_v_scale_caches_deduplicates_equal_shared_views(same_scale):
+    first, second = _c8_mxfp_layer(), _c8_mxfp_layer()
+    if not same_scale:
+        second.v_cache_scale.add_(1)
+    cache = torch.zeros(mxfp_v_scale_cache_shape(2, 128, 2, 64), dtype=torch.uint8)
+    first.kv_cache = second.kv_cache = (MagicMock(), MagicMock(), MagicMock(), cache)
+    runner = _c8_mxfp_runner({"first": first, "second": second})
+    runner._fill_c8_mxfp_v_scale_caches()
+    assert len(runner._c8_mxfp_v_scale_caches) == (1 if same_scale else 2)
+    assert torch.equal(cache[0, :, :, 0, :, 0].reshape(-1), second.v_cache_scale)
+
+
 def test_fill_c8_mxfp_v_scale_caches_skips_non_c8_layers():
     layer = SimpleNamespace(impl=object(), kv_cache=(MagicMock(), MagicMock()))
     runner = _c8_mxfp_runner({"plain": layer})
