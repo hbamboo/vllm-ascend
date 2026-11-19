@@ -55,7 +55,7 @@ def load_qfa_helpers():
     scatter_spec.loader.exec_module(scatter)
     ops.scatter_pa_kv_cache_with_k_scale = scatter.scatter_pa_kv_cache_with_k_scale
     sys.modules[ops.__name__] = ops
-    for name in ("qfa_v_head_scale", "sink"):
+    for name in ("qfa_v_head_scale", "qfa_kv_scatter", "sink"):
         load_triton_helper(root, name)
     return helpers, native
 
@@ -341,6 +341,37 @@ class TestC8QFAFP8NPU(unittest.TestCase):
                 shared_output = torch.empty_like(case.output)
                 consumer.forward(case.layer, case.query, None, None, case.cache, case.metadata, output=shared_output)
                 torch.testing.assert_close(shared_output, case.output, rtol=0, atol=0)
+
+    def test_token_head_static_v_scatter_above_4gib(self):
+        case = self.make_case(6, 256, kv_heads=2, static_per_channel=True, kv_len=6)
+        pages = (5 * 1024**3) // case.pitch
+        raw = torch.zeros(pages * case.pitch, dtype=torch.int8, device="npu")
+        case.cache = self.helpers.qfa_fp8_cache_views(raw, pages, case.spec, 128, page_stride_bytes=case.pitch)
+        outputs = []
+        key8, key_scale = torch_npu.npu_dynamic_quant(case.key, dst_type=torch.float8_e4m3fn, quant_mode="pertoken")
+        value8 = torch_npu.npu_quantize(
+            case.value.flatten(1), case.layer.v_cache_scale_float_reciprocal, None, torch.float8_e4m3fn, -1, False
+        ).reshape_as(case.value)
+        for page in (4, pages - 4):
+            outputs.append(
+                self.forward_step(
+                    case,
+                    case.query,
+                    case.key,
+                    case.value,
+                    [0, 6],
+                    [6],
+                    [[page]],
+                    list(range(page * 128, page * 128 + 6)),
+                ).cpu()
+            )
+            for cached, expected in zip(case.cache[:2], (key8, value8)):
+                actual = cached[page, :, :6].view(torch.uint8).permute(1, 0, 2).contiguous().cpu()
+                torch.testing.assert_close(actual, expected.view(torch.uint8).cpu(), rtol=0, atol=0)
+            torch.testing.assert_close(case.cache[2][page, :, :6].t().cpu(), key_scale.cpu(), rtol=0, atol=0)
+        self.assertGreater((pages - 4) * case.pitch, 2**32)
+        torch.testing.assert_close(*outputs, rtol=0, atol=0)
+        print("QFA_64BIT_SCATTER_PASS", (pages - 4) * case.pitch, flush=True)
 
     def test_token_head_static_v_skips_negative_padding(self):
         control = self.make_case(6, kv_heads=2, static_per_channel=True)

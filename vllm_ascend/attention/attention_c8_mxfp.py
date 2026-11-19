@@ -1033,17 +1033,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         slot_mapping = attn_metadata.slot_mapping[:num_actual_tokens]
         key_cache, value_cache = kv_cache[0], kv_cache[1]
         if self.q_quant_mode in ("per_token", "per_token_head"):
-            from cann_ops_transformer.ops import scatter_pa_kv_cache_with_k_scale
+            from vllm_ascend.ops.triton.qfa_kv_scatter import scatter_qfa_kv
 
-            scatter_pa_kv_cache_with_k_scale(
+            scatter_qfa_kv(
                 quant_key,
                 quant_value,
+                key_scale if key_scale.ndim == 2 else key_scale[:, None].expand(-1, self.num_kv_heads),
                 key_cache,
                 value_cache,
+                kv_cache[2],
                 slot_mapping,
-                key_scale if key_scale.ndim == 2 else key_scale[:, None].expand(-1, self.num_kv_heads),
-                kv_cache[2].unsqueeze(-1),
-                cache_layout="BNBD",
             )
             notify_kv_cache_written()
             return
