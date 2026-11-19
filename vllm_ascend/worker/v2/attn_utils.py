@@ -980,19 +980,25 @@ def _uses_single_raw_mla_cache(
 
 
 def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable[KVCacheSpec]) -> bool:
-    """Keep Gemma 4's budget and the V2 runner on the same dense layout.
+    """Keep full/sliding planner budgets and V2 physical allocation aligned.
 
     Equal physical pages let full and sliding-window groups overlay the same
     pool even when their head dimensions and tokens per block differ. Keep
-    specialized/quantized caches and distributed transfer on their existing
-    allocation paths. Limit this regression fix to Gemma 4 so other models
-    retain their existing allocation behavior.
+    Gemma 4 uses dense K/V planes. Token/head QFA uses whole-page packets,
+    including the BF16 draft, so a physical block has the same byte range
+    in every group. Its SWA scales must be neutral: the existing zeroer
+    restores them without a group ID, while full mode 6 has no static
+    E8M0 scale cache to restore.
     """
     model_config = getattr(vllm_config, "model_config", None)
     text_config = getattr(model_config, "hf_text_config", None)
-    if getattr(text_config, "model_type", None) != "gemma4_text":
+    c8_packets = (
+        getattr(getattr(vllm_config, "cache_config", None), "cache_dtype", None) == "mxfp8"
+        and (getattr(vllm_config, "additional_config", None) or {}).get("c8_q_quant_mode") == "per_token_head"
+    )
+    if not c8_packets and getattr(text_config, "model_type", None) != "gemma4_text":
         return False
-    if vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
+    if not c8_packets and vllm_config.cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
         return False
     specs = tuple(specs)
     if {type(spec) for spec in specs} != {FullAttentionSpec, SlidingWindowSpec}:
@@ -1005,6 +1011,25 @@ def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable
     layout = vllm_config.cache_config.get_resolved_kv_cache_layout()
     if not (layout.is_layer_compact and layout.is_block_compact):
         return False
+    if c8_packets:
+        if len({spec.page_size_bytes for spec in specs}) != 1 or not all(
+            spec.dtype in (torch.float8_e4m3fn, torch.bfloat16)
+            and spec.head_size == spec.head_size_v
+            and spec.tokens_per_state == 1
+            and spec.num_head_slots is None
+            and (is_mxfp_cache_spec(spec) or spec.state_content_bytes is None)
+            for spec in specs
+        ):
+            return False
+        context = vllm_config.compilation_config.static_forward_context
+        sliding_layers = [
+            layer
+            for layer in context.values()
+            if getattr(getattr(layer, "impl", None), "q_quant_mode", None) == "per_token_group"
+            and layer.impl.sliding_window is not None
+        ]
+        # Startup only, after checkpoint loading; never queried in a graph.
+        return bool(sliding_layers) and all(torch.all(layer.v_cache_scale == 127).item() for layer in sliding_layers)
     return len({spec.page_size_bytes for spec in specs}) == 1 and all(
         spec.dtype in (torch.float16, torch.bfloat16)
         and spec.kv_quant_mode == KVQuantMode.NONE
@@ -1020,7 +1045,7 @@ def can_share_full_and_sliding_kv_cache(vllm_config: VllmConfig, specs: Iterable
 def allocate_shared_attention_kv_cache(
     kv_cache_config: KVCacheConfig,
     allocate: Callable[[int], torch.Tensor],
-) -> dict[str, tuple[torch.Tensor, torch.Tensor]]:
+) -> dict[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]]:
     """Materialize overlay descriptors as contiguous K/V views of one pool.
 
     Groups share block IDs from one scheduler pool, so the same ID cannot be
@@ -1055,6 +1080,11 @@ def allocate_shared_attention_kv_cache(
                 raise ValueError(f"Invalid shared attention KV cache descriptor for {name}.")
             regions[name] = (start, layer_size)
     backing = allocate(backing_size)
+    if any(is_mxfp_cache_spec(spec) for spec in specs.values()):
+        # All formats, including the BF16 draft, must stay inside the same
+        # physical page. Splitting the pool into global K/V halves would
+        # alias a QFA packet belonging to another live block ID.
+        return {name: backing[start : start + layer_size] for name, (start, layer_size) in regions.items()}
     return {
         name: (
             backing[start : start + layer_size // 2],

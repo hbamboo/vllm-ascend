@@ -17,12 +17,14 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_ascend.attention.attention_c8_mxfp import fill_mxfp_v_scale_cache, mxfp_cache_spec
 from vllm_ascend.worker import worker as worker_module
 from vllm_ascend.worker.v2 import attn_utils
 from vllm_ascend.worker.v2.attn_utils import (
     allocate_shared_attention_kv_cache,
     can_share_full_and_sliding_kv_cache,
 )
+from vllm_ascend.worker.v2.utils import C8KVBlockZeroer
 
 
 def _config():
@@ -63,6 +65,109 @@ def _cache_config(sliding_groups=5, dtype=torch.bfloat16):
 
 def _specs(cache_config):
     return {name: group.kv_cache_spec for group in cache_config.kv_cache_groups for name in group.layer_names}
+
+
+def _qfa_pool(neutral=True):
+    config = _config()
+    config.model_config.hf_text_config.model_type = "iquest_q1"
+    config.cache_config.cache_dtype = "mxfp8"
+    config.additional_config = {"c8_q_quant_mode": "per_token_head", "c8_v_quant_mode": "per_channel"}
+    full = mxfp_cache_spec(FullAttentionSpec(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16))
+    swa = mxfp_cache_spec(
+        SlidingWindowSpec(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16, sliding_window=4096)
+    )
+    draft = FullAttentionSpec(block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16)
+    page = max(spec.page_size_bytes for spec in (full, swa, draft))
+    groups = [
+        KVCacheGroupSpec(layer_names=[name], kv_cache_spec=replace(spec, page_size_padded=page))
+        for name, spec in (("full", full), ("swa", swa), ("draft", draft))
+    ]
+    count = 8
+    descriptors = [
+        KVCacheTensor(
+            size=count * page, layers=group.layer_names, offset=0, layer_stride=count * page, block_stride=page
+        )
+        for group in groups
+    ]
+    cache = KVCacheConfig(num_blocks=count, kv_cache_tensors=descriptors, kv_cache_groups=groups)
+    context = {
+        name: SimpleNamespace(
+            impl=SimpleNamespace(q_quant_mode=mode, sliding_window=window),
+            v_cache_scale=torch.full((128,), 127 if neutral else 128, dtype=torch.uint8),
+        )
+        for name, mode, window in (
+            ("full", "per_token_head", None),
+            ("swa", "per_token_group", 4096),
+            ("draft", None, None),
+        )
+    }
+    config.compilation_config = SimpleNamespace(static_forward_context=context)
+    return config, cache, context
+
+
+@pytest.mark.parametrize("neutral", [False, True])
+@pytest.mark.parametrize("use_v2", [False, True])
+def test_qfa_pool_budget_matches_shared_packet_capability(monkeypatch, neutral, use_v2):
+    config, cache, _ = _qfa_pool(neutral)
+    worker = worker_module.NPUWorker.__new__(worker_module.NPUWorker)
+    worker.vllm_config, worker.model_config = config, config.model_config
+    worker.use_v2_model_runner = use_v2
+    worker.get_kv_cache_spec = lambda: _specs(cache)
+    worker.model_runner = SimpleNamespace(
+        supports_standardized_shared_kv_backing=True, use_sparse=False, use_compress=False
+    )
+    monkeypatch.setattr(worker_module, "get_kv_cache_groups", lambda *_: cache.kv_cache_groups)
+    assert can_share_full_and_sliding_kv_cache(config, _specs(cache).values()) == neutral
+    assert worker._scale_kv_cache_memory_for_multi_group(3000) == (3000 if use_v2 and neutral else 1000)
+
+
+def test_qfa_packets_and_bf16_draft_share_page_geometry_and_recycle(monkeypatch):
+    config, cache, context = _qfa_pool()
+    allocate = Mock(side_effect=lambda size: torch.zeros(size, dtype=torch.int8))
+    monkeypatch.setattr(attn_utils, "get_current_vllm_config", lambda: config)
+    monkeypatch.setattr(attn_utils.KVPPConfig, "from_vllm_config", lambda _: SimpleNamespace(size=1))
+    monkeypatch.setattr(attn_utils, "_is_dsv4_model", lambda _: False)
+    monkeypatch.setattr(attn_utils, "enable_sfa", lambda _: False)
+    monkeypatch.setattr(attn_utils, "enable_fa_quant", lambda _: False)
+    monkeypatch.setattr(attn_utils, "_allocate_int8_cache_tensor", lambda size, *_: allocate(size))
+    backend = SimpleNamespace(get_kv_cache_shape=lambda blocks, bs, heads, dim, *_: (2, blocks, bs, heads, dim))
+    groups = [
+        SimpleNamespace(kv_cache_group_id=i, kv_cache_spec=g.kv_cache_spec, layer_names=g.layer_names, backend=backend)
+        for i, g in enumerate(cache.kv_cache_groups)
+    ]
+    raw = attn_utils._allocate_kv_cache(cache, {}, torch.device("cpu"))
+    allocate.assert_called_once_with(cache.kv_cache_tensors[0].size)
+    assert all(isinstance(t, torch.Tensor) for t in raw.values())
+    assert len({t.data_ptr() for t in raw.values()}) == 1
+    views = attn_utils._reshape_kv_cache_v2(groups, raw, "mxfp8", [128, 512, 128], {}, cache)
+    pages = raw["full"].view(cache.num_blocks, -1)
+    full, swa, draft = views["full"], views["swa"], views["draft"]
+    for tensor, marker in zip(full, (17, 23, 2, 3)):
+        tensor[4:8].view(torch.uint8).fill_(marker)
+    for tensor, marker in zip(swa, (31, 37, 41, 127)):
+        tensor[3].view(torch.uint8).fill_(marker)
+    draft[0][20:24].fill_(1)
+    draft[1][20:24].fill_(2)
+    assert torch.count_nonzero(pages[[0, 2, 4, 6, 7]]) == 0
+    assert torch.all(full[0][4:8].view(torch.uint8) == 17)
+    assert torch.all(swa[0][3].view(torch.uint8) == 31)
+    assert torch.all(draft[0][20:24] == 1) and torch.all(draft[1][20:24] == 2)
+    before = pages.clone()
+
+    def zero(ids):
+        for block_id in ids:
+            pages[block_id].zero_()
+
+    zeroer = C8KVBlockZeroer(
+        SimpleNamespace(zero_block_ids=zero), [(context["swa"].v_cache_scale, swa[3], 1)], fill_mxfp_v_scale_cache
+    )
+    zeroer.zero_block_ids([3])
+    assert torch.all(swa[3][3] == 127)
+    torch.testing.assert_close(pages[[0, 1, 2, 4, 5, 6, 7]], before[[0, 1, 2, 4, 5, 6, 7]], rtol=0, atol=0)
+    full[0][12:16].view(torch.uint8).fill_(43)
+    full[1][12:16].view(torch.uint8).fill_(47)
+    assert torch.all(full[0][12:16].view(torch.uint8) == 43)
+    assert torch.all(draft[0][20:24] == 1) and torch.all(draft[1][20:24] == 2)
 
 
 @pytest.mark.parametrize(
