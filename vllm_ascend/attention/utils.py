@@ -375,6 +375,10 @@ class AscendCommonAttentionMetadata(CommonAttentionMetadata):
     # Current attention state (e.g., ChunkedPrefill, DecodeOnly).
     attn_state: Any = None
 
+    # One execution's QFA lengths/plans, partitioned by device length views.
+    # Shallow copies for different KV groups retain this shared dictionary.
+    qfa_shared_metadata_cache: dict = field(default_factory=dict)
+
     # Padding size for graph capture, -1 means not in graph mode.
     graph_pad_size: int = -1
 

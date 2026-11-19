@@ -23,7 +23,7 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.worker.gpu import attn_utils as upstream_attn_utils
 from vllm.v1.worker.utils import AttentionGroup
 
-from vllm_ascend.attention import dsa_attn_kv_plan, dsa_v1
+from vllm_ascend.attention import attention_v1, dsa_attn_kv_plan, dsa_v1
 from vllm_ascend.attention import utils as attention_utils
 from vllm_ascend.attention.attention_c8_mxfp import fia_pseudo_cache_views, mxfp_cache_spec, mxfp_paged_cache_views
 from vllm_ascend.attention.attention_v1 import (
@@ -2080,6 +2080,110 @@ class _CaptureStateBuilder(_PrefillStateBuilder):
     def build_for_cudagraph_capture(self, common_attn_metadata, **kwargs):
         self.extra_kwargs = kwargs
         return common_attn_metadata.is_prefilling
+
+
+@pytest.fixture
+def qfa_metadata_builder(monkeypatch):
+    monkeypatch.setattr(torch.Tensor, "pin_memory", lambda tensor: tensor)
+    monkeypatch.setattr(attention_v1, "_select_seq_lens", lambda common, **kwargs: common.seq_lens_cpu)
+
+    def make(spec):
+        builder = attention_v1.AscendAttentionMetadataBuilder.__new__(attention_v1.AscendAttentionMetadataBuilder)
+        builder.pcp_enabled = False
+        builder.kv_cache_spec = spec
+        builder.speculative_config = None
+        builder.vllm_config = SimpleNamespace()
+        builder.model_config = SimpleNamespace(runner_type="generate")
+        builder.device = torch.device("cpu")
+        builder.attn_mask_builder = SimpleNamespace(get_attention_mask=lambda *_args: None)
+        builder._split_decodes_and_prefills = lambda common: (common.num_reqs, 0, common.num_actual_tokens, 0)
+        builder.build_for_cudagraph_capture = lambda common, **kwargs: builder.build(0, common)
+        return builder
+
+    return make
+
+
+@pytest.mark.parametrize("for_capture", [False, True])
+def test_qfa_metadata_is_shared_across_hybrid_groups_only_for_one_execution(qfa_metadata_builder, for_capture):
+    specs = [
+        FullAttentionSpec(block_size=512, num_kv_heads=2, head_size=128, dtype=torch.float8_e4m3fn),
+        SlidingWindowSpec(
+            block_size=512, num_kv_heads=2, head_size=128, dtype=torch.float8_e4m3fn, sliding_window=4096
+        ),
+    ]
+    builders = [qfa_metadata_builder(spec) for spec in specs]
+    groups = [
+        [SimpleNamespace(layer_names=[name], get_metadata_builder=lambda _idx, builder=builder: builder)]
+        for name, builder in zip(("full", "sliding"), builders)
+    ]
+    kwargs = dict(
+        attn_groups=groups,
+        num_reqs=2,
+        num_tokens=8,
+        query_start_loc_gpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4, 8], dtype=torch.int32),
+        max_query_len=4,
+        seq_lens=torch.tensor([10, 20], dtype=torch.int32),
+        max_seq_len=20,
+        block_tables=tuple(torch.zeros((2, 1), dtype=torch.int32) for _ in specs),
+        slot_mappings=torch.arange(16, dtype=torch.int64).reshape(2, 8),
+        kv_cache_config=SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec) for spec in specs]),
+        seq_lens_np=np.array([10, 20], dtype=np.int32),
+        positions=torch.arange(8),
+        for_cudagraph_capture=for_capture,
+    )
+    first = attn_utils.build_attn_metadata(**kwargs)
+    full, sliding = first["full"], first["sliding"]
+    assert full is not sliding
+    assert full.seq_lens_gpu is not sliding.seq_lens_gpu
+    assert full.seq_lens_gpu.data_ptr() == sliding.seq_lens_gpu.data_ptr()
+    assert full.qfa_shared_metadata_cache is sliding.qfa_shared_metadata_cache
+    assert full.qfa_metadata_cache is not sliding.qfa_metadata_cache
+    full.qfa_shared_metadata_cache["previous_execution"] = object()
+
+    second = attn_utils.build_attn_metadata(**kwargs)
+    assert second["full"].qfa_shared_metadata_cache is second["sliding"].qfa_shared_metadata_cache
+    assert second["full"].qfa_shared_metadata_cache is not full.qfa_shared_metadata_cache
+    assert "previous_execution" not in second["full"].qfa_shared_metadata_cache
+
+
+def test_qfa_metadata_separates_different_length_views_and_token_bounds(qfa_metadata_builder):
+    builder = qfa_metadata_builder(
+        FullAttentionSpec(block_size=512, num_kv_heads=2, head_size=128, dtype=torch.float8_e4m3fn)
+    )
+    query_starts = torch.tensor([0, 8, 8], dtype=torch.int32)
+    seq_lens = torch.tensor([10, 20, 30], dtype=torch.int32)
+    common = attention_utils.AscendCommonAttentionMetadata(
+        query_start_loc=query_starts,
+        query_start_loc_cpu=query_starts.clone(),
+        seq_lens=seq_lens[:2],
+        seq_lens_cpu=seq_lens[:2],
+        num_reqs=2,
+        num_actual_tokens=8,
+        max_query_len=8,
+        max_seq_len=30,
+        block_table_tensor=torch.zeros((2, 1), dtype=torch.int32),
+        slot_mapping=torch.arange(8),
+    )
+    variants = [
+        common,
+        replace(common, query_start_loc=query_starts[:], seq_lens=seq_lens[:2]),
+        replace(common, seq_lens=seq_lens[1:]),
+        replace(common, query_start_loc=query_starts.clone()),
+        replace(common, num_actual_tokens=6),
+        replace(
+            common,
+            num_reqs=1,
+            query_start_loc=query_starts[:2],
+            query_start_loc_cpu=common.query_start_loc_cpu[:2],
+            seq_lens=seq_lens[:1],
+            seq_lens_cpu=seq_lens[:1],
+        ),
+    ]
+    metadata = [builder.build(0, item) for item in variants]
+    assert metadata[0].qfa_shared_metadata_cache is metadata[1].qfa_shared_metadata_cache
+    distinct = [metadata[0], *metadata[2:]]
+    assert len({id(item.qfa_shared_metadata_cache) for item in distinct}) == len(distinct)
 
 
 @pytest.mark.parametrize("capture", [False, True])

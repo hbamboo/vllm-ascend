@@ -1,3 +1,4 @@
+import sys
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -189,14 +190,7 @@ class TestC8MXFPQfaQueryPlan(TestBase):
 
 
 class TestC8MXFPPerStepDerivations(TestBase):
-    """Per-step quantities are derived once, not once per layer.
-
-    cu_seqlens_q / seqused_kv and the K-scale slot decomposition depend only
-    on the runner's per-step buffers, but a step walks 23 full-attention
-    layers. Caching them on the shared AscendMetadata is what keeps that from
-    being ~200 redundant device ops a decode step, so the reuse is the thing
-    worth pinning.
-    """
+    """Reuse lengths across groups while retaining group-local KV mappings."""
 
     def setUp(self):
         self.impl = object.__new__(AscendC8MXFPAttentionBackendImpl)
@@ -221,6 +215,34 @@ class TestC8MXFPPerStepDerivations(TestBase):
         self.assertEqual(cu_seqlens_q.tolist(), [0, 4, 8, 8, 8])
         self.assertEqual(seqused_kv.tolist(), [10, 20, 1, 1])
 
+    def test_distinct_group_metadata_reuses_lengths_but_a_new_step_refreshes_them(self):
+        query_starts = self.attn_metadata.query_start_loc_gpu
+        seq_lens = self.attn_metadata.seq_lens_gpu
+        shared = {}
+        first_metadata = SimpleNamespace(
+            query_start_loc_gpu=query_starts[:], seq_lens_gpu=seq_lens[:], qfa_shared_metadata_cache=shared
+        )
+        second_metadata = SimpleNamespace(
+            query_start_loc_gpu=query_starts[:], seq_lens_gpu=seq_lens[:], qfa_shared_metadata_cache=shared
+        )
+        self.assertIsNot(first_metadata.query_start_loc_gpu, second_metadata.query_start_loc_gpu)
+        self.assertIsNot(first_metadata.seq_lens_gpu, second_metadata.seq_lens_gpu)
+        first = self.impl._qfa_step_lengths(first_metadata, 8)
+        second = self.impl._qfa_step_lengths(second_metadata, 8)
+        self.assertIs(first[0], second[0])
+        self.assertIs(first[1], second[1])
+
+        query_starts[1] = 3
+        seq_lens.add_(1)
+        next_metadata = SimpleNamespace(
+            query_start_loc_gpu=query_starts[:], seq_lens_gpu=seq_lens[:], qfa_shared_metadata_cache={}
+        )
+        refreshed = self.impl._qfa_step_lengths(next_metadata, 8)
+        self.assertIsNot(refreshed[0], first[0])
+        self.assertEqual(refreshed[0].tolist(), [0, 3, 8])
+        self.assertEqual(refreshed[1].tolist(), [11, 21])
+        self.assertEqual(first[0].tolist(), [0, 4, 8])
+
     def test_k_scale_slot_index_is_derived_once_per_step(self):
         slots = torch.tensor([2, 5, -1], dtype=torch.int64)
         first = self.impl._qfa_k_scale_slot_index(self.attn_metadata, slots, 4)
@@ -237,6 +259,18 @@ class TestC8MXFPPerStepDerivations(TestBase):
         self.assertEqual(block_ids.tolist(), [0, 1, 0])
         self.assertEqual(seg_ids.tolist(), [0, 0, 0])
         self.assertEqual(frag_ids.tolist(), [2, 1, 0])
+
+    def test_shared_lengths_do_not_share_group_slot_mappings(self):
+        shared = {}
+        first_metadata = SimpleNamespace(qfa_shared_metadata_cache=shared)
+        second_metadata = SimpleNamespace(qfa_shared_metadata_cache=shared)
+        slots = torch.tensor([[2, 5, -1], [6, 9, -1]], dtype=torch.int64)
+        first = self.impl._qfa_k_scale_slot_index(first_metadata, slots[0], 4)
+        second = self.impl._qfa_k_scale_slot_index(second_metadata, slots[1], 4)
+        self.assertIsNot(first[0], second[0])
+        self.assertEqual(first[0].tolist(), [0, 1, 0])
+        self.assertEqual(second[0].tolist(), [1, 2, 0])
+        self.assertIsNot(first_metadata.qfa_metadata_cache, second_metadata.qfa_metadata_cache)
 
     def test_the_two_derivations_do_not_collide_in_the_step_cache(self):
         lengths = self.impl._qfa_step_lengths(self.attn_metadata, 8)
@@ -319,3 +353,88 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
         # was built for has to be the one the main call then uses.
         _, invocations = self._plans([{"mask_mode": 3}])
         self.assertEqual(invocations[0][1]["mask_mode"], 3)
+
+    def test_shared_group_plans_keep_distinct_layouts_and_windows(self):
+        shared = {}
+        metadata = [SimpleNamespace(qfa_shared_metadata_cache=shared) for _ in range(6)]
+        native = MagicMock(quant_flash_attn_metadata=MagicMock(side_effect=lambda *args, **kwargs: object()))
+        lengths = dict(
+            cu_seqlens_q=torch.tensor([0, 1, 2], dtype=torch.int32),
+            seqused_kv=torch.tensor([10, 20], dtype=torch.int32),
+            max_seqlen_q=1,
+        )
+        cases = ((None, "N2TGD"), (None, "N2TGD"), (None, "TND"), (4096, "TND"), (2048, "TND"), (4096, "TND"))
+        plans = []
+        with patch.dict(sys.modules, {"cann_ops_transformer.ops": native}):
+            for item, (window, layout) in zip(metadata, cases):
+                self.impl.sliding_window = window
+                plans.append(
+                    self.impl._get_qfa_metadata(item, **lengths, mask_mode=4 if window else 0, layout_q_descale=layout)
+                )
+        self.assertEqual(native.quant_flash_attn_metadata.call_count, 4)
+        self.assertIs(plans[0], plans[1])
+        self.assertIs(plans[3], plans[5])
+        self.assertIsNot(plans[0], plans[2])
+        self.assertIsNot(plans[3], plans[4])
+        self.assertEqual(
+            [call.kwargs["win_left"] for call in native.quant_flash_attn_metadata.call_args_list], [-1, -1, 4095, 2047]
+        )
+
+    def test_native_full_and_sliding_use_separate_shared_plans(self):
+        shared = {}
+        query_starts = torch.tensor([0, 1, 2], dtype=torch.int32)
+        seq_lens = torch.tensor([10, 20], dtype=torch.int32)
+        metadata = [
+            SimpleNamespace(
+                query_start_loc_gpu=query_starts[:],
+                seq_lens_gpu=seq_lens[:],
+                qfa_shared_metadata_cache=shared,
+                num_actual_tokens=2,
+                max_query_len=1,
+                block_tables=torch.zeros(2, 1, dtype=torch.int32),
+            )
+            for _ in range(2)
+        ]
+        self.impl.q_quant_mode = "per_token_head"
+        self.impl.kv_sharing_target_layer_name = None
+        self.impl.qfa_v_descale = torch.ones(2)
+        self.impl.qfa_v_output_scale = torch.ones(2, 128)
+        self.impl.qfa_p_scale = torch.ones(1)
+        self.impl.scale = 128**-0.5
+        query = torch.zeros(2, 8, 128, dtype=torch.bfloat16)
+        output = torch.empty_like(query)
+        native = MagicMock(
+            quant_flash_attn_metadata=MagicMock(side_effect=lambda *args, **kwargs: object()),
+            quant_flash_attn=MagicMock(return_value=(torch.zeros_like(query), None)),
+        )
+        modules = {
+            "cann_ops_transformer.ops": native,
+            "vllm_ascend.ops.triton.qfa_v_head_scale": MagicMock(),
+            "vllm_ascend.ops.triton.sink": MagicMock(),
+        }
+        with (
+            patch.dict(sys.modules, modules),
+            patch("vllm_ascend.attention.attention_c8_mxfp.record_attention_compute_start"),
+            patch(
+                "vllm_ascend.attention.attention_c8_mxfp.torch_npu.npu_dynamic_quant",
+                side_effect=lambda x, **kwargs: (x.to(torch.float8_e4m3fn), torch.ones(x.shape[:-1])),
+            ),
+        ):
+            for item in metadata:
+                self.impl._forward_fp8_per_token(SimpleNamespace(), query, None, None, (None,) * 4, item, output)
+            self.impl.sliding_window = 4096
+            self.impl.q_quant_mode = "per_token_group"
+            lengths = self.impl._qfa_step_lengths(metadata[0], 2)
+            for item in metadata:
+                self.impl._get_qfa_metadata(
+                    item,
+                    cu_seqlens_q=lengths[0],
+                    seqused_kv=lengths[1],
+                    max_seqlen_q=1,
+                    mask_mode=4,
+                    layout_q_descale="TND",
+                )
+        self.assertEqual([call.args[3] for call in native.quant_flash_attn_metadata.call_args_list], [6, 1])
+        calls = native.quant_flash_attn.call_args_list
+        self.assertIs(calls[0].kwargs["metadata"], calls[1].kwargs["metadata"])
+        self.assertIs(calls[0].kwargs["cu_seqlens_q"], calls[1].kwargs["cu_seqlens_q"])

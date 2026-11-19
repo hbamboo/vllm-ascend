@@ -685,7 +685,11 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     q_quant_mode: str = "per_token_group"
     v_quant_mode: str = "per_channel"
 
-    def _qfa_step_cache(self, attn_metadata: AscendMetadata) -> dict:
+    def _qfa_step_cache(self, attn_metadata: AscendMetadata, *, shared: bool = False) -> dict:
+        if shared:
+            cache = getattr(attn_metadata, "qfa_shared_metadata_cache", None)
+            if cache is not None:
+                return cache
         cache = getattr(attn_metadata, "qfa_metadata_cache", None)
         if cache is None:
             cache = {}
@@ -699,7 +703,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         consumes the recorded tensors, and each replay re-executes that one
         derivation against the refreshed buffers.
         """
-        cache = self._qfa_step_cache(attn_metadata)
+        cache = self._qfa_step_cache(attn_metadata, shared=True)
         lengths = cache.get("lengths")
         if lengths is None:
             # Clamp sanitizes the tail: unused query_start_loc slots carry -1
@@ -749,7 +753,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         ahead of every QFA call that reads its output, and the main operator
         treats ``metadata`` as a read-only input.
         """
-        cache = self._qfa_step_cache(attn_metadata)
+        cache = self._qfa_step_cache(attn_metadata, shared=True)
         win_left = self.sliding_window - 1 if self.sliding_window is not None else -1
         win_right = 0 if self.sliding_window is not None else -1
         plan_key = (
@@ -1140,8 +1144,9 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         record_attention_compute_start()
         max_q = attn_metadata.max_query_len or num_tokens
         mask_mode = QFA_MASK_MODE_NO_MASK if max_q == 1 else QFA_MASK_MODE_CAUSAL
+        plan_cache = self._qfa_step_cache(attn_metadata, shared=True)
         plan_key = ("fp8_token", self.num_heads, self.num_kv_heads, self.head_size, max_q, mask_mode)
-        metadata = step_cache.get(plan_key)
+        metadata = plan_cache.get(plan_key)
         if metadata is None:
             metadata = quant_flash_attn_metadata(
                 self.num_heads,
@@ -1158,7 +1163,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 layout_kv="PA_BNBD",
                 layout_out="TND",
             )
-            step_cache[plan_key] = metadata
+            plan_cache[plan_key] = metadata
         query_ntd = query8.view(torch.uint8).permute(1, 0, 2).contiguous().view(torch.float8_e4m3fn)
         scale_nt = (
             query_scale.t().contiguous() if token_head else query_scale[None, :].expand(self.num_heads, -1).contiguous()

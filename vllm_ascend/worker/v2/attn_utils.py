@@ -465,6 +465,7 @@ def build_attn_metadata(
         positions = torch.zeros(num_input_tokens, dtype=torch.int64, device=query_start_loc_gpu.device)
 
     attn_metadata: dict[str, Any] = {}
+    qfa_shared_metadata_cache: dict = {}
     # Share request-level DSA metadata across cache groups in one execution.
     common_ratio_to_sas_metadata: dict[Any, Any] = {}
     common_v41_batch_metadata: dict[str, Any] = {}
@@ -541,6 +542,7 @@ def build_attn_metadata(
             req_topk_buffer_active=req_topk_buffer_active,
             copy_sfa_draft_index=copy_sfa_draft_index,
             copy_sfa_restore_tails=copy_sfa_restore_tails,
+            qfa_shared_metadata_cache=qfa_shared_metadata_cache,
             dcp_local_seq_lens=dcp_local_seq_lens,
             dcp_local_seq_lens_cpu=dcp_local_seq_lens_cpu,
             **common_attn_metadata_extra_kwargs,

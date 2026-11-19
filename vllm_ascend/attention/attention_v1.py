@@ -245,14 +245,13 @@ class AscendMetadata:
     # prefill reshape_and_cache event
     reshape_cache_event: torch.npu.Event = None
 
-    # Per-step scratch for C8-MXFP (QFA) layers. The builder creates one
-    # AscendMetadata per step shared by all attention layers, so the QFA
-    # metadata operator output is computed once per step instead of once
-    # per layer. Key: layout_q_descale -> QFA metadata tensor, because that
-    # layout is what selects the prefill or decode kernel the plan is computed
-    # for. Only used on the eager path -- graph capture bypasses the cache so
-    # the metadata op executes inside the captured region.
+    # Group-local QFA scratch: slot indices and V history depend on this
+    # group's slot mapping and block table, even when its lengths match.
     qfa_metadata_cache: dict = field(default_factory=dict)
+    # Lengths and QFA plans are shared across groups with the same length
+    # views. During capture, the first layer records their derivation and
+    # later layers reuse those tensors; replay refreshes them once.
+    qfa_shared_metadata_cache: dict | None = None
     pcp_local_num_input_tokens: int | None = None
 
 
@@ -428,6 +427,15 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             num_prefills=num_prefills,
         )
+        qfa_shared_cache = None
+        if common_attn_metadata.query_start_loc is not None and common_attn_metadata.seq_lens is not None:
+            qfa_length_views = tuple(
+                (tensor.data_ptr(), tensor.shape, tensor.stride(), tensor.dtype, tensor.device)
+                for tensor in (common_attn_metadata.query_start_loc, common_attn_metadata.seq_lens)
+            )
+            qfa_shared_cache = common_attn_metadata.qfa_shared_metadata_cache.setdefault(
+                (num_actual_tokens, *qfa_length_views), {}
+            )
         attn_metadata = self.metadata_cls(
             num_actual_tokens=num_actual_tokens,
             num_decode_tokens=num_decode_tokens,
@@ -447,6 +455,7 @@ class AscendAttentionMetadataBuilder(AttentionMetadataBuilder[AscendMetadata]):
             num_decodes=num_decodes,
             causal=common_attn_metadata.causal,
             model_runner_type=self.model_config.runner_type,
+            qfa_shared_metadata_cache=qfa_shared_cache,
             **backend_metadata,
         )
         if self.pcp_enabled:

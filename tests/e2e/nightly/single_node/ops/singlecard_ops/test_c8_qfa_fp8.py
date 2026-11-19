@@ -472,6 +472,67 @@ class TestC8QFAFP8NPU(unittest.TestCase):
             torch.testing.assert_close(graph_output.cpu(), p8_expected, rtol=0.008, atol=1e-4)
             self.check_case(case, expected_output=p8_expected)
 
+    def test_token_head_static_v_graph_shares_lengths_and_plan_across_readers(self):
+        case = self.make_case(6, 256, kv_heads=2, static_per_channel=True)
+        self.run_case(case)
+        shared = {}
+        readers = [SimpleNamespace(**vars(case.metadata)) for _ in range(2)]
+        impls = [self.helpers.AscendC8MXFPAttentionBackendImpl() for _ in readers]
+        outputs = [torch.empty_like(case.query) for _ in readers]
+        for metadata, impl in zip(readers, impls):
+            metadata.qfa_metadata_cache = {}
+            metadata.qfa_shared_metadata_cache = shared
+            impl.__dict__.update(case.impl.__dict__)
+
+        def run(metadata_list, output_list):
+            for impl, metadata, output in zip(impls, metadata_list, output_list):
+                impl.forward(case.layer, case.query, None, None, case.cache, metadata, output=output)
+
+        with patch.object(
+            sys.modules["cann_ops_transformer.ops"],
+            "quant_flash_attn_metadata",
+            wraps=self.native.quant_flash_attn_metadata,
+        ) as metadata_op:
+            for _ in range(3):
+                run(readers, outputs)
+            torch.npu.synchronize()
+            shared.clear()
+            for metadata in readers:
+                metadata.qfa_metadata_cache = {}
+            metadata_op.reset_mock()
+            graph = torch.npu.NPUGraph()
+            with torch.npu.graph(graph):
+                run(readers, outputs)
+            self.assertEqual(metadata_op.call_count, 1)
+            previous = outputs[0].clone()
+            original_query = case.query.clone()
+
+            for step, (factor, used) in enumerate(((1.5, 513), (1.0, 529)), start=1):
+                case.query.copy_(original_query * factor)
+                case.metadata.seq_lens_gpu.fill_(used)
+                case.kv_len = used
+                graph.replay()
+                torch.npu.synchronize()
+                captured = [output.clone() for output in outputs]
+                self.assertEqual(metadata_op.call_count, step)
+                self.assertFalse(torch.equal(captured[0], previous))
+                previous = captured[0]
+                eager_shared = {}
+                eager_metadata = [SimpleNamespace(**vars(metadata)) for metadata in readers]
+                eager_outputs = [torch.empty_like(case.query) for _ in readers]
+                for metadata in eager_metadata:
+                    metadata.qfa_metadata_cache = {}
+                    metadata.qfa_shared_metadata_cache = eager_shared
+                run(eager_metadata, eager_outputs)
+                torch.npu.synchronize()
+                self.assertEqual(metadata_op.call_count, step + 1)
+                for actual, expected in zip(captured, eager_outputs):
+                    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                torch.testing.assert_close(*captured, rtol=0, atol=0)
+                case.output = captured[0]
+                self.check_case(case)
+                print("QFA_SHARED_STATIC_GRAPH_PASS", used, flush=True)
+
     def test_token_head_static_v_prefill_6144_then_decode_6(self):
         case = self.make_case(6144, 256, kv_heads=2, static_per_channel=True, kv_len=6150)
         prefill_metadata = SimpleNamespace(**vars(case.producer_metadata))
