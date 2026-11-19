@@ -4,9 +4,12 @@
 
 import ast
 import math
+import runpy
+import sys
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -109,6 +112,51 @@ class TestQfaFp8CacheViews(unittest.TestCase):
             self.helpers.qfa_fp8_cache_views(raw, 1, spec, self.kernel_block_size)
         with self.assertRaisesRegex(ValueError, "aligned complete pages"):
             self.helpers.qfa_fp8_cache_views(raw[:-4], 1, self.spec, self.kernel_block_size)
+
+
+class TestQfaSlidingPlans(unittest.TestCase):
+    def test_full_and_sliding_plans_keep_distinct_windows_in_decode_and_prefill(self):
+        root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
+        load_helpers = runpy.run_path(str(root / "tests/ut/attention/test_c8_k_per_token.py"))["load_helpers"]
+        helpers = load_helpers(SimpleNamespace())
+        impl = helpers.AscendC8MXFPAttentionBackendImpl()
+        impl.num_heads, impl.num_kv_heads, impl.head_size = 6, 1, 128
+        impl.scale = 128**-0.5
+        for q_len in (1, 6, 129):
+            with self.subTest(q_len=q_len):
+                query = torch.zeros(q_len, 6, 128, dtype=torch.float8_e4m3fn)
+                query_scale = torch.full((q_len, 6, 2, 2), 127, dtype=torch.uint8)
+                cache = (query, query, torch.ones(1, dtype=torch.uint8), torch.ones(1, dtype=torch.uint8))
+                metadata = SimpleNamespace(
+                    causal=True,
+                    num_actual_tokens=q_len,
+                    max_query_len=q_len,
+                    query_start_loc_gpu=torch.tensor([0, q_len], dtype=torch.int32),
+                    seq_lens_gpu=torch.tensor([1025], dtype=torch.int32),
+                    block_tables=torch.zeros(1, 9, dtype=torch.int32),
+                    attn_mask=torch.ones(2048, 2048, dtype=torch.int8),
+                )
+                native = SimpleNamespace(
+                    quant_flash_attn_metadata=MagicMock(return_value=torch.ones(1)),
+                    quant_flash_attn=MagicMock(return_value=(torch.zeros_like(query), None)),
+                )
+                with patch.dict(sys.modules, {"cann_ops_transformer.ops": native}):
+                    for window in (None, 4, 7, 4):
+                        impl.sliding_window = window
+                        impl._forward_mxfp8_attention(
+                            query, query_scale, cache, metadata, torch.empty(q_len, 6, 128, dtype=torch.bfloat16)
+                        )
+                        call = native.quant_flash_attn.call_args.kwargs
+                        expected_mask = 4 if window else (0 if q_len == 1 else 3)
+                        self.assertEqual(call["mask_mode"], expected_mask)
+                        self.assertEqual(call["win_left"], window - 1 if window else -1)
+                        self.assertEqual(call["win_right"], 0 if window else -1)
+                        self.assertEqual(call["layout_q_descale"], "N2TGD" if q_len == 1 else "TND")
+                self.assertEqual(native.quant_flash_attn_metadata.call_count, 3)
+                for call, window in zip(native.quant_flash_attn_metadata.call_args_list, (None, 4, 7)):
+                    self.assertEqual(call.args[3], 1)
+                    self.assertEqual(call.kwargs["win_left"], window - 1 if window else -1)
+                    self.assertEqual(call.kwargs["win_right"], 0 if window else -1)
 
 
 if __name__ == "__main__":

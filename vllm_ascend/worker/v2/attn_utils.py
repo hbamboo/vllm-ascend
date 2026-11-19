@@ -1595,7 +1595,7 @@ def _reshape_kv_cache_v2(
                     kv_cache_spec,
                     kernel_block_size,
                     fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token",
-                    qfa_fp8=(vllm_config.additional_config or {}).get("c8_q_quant_mode")
+                    qfa_fp8=vllm_config.compilation_config.static_forward_context[layer_name].impl.q_quant_mode
                     in ("per_token", "per_token_head"),
                 )
                 continue

@@ -124,6 +124,7 @@ from vllm_ascend.ascend_config import get_ascend_config
 from vllm_ascend.attention.attention_c8_mxfp import (
     AscendC8MXFPAttentionBackendImpl,
     fill_mxfp_v_scale_cache,
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
 )
@@ -4700,11 +4701,7 @@ class NPUModelRunner(GPUModelRunner):
         # The dtype, not the global flag: --kv-cache-dtype-skip-layers keeps
         # some layers on BF16 and vLLM promotes their SlidingWindowSpec to
         # FullAttentionSpec when the layers share one block pool.
-        return (
-            type(spec) is FullAttentionSpec
-            and is_c8_mxfp_kv_quant(self.vllm_config)
-            and spec.dtype == torch.float8_e4m3fn
-        )
+        return is_mxfp_cache_spec(spec) and is_c8_mxfp_kv_quant(self.vllm_config)
 
     def _fill_c8_mxfp_v_scale_caches(self, kv_caches: dict[str, Any]) -> None:
         """Initialize V scales and retain views for physical-page reassignment.
@@ -4715,10 +4712,6 @@ class NPUModelRunner(GPUModelRunner):
         the scheduler assigns that physical page to full attention again.
         """
         self._c8_mxfp_v_scale_caches = []
-        if self.ascend_config.c8_v_quant_mode == "per_token" or self.ascend_config.c8_q_quant_mode in (
-            "per_token", "per_token_head"
-        ):
-            return
         kv_cache_config = getattr(self, "kv_cache_config", None)
         group_by_layer = {
             name: group_id
@@ -4728,6 +4721,8 @@ class NPUModelRunner(GPUModelRunner):
         for layer_name, cache in kv_caches.items():
             layer = self.compilation_config.static_forward_context.get(layer_name)
             if isinstance(getattr(layer, "impl", None), AscendC8MXFPAttentionBackendImpl):
+                if layer.impl.q_quant_mode in ("per_token", "per_token_head") or layer.impl.v_quant_mode == "per_token":
+                    continue
                 value_scale_cache = cache[3]
                 assert value_scale_cache.shape[0] % self.kv_cache_config.num_blocks == 0
                 kernel_blocks_per_page = value_scale_cache.shape[0] // self.kv_cache_config.num_blocks
@@ -5519,7 +5514,8 @@ class NPUModelRunner(GPUModelRunner):
                     kv_caches[layer_name] = mxfp_cache_views_for_spec(
                         raw, current_kv_cache_spec, kernel_block_size,
                         fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
-                        qfa_fp8=self.ascend_config.c8_q_quant_mode in ("per_token", "per_token_head"),
+                        qfa_fp8=self.compilation_config.static_forward_context[layer_name].impl.q_quant_mode
+                        in ("per_token", "per_token_head"),
                     )
                     continue
 

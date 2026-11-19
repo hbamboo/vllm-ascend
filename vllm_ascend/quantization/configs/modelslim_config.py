@@ -727,7 +727,7 @@ class AscendModelSlimConfig(QuantizationConfig):
 
                 scheme = AscendC8KVCacheAttentionMethod(self.quant_description, prefix)
                 logger.debug("Select AscendKVCacheMethod(C8) for %s (layer=%s)", prefix, "AttentionLayerBase[C8]")
-            elif self.enable_mxfp_c8_quant and self._is_full_attention_layer(layer):
+            elif self.enable_mxfp_c8_quant and self._is_c8_mxfp_attention_layer(layer, runtime_prefix):
                 if self._has_mxfp_c8_recipe is False:
                     logger.warning_once(
                         "[quantization] --kv-cache-dtype mxfp8 is set but the checkpoint "
@@ -803,26 +803,19 @@ class AscendModelSlimConfig(QuantizationConfig):
         return False
 
     @staticmethod
-    def _is_full_attention_layer(layer: torch.nn.Module) -> bool:
-        """C8-MXFP only applies to standard full-attention ``Attention``
-        layers. Other AttentionLayerBase subclasses (GDN/Mamba, encoder
-        attention, ...) must not get the MXFP KV-cache method: they have no
-        ``num_kv_heads``/``head_size_v`` and install the QFA backend on the
-        wrong layer type.
+    def _is_c8_mxfp_attention_layer(layer: torch.nn.Module, prefix: str) -> bool:
+        """Select full/SWA Attention layers that resolved to MXFP8 cache.
 
-        Per-layer sliding-window ``Attention`` layers are excluded as well:
-        the C8-MXFP QFA path raises NotImplementedError for sliding-window
-        attention (AscendC8MXFPAttentionBackendImpl), and their
-        SlidingWindowSpec would neither be converted by ``mxfp_cache_spec``
-        nor receive the (k, v, k_scale, v_scale) cache tuple -- the mismatch
-        crashes ``_fill_c8_mxfp_v_scale_caches`` (``cache[3]`` on a raw K/V
-        tuple). Those layers keep their unquantized KV cache instead.
+        Respect per-layer cache skips and exclude the Eagle draft, whose
+        checkpoint has no C8 V scale. SWA layers without calibration retain
+        the existing neutral V scale initialized by create_weights.
         """
         from vllm.model_executor.layers.attention import Attention
 
         return (
             isinstance(layer, Attention)
-            and getattr(layer, "sliding_window", None) is None
+            and "mtp_model_layer" not in prefix
+            and str(getattr(layer, "kv_cache_dtype", "")).startswith("mxfp8")
         )
 
     @property

@@ -80,6 +80,15 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             config = get_ascend_config()
             self.q_quant_mode = config.c8_q_quant_mode
             self.v_quant_mode = config.c8_v_quant_mode
+            # The delivered QFA supports SWA in MXFP8 mode 1 only. Keep the
+            # configured full-attention scheme; use PR #13's scheme for SWA.
+            sliding_mxfp = getattr(layer, "sliding_window", None) is not None and self.q_quant_mode in (
+                "per_token",
+                "per_token_head",
+            )
+            if sliding_mxfp:
+                self.q_quant_mode = "per_token_group"
+                self.v_quant_mode = "per_channel"
             if self.q_quant_mode in ("per_token", "per_token_head"):
                 from vllm_ascend.attention.attention_c8_mxfp import AscendC8QFAFP8AttentionBackend
 
@@ -105,7 +114,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             # initialize the state the impl relies on here.
             layer.impl.enable_hamming_sparse = False
             layer.impl.q_quant_mode = self.q_quant_mode
-            layer.impl.k_quant_mode = config.c8_k_quant_mode
+            layer.impl.k_quant_mode = "per_token_group" if sliding_mxfp else config.c8_k_quant_mode
             layer.impl.v_quant_mode = self.v_quant_mode
             if (
                 self.q_quant_mode not in ("per_token", "per_token_head")

@@ -373,6 +373,35 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
         self.assertEqual(AscendAttentionBackend.get_supported_kernel_block_sizes(), [128])
         self.assertEqual(AscendC8MXFPAttentionBackend.get_supported_kernel_block_sizes(), [512])
 
+    def test_sliding_uses_mxfp8_without_changing_full_token_head_scheme(self):
+        from vllm_ascend.attention.attention_c8_mxfp import (
+            AscendC8MXFPAttentionBackend,
+            AscendC8QFAFP8AttentionBackend,
+        )
+
+        for window, backend, qk_mode in (
+            (None, AscendC8QFAFP8AttentionBackend, "per_token_head"),
+            (4096, AscendC8MXFPAttentionBackend, "per_token_group"),
+        ):
+            with self.subTest(window=window):
+                layer = self._make_layer(with_impl=True)
+                layer.head_size = layer.head_size_v = 128
+                layer.sliding_window = window
+                method = AscendC8MXFPKVCacheAttentionMethod({}, "layer")
+                with patch(
+                    "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config",
+                    return_value=SimpleNamespace(
+                        c8_q_quant_mode="per_token_head",
+                        c8_k_quant_mode="per_token_head",
+                        c8_v_quant_mode="per_channel",
+                    ),
+                ):
+                    method.create_weights(layer)
+                self.assertIs(layer.attn_backend, backend)
+                self.assertEqual(layer.impl.q_quant_mode, qk_mode)
+                self.assertEqual(layer.impl.k_quant_mode, qk_mode)
+                self.assertEqual(layer.impl.v_quant_mode, "per_channel")
+
     def test_installs_per_token_mode_on_swapped_impl(self):
         layer = self._make_layer(with_impl=True)
         layer.head_size = layer.head_size_v = 128

@@ -7,9 +7,10 @@ from types import SimpleNamespace
 import pytest
 import torch
 from vllm.v1.core.kv_cache_utils import KVCacheBlockCopy
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_ascend.attention.attention_c8_mxfp import (
+    is_mxfp_cache_spec,
     mxfp_cache_spec,
     mxfp_cache_views_for_spec,
     mxfp_packet_section_sizes,
@@ -78,6 +79,18 @@ def test_spec_keeps_real_head_dimensions_and_metadata():
     assert spec.state_content_bytes == 396
     assert spec.page_size_bytes == 512 * 396
     assert original.state_content_bytes is None
+
+
+def test_sliding_spec_preserves_window_and_budgets_scales():
+    original = SlidingWindowSpec(
+        block_size=512, num_kv_heads=1, head_size=128, dtype=torch.bfloat16, sliding_window=4096
+    )
+    spec = mxfp_cache_spec(original)
+    assert type(spec) is SlidingWindowSpec
+    assert spec.sliding_window == 4096
+    assert spec.page_size_bytes == mxfp_packet_size_bytes(1, 512, 128, 128)
+    assert is_mxfp_cache_spec(spec)
+    assert not is_mxfp_cache_spec(original)
 
 
 def test_d256_page_budget_includes_both_scales_once():

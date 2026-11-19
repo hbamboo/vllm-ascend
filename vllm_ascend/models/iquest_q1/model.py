@@ -489,6 +489,10 @@ class IQuestQ1Attention(nn.Module):
             # next to the target's promoted SWA window. Allocation is full
             # either way; clearing the module attr only changes the spec view.
             self.attn.sliding_window = None
+        if is_mtp_layer:
+            # The draft keeps BF16 even when every target layer uses C8.
+            self.attn.kv_cache_dtype = "auto"
+            self.attn.kv_cache_torch_dtype = vllm_config.model_config.dtype
 
     def sinks_k_weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         replicas = max(1, self.tp_size // self.total_num_kv_heads)

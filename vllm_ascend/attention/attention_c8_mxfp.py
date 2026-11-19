@@ -37,7 +37,7 @@ from vllm.v1.attention.backend import (  # type: ignore
     AttentionCGSupport,
     AttentionLayer,
 )
-from vllm.v1.kv_cache_interface import FullAttentionSpec
+from vllm.v1.kv_cache_interface import FullAttentionSpec, SlidingWindowSpec
 
 from vllm_ascend.attention.attention_v1 import (
     AscendAttentionBackend,
@@ -217,7 +217,7 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec") -> "FullAttentionSpec":
+def mxfp_cache_spec(spec: "FullAttentionSpec | SlidingWindowSpec") -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
@@ -244,7 +244,7 @@ def is_mxfp_cache_spec(spec: "KVCacheSpec") -> bool:
     BF16 layers. ``mxfp_cache_spec`` is what marks a layer as MXFP8, and it
     rewrites the dtype, so test the dtype instead of the global flag.
     """
-    return type(spec) is FullAttentionSpec and spec.dtype == torch.float8_e4m3fn
+    return type(spec) in (FullAttentionSpec, SlidingWindowSpec) and spec.dtype == torch.float8_e4m3fn
 
 
 def mxfp_paged_cache_views(
@@ -619,6 +619,7 @@ QFA_QUANT_MODE_MXFP8 = 1
 QFA_QUANT_MODE_FP8_PER_TOKEN = 6
 QFA_MASK_MODE_NO_MASK = 0
 QFA_MASK_MODE_CAUSAL = 3
+QFA_MASK_MODE_SLIDING_WINDOW = 4
 QFA_LAYOUT_TND = "TND"
 QFA_LAYOUT_N2TGD = "N2TGD"
 QFA_LAYOUT_PA_NZ = "PA_NZ"
@@ -741,19 +742,23 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """Return the QFA metadata plan (AICPU op output), derived once a step.
 
         The plan's inputs are all non-layer-specific (head counts, lengths,
-        mask mode, layouts), so one plan serves every full-attention layer of
-        a step. Sharing is safe under graph capture for the same reason as
+        mask mode, window, layouts), so layers with the same configuration
+        share a plan for each step. Sharing is safe under graph capture for the same reason as
         _qfa_step_lengths: the deriving call runs inside the captured region,
         ahead of every QFA call that reads its output, and the main operator
         treats ``metadata`` as a read-only input.
         """
         cache = self._qfa_step_cache(attn_metadata)
+        win_left = self.sliding_window - 1 if self.sliding_window is not None else -1
+        win_right = 0 if self.sliding_window is not None else -1
         plan_key = (
             self.num_heads,
             self.num_kv_heads,
             self.head_size,
             max_seqlen_q,
             mask_mode,
+            win_left,
+            win_right,
             layout_q_descale,
         )
         metadata = cache.get(plan_key)
@@ -775,8 +780,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 max_seqlen_q=max_seqlen_q,
                 max_seqlen_kv=-1,
                 mask_mode=mask_mode,
-                win_left=-1,
-                win_right=-1,
+                win_left=win_left,
+                win_right=win_right,
                 layout_q=QFA_LAYOUT_TND,
                 layout_q_descale=layout_q_descale,
                 layout_kv=QFA_LAYOUT_PA_NZ,
@@ -879,8 +884,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             metadata=qfa_metadata,
             softmax_scale=self.scale,
             mask_mode=mask_mode,
-            win_left=-1,
-            win_right=-1,
+            win_left=self.sliding_window - 1 if self.sliding_window is not None else -1,
+            win_right=0 if self.sliding_window is not None else -1,
             max_seqlen_q=max_seqlen_q,
             max_seqlen_kv=-1,
             layout_q=QFA_LAYOUT_TND,
@@ -933,8 +938,6 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         """
         if not attn_metadata.causal:
             raise NotImplementedError("C8_MXFP attention does not support non-causal attention yet.")
-        if self.sliding_window is not None:
-            raise NotImplementedError("C8_MXFP attention does not support sliding window attention yet.")
 
         # T as QFA sees it: the query rows actually fed to the operator
         # (forward slices query[:num_actual_tokens] before quantizing), so
@@ -966,6 +969,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # exactly equivalent to CAUSAL (the KV range is bounded by seqused_kv).
         # MTP verify steps (Q_S = 1 + num_spec) keep CAUSAL.
         mask_mode = QFA_MASK_MODE_NO_MASK if max_seqlen_q == 1 else QFA_MASK_MODE_CAUSAL
+        if self.sliding_window is not None:
+            mask_mode = QFA_MASK_MODE_SLIDING_WINDOW
 
         # Both operators have to agree on the q scale layout: it is what
         # picks the kernel, and the metadata plan is computed for that kernel.
