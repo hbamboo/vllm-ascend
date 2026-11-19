@@ -264,6 +264,7 @@ class TestC8MXFPQfaMetadataPlan(TestBase):
 
     def setUp(self):
         self.impl = object.__new__(AscendC8MXFPAttentionBackendImpl)
+        self.impl.sliding_window = None
         self.impl.num_heads = 8
         self.impl.num_kv_heads = 2
         self.impl.head_size = 128

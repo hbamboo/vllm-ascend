@@ -4430,7 +4430,7 @@ class TestC8MXFPVScaleCacheFill(unittest.TestCase):
         runner._kv_block_zeroer.zero_block_ids.assert_called_once_with([1])
 
     def test_v1_reshape_uses_flat_kernel_size_and_physical_page_padding(self):
-        runner = self._runner({})
+        runner = self._runner({"attn": self._c8_layer()})
         spec = mxfp_cache_spec(
             FullAttentionSpec(
                 block_size=1024,
