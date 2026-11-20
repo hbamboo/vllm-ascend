@@ -6367,7 +6367,8 @@ class NPUModelRunner(GPUModelRunner):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
                         spec = mxfp_cache_spec(
-                            spec, reserve_k_offset=getattr(getattr(attn_module, "impl", None), "k_offset_reserve", False)
+                            spec,
+                            reserve_k_offset=getattr(getattr(attn_module, "impl", None), "k_offset_reserve", False),
                         )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)

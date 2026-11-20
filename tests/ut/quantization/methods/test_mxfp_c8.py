@@ -516,8 +516,11 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
     def test_online_k_offsets_select_only_full_layers_and_keep_uniform_reservation(self):
         for mode in ("per_token_head_scalar", "per_block_fp8_anchor"):
             config = SimpleNamespace(
-                c8_q_quant_mode="per_token_head", c8_k_quant_mode="per_token_head", c8_v_quant_mode="per_channel",
-                c8_k_offset_mode=mode, c8_k_offset_layers=[86],
+                c8_q_quant_mode="per_token_head",
+                c8_k_quant_mode="per_token_head",
+                c8_v_quant_mode="per_channel",
+                c8_k_offset_mode=mode,
+                c8_k_offset_layers=[86],
             )
             for index, window in ((85, None), (86, None), (86, 4096)):
                 with self.subTest(mode=mode, index=index, window=window):

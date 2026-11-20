@@ -18,7 +18,8 @@ class TestQfaKOffsetPages(unittest.TestCase):
         root = next(p for p in Path(__file__).resolve().parents if (p / "vllm_ascend").is_dir())
         path = root / "vllm_ascend/worker/utils.py"
         copy = next(
-            node for node in ast.parse(path.read_text(encoding="utf-8")).body
+            node
+            for node in ast.parse(path.read_text(encoding="utf-8")).body
             if isinstance(node, ast.FunctionDef) and node.name == "copy_kv_cache_blocks_inplace"
         )
         future = ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0)
@@ -35,15 +36,16 @@ class TestQfaKOffsetPages(unittest.TestCase):
                     # before hybrid alignment supplies additional page padding.
                     pitch = heads * 128 * 268
                     spec = SimpleNamespace(
-                        num_kv_heads=heads, head_size=128, head_size_v=128,
-                        block_size=512, page_size_bytes=pitch * 4,
+                        num_kv_heads=heads,
+                        head_size=128,
+                        head_size_v=128,
+                        block_size=512,
+                        page_size_bytes=pitch * 4,
                     )
                     guard = 32
                     backing = torch.full((2 * spec.page_size_bytes + 2 * guard,), 29, dtype=torch.int8)
                     raw = backing[guard:-guard]
-                    cache = self.helpers.mxfp_cache_views_for_spec(
-                        raw, spec, 128, qfa_fp8=True, k_offset_mode=mode
-                    )
+                    cache = self.helpers.mxfp_cache_views_for_spec(raw, spec, 128, qfa_fp8=True, k_offset_mode=mode)
                     self.assertEqual(len(cache), 5 if mode == "per_token_head_scalar" else 6)
                     ranges = []
                     for index, view in enumerate(cache):
@@ -59,11 +61,11 @@ class TestQfaKOffsetPages(unittest.TestCase):
                     self.copy_pages([cache], 2, [SimpleNamespace(src_block_id=0, dst_block_id=1)])
                     for view in cache:
                         torch.testing.assert_close(view[:4].view(torch.uint8), view[4:].view(torch.uint8))
-                    saved = raw[spec.page_size_bytes:].clone()
-                    raw[:spec.page_size_bytes].zero_()
+                    saved = raw[spec.page_size_bytes :].clone()
+                    raw[: spec.page_size_bytes].zero_()
                     for view in cache:
                         self.assertTrue(torch.all(view[:4].view(torch.uint8) == 0))
-                    torch.testing.assert_close(raw[spec.page_size_bytes:], saved)
+                    torch.testing.assert_close(raw[spec.page_size_bytes :], saved)
                     self.assertTrue(torch.all(backing[:guard] == 29))
                     self.assertTrue(torch.all(backing[-guard:] == 29))
 

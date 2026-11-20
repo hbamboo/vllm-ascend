@@ -8,12 +8,21 @@ from vllm.triton_utils import tl, triton
 
 @triton.jit
 def _initialize_anchor(
-    key, slots, anchor, descale,
-    KT: tl.constexpr, KH: tl.constexpr, KD: tl.constexpr,
+    key,
+    slots,
+    anchor,
+    descale,
+    KT: tl.constexpr,
+    KH: tl.constexpr,
+    KD: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
-    AB: tl.constexpr, AH: tl.constexpr, AD: tl.constexpr,
-    SB: tl.constexpr, SH: tl.constexpr,
-    BLOCK_TOKENS: tl.constexpr, HEAD_DIM: tl.constexpr,
+    AB: tl.constexpr,
+    AH: tl.constexpr,
+    AD: tl.constexpr,
+    SB: tl.constexpr,
+    SH: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
     head = tl.program_id(1).to(tl.int64)
@@ -36,12 +45,24 @@ def _initialize_anchor(
 
 @triton.jit
 def _quantize_offset_k(
-    key, slots, anchor, anchor_descale, codes, scales,
-    KT: tl.constexpr, KH: tl.constexpr, KD: tl.constexpr,
+    key,
+    slots,
+    anchor,
+    anchor_descale,
+    codes,
+    scales,
+    KT: tl.constexpr,
+    KH: tl.constexpr,
+    KD: tl.constexpr,
     SLOT_STRIDE: tl.constexpr,
-    AB: tl.constexpr, AH: tl.constexpr, AD: tl.constexpr,
-    SB: tl.constexpr, SH: tl.constexpr,
-    NUM_HEADS: tl.constexpr, BLOCK_TOKENS: tl.constexpr, HEAD_DIM: tl.constexpr,
+    AB: tl.constexpr,
+    AH: tl.constexpr,
+    AD: tl.constexpr,
+    SB: tl.constexpr,
+    SH: tl.constexpr,
+    NUM_HEADS: tl.constexpr,
+    BLOCK_TOKENS: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
     SCALAR: tl.constexpr,
 ):
     token = tl.program_id(0).to(tl.int64)
@@ -90,17 +111,36 @@ def quantize_qfa_k_offset(key, slot_mapping, kv_cache, mode):
     descale = kv_cache[5] if not scalar else scales
     descale_strides = descale.stride() if not scalar else (0, 0)
     common = (
-        *key.stride(), slot_mapping.stride(0), *offset.stride(), *descale_strides,
+        *key.stride(),
+        slot_mapping.stride(0),
+        *offset.stride(),
+        *descale_strides,
     )
     if not scalar:
         _initialize_anchor[(tokens, heads)](
-            key, slot_mapping, offset, descale, *common,
-            BLOCK_TOKENS=kv_cache[0].shape[2], HEAD_DIM=dim,
-            num_warps=4, enable_fp_fusion=False,
+            key,
+            slot_mapping,
+            offset,
+            descale,
+            *common,
+            BLOCK_TOKENS=kv_cache[0].shape[2],
+            HEAD_DIM=dim,
+            num_warps=4,
+            enable_fp_fusion=False,
         )
     _quantize_offset_k[(tokens, heads)](
-        key, slot_mapping, offset, descale, codes, scales, *common,
-        NUM_HEADS=heads, BLOCK_TOKENS=kv_cache[0].shape[2], HEAD_DIM=dim,
-        SCALAR=scalar, num_warps=4, enable_fp_fusion=False,
+        key,
+        slot_mapping,
+        offset,
+        descale,
+        codes,
+        scales,
+        *common,
+        NUM_HEADS=heads,
+        BLOCK_TOKENS=kv_cache[0].shape[2],
+        HEAD_DIM=dim,
+        SCALAR=scalar,
+        num_warps=4,
+        enable_fp_fusion=False,
     )
     return codes, scales
