@@ -102,6 +102,100 @@ class TestQfaKOffsetNPU(unittest.TestCase):
                 self.assertTrue(torch.all(codes.cpu().view(torch.uint8) == 0))
                 self.assertTrue(torch.all(scale.cpu() == 1))
 
+    def test_graph_replay_refreshes_key_slots_and_anchor_lifetime(self):
+        torch.manual_seed(189)
+        heads, dim, pitch = 2, 128, 2 * 128 * 268 + 64
+        spec = SimpleNamespace(num_kv_heads=heads, head_size=dim, head_size_v=dim)
+        inputs = (torch.randn(5, heads, dim) * 2 + torch.arange(5)[:, None, None] * 3).bfloat16()
+        for mode in ("per_token_head_scalar", "per_block_fp8_anchor"):
+            with self.subTest(mode=mode):
+                raw = torch.full((4 * pitch,), 37, dtype=torch.int8, device="npu")
+                eager_raw = torch.empty_like(raw)
+                cache = self.helpers.qfa_fp8_cache_views(
+                    raw, 4, spec, 128, page_stride_bytes=pitch, k_offset_mode=mode
+                )
+                eager_cache = self.helpers.qfa_fp8_cache_views(
+                    eager_raw, 4, spec, 128, page_stride_bytes=pitch, k_offset_mode=mode
+                )
+                key = inputs[0:1].npu()
+                slots = torch.tensor([256], dtype=torch.int64, device="npu")
+                input_addresses = (key.data_ptr(), slots.data_ptr())
+                for _ in range(3):
+                    self.quantize(key, slots, cache, mode)
+                torch.npu.synchronize()
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    codes, scale = self.quantize(key, slots, cache, mode)
+                torch.npu.synchronize()
+                output_addresses = (codes.data_ptr(), scale.data_ptr())
+                raw.fill_(37)
+
+                # One captured decode shape: open, append, padding, another
+                # page, then the first page assigned to a different request.
+                for step, slot in enumerate((256, 257, -1, 384, 256)):
+                    if step == 4:
+                        raw[2 * pitch:3 * pitch].zero_()
+                    key.copy_(inputs[step:step + 1].npu())
+                    slots.copy_(torch.tensor([slot], dtype=torch.int64, device="npu"))
+                    before = raw.cpu().clone()
+                    eager_raw.copy_(raw)
+                    graph.replay()
+                    torch.npu.synchronize()
+                    actual_codes, actual_scale = codes.cpu(), scale.cpu()
+                    eager_codes, eager_scale = self.quantize(key, slots, eager_cache, mode)
+                    torch.npu.synchronize()
+                    torch.testing.assert_close(actual_codes.view(torch.uint8), eager_codes.cpu().view(torch.uint8))
+                    torch.testing.assert_close(actual_scale, eager_scale.cpu(), rtol=0, atol=0)
+                    torch.testing.assert_close(raw.cpu(), eager_raw.cpu())
+                    self.assertEqual(input_addresses, (key.data_ptr(), slots.data_ptr()))
+                    self.assertEqual(output_addresses, (codes.data_ptr(), scale.data_ptr()))
+                    if slot < 0:
+                        torch.testing.assert_close(raw.cpu(), before)
+                        self.assertTrue(torch.all(actual_codes.view(torch.uint8) == 0))
+                        self.assertTrue(torch.all(actual_scale == 1))
+                        continue
+
+                    block, position = divmod(slot, 128)
+                    kc = inputs[step:step + 1].float()
+                    if mode == "per_token_head_scalar":
+                        offset = (kc.amax(-1, keepdim=True) + kc.amin(-1, keepdim=True)) * 0.5
+                        torch.testing.assert_close(cache[4][block, :, position].cpu(), offset[0, :, 0], rtol=0, atol=0)
+                        if position:
+                            # Appending a scalar must not overwrite the first token.
+                            first = inputs[0].float()
+                            torch.testing.assert_close(
+                                cache[4][block, :, 0].cpu(),
+                                (first.amax(-1) + first.amin(-1)) * 0.5,
+                                rtol=0,
+                                atol=0,
+                            )
+                    else:
+                        if position == 0:
+                            anchor_scale = kc.abs().amax(-1, keepdim=True) / 448
+                            anchor_scale = torch.where(anchor_scale == 0, 1, anchor_scale)
+                            anchor_code = (kc / anchor_scale).clamp(-448, 448).to(torch.float8_e4m3fn)
+                            torch.testing.assert_close(
+                                cache[4][block].view(torch.uint8).cpu(), anchor_code[0].view(torch.uint8)
+                            )
+                            torch.testing.assert_close(cache[5][block].cpu(), anchor_scale[0, :, 0], rtol=1e-6, atol=0)
+                        else:
+                            torch.testing.assert_close(
+                                raw[block * pitch:(block + 1) * pitch].cpu(),
+                                before[block * pitch:(block + 1) * pitch],
+                            )
+                        offset = cache[4][block].cpu().float()[None] * cache[5][block].cpu()[None, :, None]
+                    residual = kc - offset
+                    expected_scale = residual.abs().amax(-1) / 448
+                    expected_scale = torch.where(expected_scale == 0, 1, expected_scale)
+                    torch.testing.assert_close(actual_scale, expected_scale, rtol=2e-6, atol=1e-8)
+                    reconstructed = actual_codes.float() * actual_scale[..., None] + offset
+                    self.assertTrue(torch.all((reconstructed - kc).abs().amax(-1) <= expected_scale * 16.01))
+                    # Cache writes follow the refreshed slot, preserving every
+                    # other page, including the previous request's prefix page.
+                    actual_raw = raw.cpu()
+                    torch.testing.assert_close(actual_raw[:block * pitch], before[:block * pitch])
+                    torch.testing.assert_close(actual_raw[(block + 1) * pitch:], before[(block + 1) * pitch:])
+
 
 if __name__ == "__main__":
     unittest.main()
