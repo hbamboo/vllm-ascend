@@ -217,14 +217,18 @@ def mxfp_packet_size_bytes(num_kv_heads: int, block_size: int, k_dim: int, v_dim
     return sum(mxfp_packet_section_sizes(num_kv_heads, block_size, k_dim, v_dim))
 
 
-def mxfp_cache_spec(spec: "FullAttentionSpec | SlidingWindowSpec") -> "FullAttentionSpec | SlidingWindowSpec":
+def mxfp_cache_spec(
+    spec: "FullAttentionSpec | SlidingWindowSpec", *, reserve_k_offset: bool = False
+) -> "FullAttentionSpec | SlidingWindowSpec":
     """Budget scales through upstream state_content_bytes, preserving real D."""
     k_dim, v_dim = spec.head_size, spec.head_size_v
     if spec.tokens_per_state != 1 or spec.num_heads != spec.num_kv_heads:
         raise ValueError("MXFP cache requires one stored state per token and one slot per KV head.")
     mxfp_packet_section_sizes(spec.num_kv_heads, spec.block_size, k_dim, v_dim)
     result = replace(
-        spec, dtype=torch.float8_e4m3fn, state_content_bytes=k_dim + v_dim + (k_dim + v_dim) // MXFP8_GROUP_SIZE
+        spec,
+        dtype=torch.float8_e4m3fn,
+        state_content_bytes=k_dim + v_dim + (k_dim + v_dim) // MXFP8_GROUP_SIZE + (4 if reserve_k_offset else 0),
     )
     if result.page_size_padded is not None and result.page_size_padded < result.unpadded_page_size_bytes:
         raise ValueError("MXFP padded page is smaller than its K/V and scale payload.")
@@ -295,6 +299,7 @@ def mxfp_cache_views_for_spec(
     *,
     fia_pseudo: bool = False,
     qfa_fp8: bool = False,
+    k_offset_mode: str = "none",
 ):
     """Translate scheduler pages (including padding) into kernel block views."""
     if kernel_block_size <= 0 or spec.block_size % kernel_block_size:
@@ -310,6 +315,7 @@ def mxfp_cache_views_for_spec(
             spec,
             kernel_block_size,
             page_stride_bytes=page_bytes // ratio,
+            k_offset_mode=k_offset_mode,
         )
     if fia_pseudo:
         return fia_pseudo_cache_views(
@@ -330,13 +336,36 @@ def mxfp_cache_views_for_spec(
     )
 
 
-def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride_bytes=None):
+def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride_bytes=None, k_offset_mode="none"):
     """PA_BNBD FP8 payloads and FP32 token K scales in each scheduler page."""
     if block_size != 128 or spec.head_size != 128 or spec.head_size_v != 128:
         raise ValueError("QFA FP8 per-token requires 128-token kernel pages and 128-wide K/V heads.")
     kv_bytes = spec.num_kv_heads * block_size * spec.head_size
     scale_bytes = spec.num_kv_heads * block_size * 4
     payload_bytes = 2 * kv_bytes + scale_bytes + spec.num_kv_heads * 4
+    sections = [
+        (kv_shape := (num_blocks, spec.num_kv_heads, block_size, spec.head_size), 0, torch.float8_e4m3fn, 1),
+        (kv_shape, kv_bytes, torch.float8_e4m3fn, 1),
+        ((num_blocks, spec.num_kv_heads, block_size), 2 * kv_bytes, torch.float32, 4),
+        ((num_blocks, spec.num_kv_heads), 2 * kv_bytes + scale_bytes, torch.float32, 4),
+    ]
+    if k_offset_mode != "none":
+        # Explicit extra section; the preceding V scale retains its original meaning.
+        offset_start = (payload_bytes + 31) // 32 * 32
+        if k_offset_mode == "per_token_head_scalar":
+            sections.append(((num_blocks, spec.num_kv_heads, block_size), offset_start, torch.float32, 4))
+            payload_bytes = offset_start + scale_bytes
+        elif k_offset_mode == "per_block_fp8_anchor":
+            anchor_bytes = spec.num_kv_heads * spec.head_size
+            sections.extend(
+                [
+                    ((num_blocks, spec.num_kv_heads, spec.head_size), offset_start, torch.float8_e4m3fn, 1),
+                    ((num_blocks, spec.num_kv_heads), offset_start + anchor_bytes, torch.float32, 4),
+                ]
+            )
+            payload_bytes = offset_start + anchor_bytes + spec.num_kv_heads * 4
+        else:
+            raise ValueError(f"Unsupported QFA K offset mode: {k_offset_mode}")
     pitch = payload_bytes if page_stride_bytes is None else page_stride_bytes
     if (
         raw_tensor.ndim != 1
@@ -348,15 +377,8 @@ def qfa_fp8_cache_views(raw_tensor, num_blocks, spec, block_size, *, page_stride
         or raw_tensor.storage_offset() % 4
     ):
         raise ValueError("QFA FP8 cache requires aligned complete pages containing K, V and FP32 K scales.")
-    kv_shape = (num_blocks, spec.num_kv_heads, block_size, spec.head_size)
-    scale_shape = (num_blocks, spec.num_kv_heads, block_size)
     views = []
-    for shape, offset, dtype, size in (
-        (kv_shape, 0, torch.float8_e4m3fn, 1),
-        (kv_shape, kv_bytes, torch.float8_e4m3fn, 1),
-        (scale_shape, 2 * kv_bytes, torch.float32, 4),
-        ((num_blocks, spec.num_kv_heads), 2 * kv_bytes + scale_bytes, torch.float32, 4),
-    ):
+    for shape, offset, dtype, size in sections:
         strides = (pitch // size, *(math.prod(shape[i + 1 :]) for i in range(1, len(shape))))
         views.append(
             torch.as_strided(
@@ -661,6 +683,8 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     k_quant_mode: str = "per_token_group"
     q_quant_mode: str = "per_token_group"
     v_quant_mode: str = "per_channel"
+    k_offset_mode: str = "none"
+    k_offset_reserve: bool = False
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata, *, shared: bool = False) -> dict:
         if shared:
@@ -1065,9 +1089,16 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             owner = self.vllm_config.compilation_config.static_forward_context[self.kv_sharing_target_layer_name].impl
         elif key is not None and value is not None:
             key = key[:num_tokens].reshape(num_tokens, self.num_kv_heads, self.head_size)
-            key8, key_scale = torch_npu.npu_dynamic_quant(
-                key if token_head else key.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
-            )
+            if self.k_offset_mode != "none":
+                from vllm_ascend.ops.triton.qfa_k_offset import quantize_qfa_k_offset
+
+                key8, key_scale = quantize_qfa_k_offset(
+                    key, attn_metadata.slot_mapping[:num_tokens], kv_cache, self.k_offset_mode
+                )
+            else:
+                key8, key_scale = torch_npu.npu_dynamic_quant(
+                    key if token_head else key.flatten(1), dst_type=torch.float8_e4m3fn, quant_mode="pertoken"
+                )
             if token_head:
                 value8 = torch_npu.npu_quantize(
                     value[:num_tokens].reshape(num_tokens, -1),
@@ -1134,6 +1165,12 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             query_scale.t().contiguous() if token_head else query_scale[None, :].expand(self.num_heads, -1).contiguous()
         )
         sink_key = getattr(layer, "sink_key", None)
+        offset_options = {}
+        if owner.k_offset_mode != "none":
+            offset_options = {
+                "k_offset": kv_cache[4],
+                "k_offset_descale": kv_cache[5] if owner.k_offset_mode == "per_block_fp8_anchor" else None,
+            }
         attn_output, lse = quant_flash_attn(
             query_ntd,
             kv_cache[0],
@@ -1157,6 +1194,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
             layout_kv="PA_BNBD",
             layout_out="TND",
             return_softmax_lse=sink_key is not None,
+            **offset_options,
         )
         if sink_key is not None or token_head:
             qfa_sink_apply_triton(

@@ -339,7 +339,9 @@ def get_kv_cache_spec(vllm_config: VllmConfig) -> dict[str, KVCacheSpec]:
         # the packet-packed FP8 layout made the BF16 kernels write into an FP8
         # cache (Invalid_Argument_Tensor_Dtype in ScatterPaKvCache).
         if is_c8_mxfp_kv_quant(vllm_config) and is_mxfp_cache_spec(spec):
-            spec = mxfp_cache_spec(spec)
+            spec = mxfp_cache_spec(
+                spec, reserve_k_offset=getattr(getattr(attn_module, "impl", None), "k_offset_reserve", False)
+            )
         kv_cache_spec[layer_name] = spec
         if isinstance(spec, AttentionSpec) and getattr(attn_module, "align_kv_cache_with_mamba", True):
             attention_layer_names.append(layer_name)
@@ -1634,6 +1636,9 @@ def _reshape_kv_cache_v2(
                     fia_pseudo=(vllm_config.additional_config or {}).get("c8_v_quant_mode") == "per_token",
                     qfa_fp8=vllm_config.compilation_config.static_forward_context[layer_name].impl.q_quant_mode
                     in ("per_token", "per_token_head"),
+                    k_offset_mode=getattr(
+                        vllm_config.compilation_config.static_forward_context[layer_name].impl, "k_offset_mode", "none"
+                    ),
                 )
                 continue
 

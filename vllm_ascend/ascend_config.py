@@ -593,6 +593,10 @@ class AscendConfig:
     c8_q_quant_mode: Literal["per_token_group", "per_token", "per_token_head"] = "per_token_group"
     # Dynamic per-token V selects FIA; dynamic per-head V selects QFA mode 6.
     c8_v_quant_mode: Literal["per_channel", "per_token", "per_head"] = "per_channel"
+    # Online K offsets, reconstructed by QFA before softmax; no calibration table.
+    c8_k_offset_mode: Literal["none", "per_token_head_scalar", "per_block_fp8_anchor"] = "none"
+    # Optional tracing subset. None applies the selected mode to every full layer.
+    c8_k_offset_layers: list[int] | None = None
     enable_mc2_hierarchy_comm: bool = False  # deprecated, will be replaced by mc2_comm_alg = "hierarchy"
     enable_dsa_cp: bool = False
     sfa_dcp_force_tmajor_restore: bool = False
@@ -711,6 +715,15 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.c8_k_offset_mode != "none" and (
+            self.c8_q_quant_mode != "per_token_head"
+            or self.c8_k_quant_mode != "per_token_head"
+            or self.c8_v_quant_mode != "per_channel"
+        ):
+            raise ValueError("c8_k_offset_mode requires per_token_head Q/K and per_channel V.")
+        if self.c8_k_offset_layers is not None:
+            if self.c8_k_offset_mode == "none" or any(layer < 0 for layer in self.c8_k_offset_layers):
+                raise ValueError("c8_k_offset_layers requires an offset mode and nonnegative layer indices.")
         if self.c8_q_quant_mode in ("per_token", "per_token_head"):
             import torch
 

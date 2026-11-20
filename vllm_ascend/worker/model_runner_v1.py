@@ -5516,6 +5516,9 @@ class NPUModelRunner(GPUModelRunner):
                         fia_pseudo=self.ascend_config.c8_v_quant_mode == "per_token",
                         qfa_fp8=self.compilation_config.static_forward_context[layer_name].impl.q_quant_mode
                         in ("per_token", "per_token_head"),
+                        k_offset_mode=getattr(
+                            self.compilation_config.static_forward_context[layer_name].impl, "k_offset_mode", "none"
+                        ),
                     )
                     continue
 
@@ -6363,7 +6366,9 @@ class NPUModelRunner(GPUModelRunner):
             elif isinstance(attn_module, Attention):
                 if spec := attn_module.get_kv_cache_spec(self.vllm_config):
                     if self._is_c8_mxfp_kv_cache(spec):
-                        spec = mxfp_cache_spec(spec)
+                        spec = mxfp_cache_spec(
+                            spec, reserve_k_offset=getattr(getattr(attn_module, "impl", None), "k_offset_reserve", False)
+                        )
                     kv_cache_spec[layer_name] = spec
                     attn_layer_names.add(layer_name)
             elif isinstance(attn_module, MLAAttention):

@@ -513,6 +513,25 @@ class TestAscendC8MXFPKVCacheAttentionMethod(TestBase):
                 ):
                     AscendC8MXFPKVCacheAttentionMethod({}, "layer").create_weights(layer)
 
+    def test_online_k_offsets_select_only_full_layers_and_keep_uniform_reservation(self):
+        for mode in ("per_token_head_scalar", "per_block_fp8_anchor"):
+            config = SimpleNamespace(
+                c8_q_quant_mode="per_token_head", c8_k_quant_mode="per_token_head", c8_v_quant_mode="per_channel",
+                c8_k_offset_mode=mode, c8_k_offset_layers=[86],
+            )
+            for index, window in ((85, None), (86, None), (86, 4096)):
+                with self.subTest(mode=mode, index=index, window=window):
+                    layer = self._make_layer(with_impl=True)
+                    layer.head_size = layer.head_size_v = 128
+                    layer.sliding_window = window
+                    with patch(
+                        "vllm_ascend.quantization.methods.kv_cache.mxfp_c8.get_ascend_config", return_value=config
+                    ):
+                        AscendC8MXFPKVCacheAttentionMethod({}, f"model.layers.{index}.self_attn").create_weights(layer)
+                    self.assertEqual(layer.impl.k_offset_reserve, window is None)
+                    self.assertEqual(layer.impl.k_offset_mode, mode if index == 86 and window is None else "none")
+                    self.assertEqual(layer.impl.q_quant_mode, "per_token_group" if window else "per_token_head")
+
     def test_qfa_fp8_does_not_apply_the_mx_block_width_limit(self):
         for q_mode, v_mode in (("per_token", "per_head"), ("per_token_head", "per_channel")):
             with self.subTest(q_mode=q_mode):

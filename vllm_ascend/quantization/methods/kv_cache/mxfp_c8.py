@@ -116,6 +116,16 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             layer.impl.q_quant_mode = self.q_quant_mode
             layer.impl.k_quant_mode = "per_token_group" if sliding_mxfp else config.c8_k_quant_mode
             layer.impl.v_quant_mode = self.v_quant_mode
+            # Reserve equal full-layer pages even when tracing selects a subset.
+            offset_mode = getattr(config, "c8_k_offset_mode", "none")
+            layer.impl.k_offset_reserve = offset_mode != "none" and not sliding_mxfp
+            layer.impl.k_offset_mode = offset_mode if layer.impl.k_offset_reserve else "none"
+            offset_layers = getattr(config, "c8_k_offset_layers", None)
+            if layer.impl.k_offset_reserve and offset_layers is not None:
+                from vllm.model_executor.models.utils import extract_layer_index
+
+                if extract_layer_index(self.prefix) not in offset_layers:
+                    layer.impl.k_offset_mode = "none"
             if (
                 self.q_quant_mode not in ("per_token", "per_token_head")
                 and layer.impl.k_quant_mode == "per_token"
