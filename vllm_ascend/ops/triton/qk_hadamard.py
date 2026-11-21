@@ -61,6 +61,10 @@ def hadamard128(input: torch.Tensor, *, output_dtype: torch.dtype | None = None)
     if input.dtype not in (torch.bfloat16, torch.float32) or output_dtype not in (torch.bfloat16, torch.float32):
         raise ValueError("H128 supports BF16/FP32 input and output.")
     source = input.unsqueeze(0) if input.ndim == 2 else input
+    # The Ascend gather lowering rejects a non-unit inner stride. Production
+    # post-RoPE Q/K have unit inner stride; materialize only sliced channels.
+    if source.stride(-1) != 1:
+        source = source.contiguous()
     output = torch.empty(source.shape, dtype=output_dtype, device=input.device)
     rows = source.shape[0] * source.shape[1]
     if rows:

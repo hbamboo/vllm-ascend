@@ -89,7 +89,8 @@ class TestC8QKHadamardNPU(unittest.TestCase):
             with patch.object(self.helpers.AscendC8MXFPAttentionBackendImpl, "c8_qk_rotation", "hadamard"):
                 case = self.swa_fixture.make_case(6, 300, kv_len=513)
         else:
-            case = self.full_fixture.make_case(6, kv_heads=2, kv_len=257)
+            # The independent P448 reference below models one softmax block.
+            case = self.full_fixture.make_case(6, kv_heads=2, kv_len=128)
             case.impl.q_quant_mode = case.impl.k_quant_mode = "per_token_head"
             case.impl.v_quant_mode = "per_channel"
             case.channel_scale = torch.exp2(torch.arange(256, device="npu").remainder(4).float() - 1).reshape(2, 128)
@@ -149,7 +150,23 @@ class TestC8QKHadamardNPU(unittest.TestCase):
         sink = case.layer._c8_rotated_sink_key.cpu().double().repeat_interleave(group, 0)
         sink_logits = (sink_q * sink[None]).sum(-1) * case.impl.scale
         expected *= torch.sigmoid(lse.t() - sink_logits)[..., None]
-        return expected, lse, k8
+        ideal = expected
+        if not sliding:
+            assert used <= 128, "Single-block P448 reference cannot model online multi-block softmax"
+            # Native PV consumes E4M3(exp(score - max) * 448), retaining the
+            # unquantized denominator. Native output rounds to BF16 before
+            # the fused sink epilogue restores channel scales in FP32 and
+            # applies the FP32 sink factor, then rounds once more to BF16.
+            scores_fp32 = scores.float()
+            exp_scores = (scores_fp32 - scores_fp32.amax(-1, keepdim=True)).exp()
+            p8 = (exp_scores * 448).to(torch.float8_e4m3fn).float()
+            pv = torch.einsum("hts,shd->thd", p8, v8.cpu().float()[:used].repeat_interleave(group, 1))
+            native_output = (pv / (exp_scores.sum(-1).t()[..., None] * 448)).bfloat16()
+            channel_scale = vscale.float().repeat_interleave(group, 0)
+            sink_logits_fp32 = (qhat.float() * sink.float()[None]).sum(-1) * case.impl.scale
+            factor = torch.sigmoid(lse.t().float() - sink_logits_fp32)
+            expected = (native_output.float() * channel_scale[None] * factor[..., None]).bfloat16().double()
+        return expected, lse, k8, ideal
 
     def check_cached_k(self, case, sliding, k8):
         cached = case.cache[0].view(torch.uint8).cpu()
@@ -184,10 +201,20 @@ class TestC8QKHadamardNPU(unittest.TestCase):
                     for _ in range(3):
                         run()
                     torch.npu.synchronize()
-                    expected, lse, k8 = self.golden(case, sliding)
+                    expected, lse, k8, ideal = self.golden(case, sliding)
                     self.check_cached_k(case, sliding, k8)
                     torch.testing.assert_close(captured[-1][1].cpu().double(), lse, rtol=1e-4, atol=1e-3)
-                    torch.testing.assert_close(case.output.cpu().double(), expected, rtol=0.03, atol=0.005)
+                    output_rtol, output_atol = (0.03, 0.005) if sliding else (0.008, 1e-4)
+                    print(
+                        "H128_PV_DIAGNOSTIC",
+                        "SWA" if sliding else "FULL_SINGLE_BLOCK_P448",
+                        {
+                            "ideal_max_abs": (case.output.cpu().double() - ideal).abs().max().item(),
+                            "native_reference_max_abs": (case.output.cpu().double() - expected).abs().max().item(),
+                        },
+                        flush=True,
+                    )
+                    torch.testing.assert_close(case.output.cpu().double(), expected, rtol=output_rtol, atol=output_atol)
                     graph = torch.npu.NPUGraph()
                     with torch.npu.graph(graph):
                         run()
@@ -202,9 +229,21 @@ class TestC8QKHadamardNPU(unittest.TestCase):
                         torch.npu.synchronize()
                         torch.testing.assert_close(graph_output, eager, rtol=0, atol=0)
                         torch.testing.assert_close(replay_lse, captured[-1][1], rtol=0, atol=0)
-                        expected, lse, _ = self.golden(case, sliding)
+                        expected, lse, _, ideal = self.golden(case, sliding)
                         torch.testing.assert_close(replay_lse.cpu().double(), lse, rtol=1e-4, atol=1e-3)
-                        torch.testing.assert_close(graph_output.cpu().double(), expected, rtol=0.03, atol=0.005)
+                        print(
+                            "H128_PV_GRAPH_DIAGNOSTIC",
+                            "SWA" if sliding else "FULL_SINGLE_BLOCK_P448",
+                            {
+                                "factor": factor,
+                                "ideal_max_abs": (graph_output.cpu().double() - ideal).abs().max().item(),
+                                "native_reference_max_abs": (graph_output.cpu().double() - expected).abs().max().item(),
+                            },
+                            flush=True,
+                        )
+                        torch.testing.assert_close(
+                            graph_output.cpu().double(), expected, rtol=output_rtol, atol=output_atol
+                        )
                 print("H128_QUANT_QFA_GRAPH_PASS", "SWA" if sliding else "FULL", flush=True)
 
 
