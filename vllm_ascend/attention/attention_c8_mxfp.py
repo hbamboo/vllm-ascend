@@ -684,7 +684,14 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
     q_quant_mode: str = "per_token_group"
     v_quant_mode: str = "per_channel"
     k_offset_mode: str = "none"
+    c8_qk_rotation: str = "none"
     k_offset_reserve: bool = False
+
+    def _qfa_sink_key(self, layer):
+        sink_key = getattr(layer, "sink_key", None)
+        if sink_key is not None and self.c8_qk_rotation == "hadamard":
+            return layer._c8_rotated_sink_key
+        return sink_key
 
     def _qfa_step_cache(self, attn_metadata: AscendMetadata, *, shared: bool = False) -> dict:
         if shared:
@@ -1164,7 +1171,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         scale_nt = (
             query_scale.t().contiguous() if token_head else query_scale[None, :].expand(self.num_heads, -1).contiguous()
         )
-        sink_key = getattr(layer, "sink_key", None)
+        sink_key = self._qfa_sink_key(layer)
         offset_options = {}
         if owner.k_offset_mode != "none":
             offset_options = {
@@ -1257,6 +1264,15 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
                 f"{len(kv_cache) if kv_cache is not None else 0}."
             )
 
+        if self.c8_qk_rotation == "hadamard":
+            from vllm_ascend.ops.triton.qk_hadamard import hadamard128
+
+            # The model has already applied QK norm/RoPE. Cache owners rotate
+            # K once before quantization; sharing consumers rotate only Q.
+            query = hadamard128(query.reshape(query.shape[0], self.num_heads, self.head_size))
+            if key is not None and self.kv_sharing_target_layer_name is None:
+                key = hadamard128(key.reshape(key.shape[0], self.num_kv_heads, self.head_size))
+
         if self.q_quant_mode in ("per_token", "per_token_head"):
             return self._forward_fp8_per_token(layer, query, key, value, kv_cache, attn_metadata, output)
 
@@ -1268,7 +1284,7 @@ class AscendC8MXFPAttentionBackendImpl(AscendAttentionBackendImpl):
         # computes sink_logit = scale * (q . sink_k[kv head]) in FP32.
         # C8_DISABLE_SINK=1 skips the correction (A/B diagnostic for the QFA
         # LSE convention).
-        sink_key = getattr(layer, "sink_key", None)
+        sink_key = self._qfa_sink_key(layer)
         if sink_key is not None and os.environ.get("C8_DISABLE_SINK") == "1":
             sink_key = None
         record_attention_compute_start()

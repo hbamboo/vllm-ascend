@@ -78,6 +78,9 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             )
 
             config = get_ascend_config()
+            rotation = getattr(config, "c8_qk_rotation", "none")
+            if rotation == "hadamard" and layer.head_size != 128:
+                raise ValueError("c8_qk_rotation=hadamard requires Q/K head dimension 128.")
             self.q_quant_mode = config.c8_q_quant_mode
             self.v_quant_mode = config.c8_v_quant_mode
             # The delivered QFA supports SWA in MXFP8 mode 1 only. Keep the
@@ -116,6 +119,7 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
             layer.impl.q_quant_mode = self.q_quant_mode
             layer.impl.k_quant_mode = "per_token_group" if sliding_mxfp else config.c8_k_quant_mode
             layer.impl.v_quant_mode = self.v_quant_mode
+            layer.impl.c8_qk_rotation = rotation
             # Reserve equal full-layer pages even when tracing selects a subset.
             offset_mode = getattr(config, "c8_k_offset_mode", "none")
             layer.impl.k_offset_reserve = offset_mode != "none" and not sliding_mxfp
@@ -144,6 +148,16 @@ class AscendC8MXFPKVCacheAttentionMethod(AscendAttentionScheme):
         weight_param.weight_loader = _quant_weight_loader
 
     def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if getattr(getattr(layer, "impl", None), "c8_qk_rotation", "none") == "hadamard":
+            sink_key = getattr(layer, "sink_key", None)
+            if sink_key is not None:
+                from vllm_ascend.ops.triton.qk_hadamard import hadamard128
+
+                # Keep the loaded parameter intact; derive its rotated basis
+                # once, after weight loading, before any graph capture.
+                layer.register_buffer(
+                    "_c8_rotated_sink_key", hadamard128(sink_key, output_dtype=torch.float32), persistent=False
+                )
         if self.v_quant_mode == "per_head":
             initial_scale = torch.finfo(torch.float32).tiny
             fp8_max = torch.finfo(torch.float8_e4m3fn).max

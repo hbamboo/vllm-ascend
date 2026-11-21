@@ -591,6 +591,8 @@ class AscendConfig:
     c8_k_quant_mode: Literal["per_token_group", "per_token", "per_token_head"] = "per_token_group"
     # FP32 QFA modes: per_token pairs with dynamic V; per_token_head with static V.
     c8_q_quant_mode: Literal["per_token_group", "per_token", "per_token_head"] = "per_token_group"
+    # Fixed orthogonal post-RoPE rotation before C8 Q/K quantization; V is unchanged.
+    c8_qk_rotation: Literal["none", "hadamard"] = "none"
     # Dynamic per-token V selects FIA; dynamic per-head V selects QFA mode 6.
     c8_v_quant_mode: Literal["per_channel", "per_token", "per_head"] = "per_channel"
     # Online K offsets, reconstructed by QFA before softmax; no calibration table.
@@ -715,6 +717,16 @@ class AscendConfig:
     # the max_num_batched_tokens that sequence-parallel writeback corrected).
     def derive_and_validate(self, vllm_config: VllmConfig) -> AscendConfig:
         vc = vllm_config
+        if self.c8_qk_rotation == "hadamard":
+            # Keep torch lazy during platform discovery, like the other C8 guards below.
+            import torch
+
+            if vc.cache_config.cache_dtype != "mxfp8" or vc.model_config.dtype != torch.bfloat16:
+                raise ValueError("c8_qk_rotation=hadamard requires C8 mxfp8 and bfloat16.")
+            if self.c8_k_offset_mode != "none":
+                raise ValueError("c8_qk_rotation=hadamard requires c8_k_offset_mode=none in this stage.")
+            if self.c8_v_quant_mode == "per_token":
+                raise ValueError("c8_qk_rotation=hadamard requires the actual C8 QFA backend, not pseudo FIA.")
         if self.c8_k_offset_mode != "none" and (
             self.c8_q_quant_mode != "per_token_head"
             or self.c8_k_quant_mode != "per_token_head"
